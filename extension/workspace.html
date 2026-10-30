@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>ImageCrate</title><link rel="stylesheet" href="workspace.css"></head>
+<body class="images"><main class="shell">
+<header class="topbar"><div class="brand"><span class="brand-icon" aria-hidden="true">▧</span><div><p class="eyebrow">YOUR PAGE, YOUR PICKS</p><h1>ImageCrate</h1></div></div><div class="header-actions"><button id="source" class="secondary">元ページを開く</button><button id="scan" class="secondary">再スキャン</button></div></header>
+<div class="source-line"><span>取得元</span><strong id="source-title" class="source-title">読み込み中…</strong><span id="source-domain"></span></div>
+<p id="message" class="notice" role="status" aria-live="polite">ページを確認しています。</p><p id="error" class="error" role="alert" hidden></p>
+<div id="notices" class="notice" hidden></div>
+
+<section aria-labelledby="gallery-heading"><div class="intro"><div><p class="eyebrow">KEEP WHAT MATTERS</p><h2 id="gallery-heading">残したい画像を、選んで保存。</h2><p>まず画像を選択してください。選んだ画像だけをまとめて保存します。</p></div></div>
+<div class="toolbar"><label class="field">検索<input id="query" type="search" placeholder="ファイル名・説明で検索"></label><label class="field">最小幅（px）<input id="width" type="number" min="0" value="0"></label><label class="field">最小高さ（px）<input id="height" type="number" min="0" value="0"></label><label class="field">種類<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">IMG</option></select></label></div>
+<div class="control-row"><span id="count">表示0 / 全0件</span><div><button id="select-visible" class="secondary small">表示中を選択</button><button id="clear" class="secondary small">選択をすべて解除</button></div></div>
+<p class="meta">寸法が不明の画像は、最小幅・高さを指定すると非表示になります。ページをスクロール後、再スキャンで追加できます。</p>
+<div id="grid" class="grid"></div><div id="empty" class="empty" hidden></div>
+</section>
+<footer class="footer"><div><strong id="selection" class="selection-summary">選択0件</strong><p id="batch" class="batch-status" aria-live="polite"></p></div><div class="header-actions"><button id="cancel" class="secondary" hidden>保存を停止</button><button id="retry" class="secondary" hidden>中断分を再試行</button><button id="save" class="primary" disabled>選択0件を保存</button></div></footer>
+
+</main><script type="module" src="workspace.js"></script></body></html>

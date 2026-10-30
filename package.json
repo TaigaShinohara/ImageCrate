@@ -1,0 +1,15 @@
+{
+  "name": "imagecrate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ImageCrate Chrome extension",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check.mjs",
+    "test:browser": "node tests/browser-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}

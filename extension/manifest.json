@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "ImageCrate",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "ページの画像を選んで一括保存。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage"
+  ],
+  "action": {
+    "default_title": "ImageCrateを開く"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+  }
+}
