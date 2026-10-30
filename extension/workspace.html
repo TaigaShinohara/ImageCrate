@@ -1,17 +1,92 @@
 <!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>ImageCrate</title><link rel="stylesheet" href="workspace.css"></head>
-<body class="images"><main class="shell">
-<header class="topbar"><div class="brand"><span class="brand-icon" aria-hidden="true">▧</span><div><p class="eyebrow">YOUR PAGE, YOUR PICKS</p><h1>ImageCrate</h1></div></div><div class="header-actions"><button id="source" class="secondary">元ページを開く</button><button id="scan" class="secondary">再スキャン</button></div></header>
-<div class="source-line"><span>取得元</span><strong id="source-title" class="source-title">読み込み中…</strong><span id="source-domain"></span></div>
-<p id="message" class="notice" role="status" aria-live="polite">ページを確認しています。</p><p id="error" class="error" role="alert" hidden></p>
-<div id="notices" class="notice" hidden></div>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>ImageCrate</title>
+  <link rel="stylesheet" href="workspace.css">
+</head>
+<body>
+<svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 5-5 4 4 4-6 5 7"/></symbol>
+  <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M8 5H5v14h14v-3M12 4h8v8M20 4l-10 10"/></symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></symbol>
+  <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
+  <symbol id="icon-filter" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></symbol>
+  <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  <symbol id="icon-select" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="m7 12 3 3 7-7"/></symbol>
+  <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+  <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+  <symbol id="icon-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 4 2c-1 .7-1.5 1-1.5 2M12 17h.01"/></symbol>
+  <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+</svg>
+<main class="shell">
+  <header class="topbar">
+    <div class="brand"><span class="brand-icon"><svg class="icon" aria-hidden="true"><use href="#icon-image"/></svg></span><h1>ImageCrate</h1></div>
+    <details id="help" class="help-disclosure disclosure">
+      <summary aria-controls="help-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-help"/></svg><span>使い方</span></summary>
+      <div id="help-panel" class="help-panel disclosure-panel">
+        <ol class="help-steps">
+          <li><svg class="icon" aria-hidden="true"><use href="#icon-select"/></svg><span>画像を選ぶ</span></li>
+          <li><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>必要なら絞り込む</span></li>
+          <li><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>選んだ画像を保存</span></li>
+        </ol>
+        <p>今ページにある画像を探します。追加したいときは、元ページをスクロールして再スキャン。</p>
+        <p>保存先は Downloads / ImageCrate / ページ名。非表示にした選択画像も保存します。</p>
+      </div>
+    </details>
+  </header>
 
-<section aria-labelledby="gallery-heading"><div class="intro"><div><p class="eyebrow">KEEP WHAT MATTERS</p><h2 id="gallery-heading">残したい画像を、選んで保存。</h2><p>まず画像を選択してください。選んだ画像だけをまとめて保存します。</p></div></div>
-<div class="toolbar"><label class="field">検索<input id="query" type="search" placeholder="ファイル名・説明で検索"></label><label class="field">最小幅（px）<input id="width" type="number" min="0" value="0"></label><label class="field">最小高さ（px）<input id="height" type="number" min="0" value="0"></label><label class="field">種類<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">IMG</option></select></label></div>
-<div class="control-row"><span id="count">表示0 / 全0件</span><div><button id="select-visible" class="secondary small">表示中を選択</button><button id="clear" class="secondary small">選択をすべて解除</button></div></div>
-<p class="meta">寸法が不明の画像は、最小幅・高さを指定すると非表示になります。ページをスクロール後、再スキャンで追加できます。</p>
-<div id="grid" class="grid"></div><div id="empty" class="empty" hidden></div>
-</section>
-<footer class="footer"><div><strong id="selection" class="selection-summary">選択0件</strong><p id="batch" class="batch-status" aria-live="polite"></p></div><div class="header-actions"><button id="cancel" class="secondary" hidden>保存を停止</button><button id="retry" class="secondary" hidden>中断分を再試行</button><button id="save" class="primary" disabled>選択0件を保存</button></div></footer>
+  <section class="source-bar" aria-label="取得元ページ">
+    <svg class="icon source-symbol" aria-hidden="true"><use href="#icon-image"/></svg>
+    <div class="source-info"><strong id="source-title">読み込み中…</strong><span id="source-domain"></span></div>
+    <div class="source-actions">
+      <button id="source" class="quiet" title="元ページを開く"><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg><span>元ページ</span></button>
+      <button id="scan" class="quiet" title="表示された画像を追加で取得"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg><span>再スキャン</span></button>
+    </div>
+  </section>
+  <p id="error" class="error" role="alert" hidden></p>
+  <div id="notices" class="notice" hidden></div>
 
-</main><script type="module" src="workspace.js"></script></body></html>
+  <section class="gallery" aria-labelledby="gallery-heading">
+    <div class="gallery-heading"><h2 id="gallery-heading">画像</h2><span id="count" class="count">表示0 / 全0件</span></div>
+    <div class="search-tools">
+      <label class="search-field"><span class="sr-only">画像を検索</span><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><input id="query" type="search" placeholder="画像を検索" autocomplete="off"></label>
+      <details id="filters" class="filter-disclosure disclosure">
+        <summary aria-controls="filter-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>絞り込み</span><span id="filter-count" class="filter-count" hidden></span><span class="chevron" aria-hidden="true"></span></summary>
+        <div id="filter-panel" class="filter-panel disclosure-panel">
+          <label class="field">最小幅 <span>px</span><input id="width" type="number" min="0" value="0" inputmode="numeric"></label>
+          <label class="field">最小高さ <span>px</span><input id="height" type="number" min="0" value="0" inputmode="numeric"></label>
+          <label class="field">形式<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">IMG</option></select></label>
+          <p class="filter-hint">最小寸法を指定すると、寸法不明の画像は表示されません。</p>
+        </div>
+      </details>
+    </div>
+    <div id="active-filters" class="active-filters" aria-label="適用中の条件" hidden></div>
+    <div class="control-row">
+      <p class="scan-status" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="message">ページを確認しています</span></p>
+      <div class="selection-tools">
+        <button id="reset-filters" class="quiet" hidden>条件をリセット</button>
+        <button id="select-visible" class="quiet"><svg class="icon" aria-hidden="true"><use href="#icon-select"/></svg><span>表示中を選択</span></button>
+        <button id="clear" class="quiet" disabled><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg><span>すべて解除</span></button>
+      </div>
+    </div>
+    <div id="grid" class="grid" aria-label="画像一覧" aria-busy="false"></div>
+    <div id="empty" class="empty" hidden></div>
+  </section>
+</main>
+<footer id="footer" class="footer">
+  <div class="footer-inner">
+    <div class="selection-info"><span id="selection-mark" class="selection-mark" aria-hidden="true"><svg class="icon"><use href="#icon-select"/></svg></span><div><strong id="selection" class="selection-summary">選択0件</strong><p id="selection-hint" class="selection-hint">画像をクリックして選択</p></div></div>
+    <div class="save-actions">
+      <button id="cancel" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-stop"/></svg>保存を停止</button>
+      <button id="retry" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>中断分を再試行</button>
+      <button id="save" class="primary" disabled><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span id="save-label">選択0件を保存</span></button>
+    </div>
+    <div id="batch-panel" class="batch-panel" hidden><progress id="batch-progress" max="1" value="0" aria-label="今回の保存の進捗"></progress><p id="batch" class="batch-status" role="status" aria-live="polite"></p></div>
+  </div>
+</footer>
+<script type="module" src="workspace.js"></script>
+</body>
+</html>
