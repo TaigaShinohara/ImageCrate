@@ -30,7 +30,7 @@ test('new workspace and saved Chrome permission never fetch before its clicked a
   const h=harness();h.allowed.add('https://images.test/*');
   await assert.rejects(h.controller.load('https://images.test/a'),/許可/);assert.equal(h.fetches,0);assert.equal(h.decodes,0);
   await h.controller.grantHost('https://images.test/a');const result=await h.controller.load('https://images.test/a');
-  assert.equal(h.requests,1);assert.equal(h.fetches,1);assert.equal(result.width,40);assert.match(result.url,/^blob:static/);assert.equal(h.urls[0].blob.type,'image/png');
+  assert.equal(h.requests,1);assert.equal(h.fetches,1);assert.equal(result.width,40);assert.equal(result.detectedFormat,'svg');assert.match(result.url,/^blob:static/);assert.equal(h.urls[0].blob.type,'image/png');
   result.release();await h.controller.dispose();assert.deepEqual(h.revoked,['blob:static-1']);
 });
 

@@ -44,6 +44,7 @@ function icon(name) {
 }
 function resetFilters() {
   $('query').value='';$('width').value=0;$('height').value=0;$('type').value='';
+  $('exclude-ad-like').checked=false;
   renderImages();
 }
 function renderFilterState(filters) {
@@ -51,6 +52,7 @@ function renderFilterState(filters) {
   if(filters.width)conditions.push({id:'width',label:`幅 ${filters.width}px以上`});
   if(filters.height)conditions.push({id:'height',label:`高さ ${filters.height}px以上`});
   if(filters.type)conditions.push({id:'type',label:filters.type.toUpperCase()});
+  if(filters.excludeAdLike)conditions.push({id:'exclude-ad-like',label:'広告らしい画像を除外'});
   $('filter-count').textContent=conditions.length;$('filter-count').hidden=!conditions.length;
   $('reset-filters').hidden=!conditions.length && !filters.query;
   $('active-filters').hidden=!conditions.length;
@@ -60,7 +62,7 @@ function renderFilterState(filters) {
   for(const condition of conditions) {
     const chip=element('button','filter-chip');chip.type='button';chip.dataset.filter=condition.id;
     chip.append(element('span','',condition.label),icon('close'));chip.setAttribute('aria-label',`${condition.label}の条件を解除`);
-    chip.addEventListener('click',()=>{$(condition.id).value=condition.id==='type' ? '' : 0;renderImages();});
+    chip.addEventListener('click',()=>{if(condition.id==='exclude-ad-like')$(condition.id).checked=false;else $(condition.id).value=condition.id==='type' ? '' : 0;renderImages();persistUI(gallery.viewPatch()).catch(error);});
     $('active-filters').append(chip);
   }
   if(focusedCondition) {
@@ -151,7 +153,7 @@ function updateSummary() {
 }
 function renderImages() {
   if(!state)return;
-  const filters={query:$('query').value,width:Math.max(0,Number($('width').value)||0),height:Math.max(0,Number($('height').value)||0),type:$('type').value};
+  const filters={query:$('query').value,width:Math.max(0,Number($('width').value)||0),height:Math.max(0,Number($('height').value)||0),type:$('type').value,excludeAdLike:$('exclude-ad-like').checked};
   renderFilterState(filters);gallery.render();visible=gallery.visible;updateSummary();
 }
 async function scan(continuation=false) {
@@ -499,7 +501,7 @@ for(const id of ['filters','help']) {
   });
   details.addEventListener('keydown',event=>{if(event.key==='Escape'&&details.open){details.open=false;summary.focus();event.preventDefault();}});
 }
-for(const id of ['query','width','height','type'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
+for(const id of ['query','width','height','type','exclude-ad-like'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
 $('select-visible').addEventListener('click',()=>{const urls=[...new Set([...selected,...gallery.visible.map(i=>i.url)])];persistUI({selectedURLs:urls}).then(()=>gallery.sync()).catch(error);});
 $('clear').addEventListener('click',()=>persistUI({selectedURLs:[]}).then(()=>renderImages()).catch(error));
 $('recovery-cancel').addEventListener('click',()=>persistUI({saveScope:'selection',failedBatchId:null}).catch(error));

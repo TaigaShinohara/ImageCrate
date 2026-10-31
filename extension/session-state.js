@@ -4,12 +4,12 @@ export const CANDIDATE_BYTE_LIMIT = 6 * 1024 * 1024;
 export const SELECTION_LIMIT = 500;
 const encoder = new TextEncoder();
 export const serializedBytes = value => encoder.encode(JSON.stringify(value)).byteLength;
-export const defaultUI = () => ({view:'all',query:'',width:0,height:0,type:'',onlySelected:false,scrollY:0,focusAnchor:'',saveScope:'selection',failedBatchId:null});
+export const defaultUI = () => ({view:'all',query:'',width:0,height:0,type:'',excludeAdLike:false,onlySelected:false,scrollY:0,focusAnchor:'',saveScope:'selection',failedBatchId:null});
 export function sessionDefaults(input) {
   const state = {...input,revision:Number.isSafeInteger(input.revision) ? input.revision : 0,
     selectionRevision:Number.isSafeInteger(input.selectionRevision) ? input.selectionRevision : 0,
     items:[...(input.items || [])],selectedItems:[...(input.selectedItems || [])],selectedURLs:[...new Set(input.selectedURLs || [])],
-    ui:{...defaultUI(),...(input.ui || {})},jobs:(input.jobs || []).map(job=>({...job,
+    ui:{...defaultUI(),...(input.ui || {}),excludeAdLike:input.ui?.excludeAdLike===true},jobs:(input.jobs || []).map(job=>({...job,
       // Retries replace the attempt id, never the identity used by the durable
       // batch transfer ledger. Old job IDs are stable migration identities.
       logicalJobId:job.logicalJobId || job.id,
@@ -40,7 +40,7 @@ export function applyUIPatch(state, patch = {}, baseRevision) {
   if (typeof patch.query === 'string') ui.query = patch.query.slice(0,500);
   if (typeof patch.type === 'string') ui.type = patch.type.slice(0,30);
   for (const key of ['width','height']) if (Number.isFinite(Number(patch[key])) && Object.hasOwn(patch,key)) ui[key] = Math.max(0,Math.min(100000,Math.floor(Number(patch[key]))));
-  for (const key of ['onlySelected','filtersOpen','helpOpen']) if (typeof patch[key] === 'boolean') ui[key] = patch[key];
+  for (const key of ['onlySelected','filtersOpen','helpOpen','excludeAdLike']) if (typeof patch[key] === 'boolean') ui[key] = patch[key];
   if (Number.isFinite(patch.scrollY)) ui.scrollY = Math.max(0,Math.min(1e9,patch.scrollY));
   if (typeof patch.focusAnchor === 'string') ui.focusAnchor = patch.focusAnchor.slice(0,131072);
   if (['selection','failed'].includes(patch.saveScope)) ui.saveScope=patch.saveScope;

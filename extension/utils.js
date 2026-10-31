@@ -65,6 +65,9 @@ export function extensionOf(url, kind) {
   } catch { /* use a neutral suffix for URLs without format information */ }
   return kind === 'images' ? 'img' : 'video';
 }
+export function isDetectedImageFormat(value) {
+  return ['png','jpeg','gif','webp','bmp','ico','svg'].includes(value);
+}
 export function fileLabel(url) {
   try {
     const u = new URL(url);

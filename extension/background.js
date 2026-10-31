@@ -1,5 +1,5 @@
 import { collect } from './collector.js';
-import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings, requiresWorkspace } from './utils.js';
+import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings, requiresWorkspace, isDetectedImageFormat } from './utils.js';
 import { pruneDirectories } from './directory-store.js';
 import { extensionForMime } from './image-format.js';
 import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
@@ -920,7 +920,8 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
       case 'dimensions': {
         for (const update of (message.updates || []).slice(0,500)) {
           if (!Number.isFinite(update.width) || !Number.isFinite(update.height) || update.width <= 0 || update.height <= 0 || update.width > 100000 || update.height > 100000) continue;
-          for (const item of [...state.items,...state.selectedItems]) if (item.url === update.url) Object.assign(item,{width:update.width,height:update.height,dimensionSource:'decoded'});
+          for (const item of [...state.items,...state.selectedItems]) if (item.url === update.url) Object.assign(item,{width:update.width,height:update.height,dimensionSource:'decoded',
+            ...(isDetectedImageFormat(update.detectedFormat)?{detectedFormat:update.detectedFormat}:{})});
         }
         await save(state); return state;
       }

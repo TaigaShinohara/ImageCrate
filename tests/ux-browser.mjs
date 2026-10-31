@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deflateSync } from 'node:zlib';
 
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -32,6 +33,22 @@ let releaseHigh = false;
 const held = new Set();
 const svg = (width = 400, height = 300, color = '#6351d9') => `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="${color}"/></svg>`;
 const originalSVG = svg(640, 480, '#aa3377');
+// Uniform, valid PNG pixels keep format detection independent of a misleading
+// URL suffix. GIF has a 400×300 logical screen and a single 1×1 red frame.
+const pngChunk = (type, data) => {
+  const name = Buffer.from(type), body = Buffer.concat([name, data]);
+  let crc = 0xffffffff;
+  for (const byte of body) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+  const length = Buffer.alloc(4), checksum = Buffer.alloc(4);
+  length.writeUInt32BE(data.length); checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+  return Buffer.concat([length, body, checksum]);
+};
+const pngHeader = Buffer.alloc(13); pngHeader.writeUInt32BE(400); pngHeader.writeUInt32BE(300, 4); pngHeader[8] = 8; pngHeader[9] = 6;
+const pngPixels = Buffer.alloc((400 * 4 + 1) * 300, 255);
+for (let row = 0; row < 300; row++) pngPixels[row * (400 * 4 + 1)] = 0;
+const adPNG = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk('IHDR', pngHeader), pngChunk('IDAT', deflateSync(pngPixels)), pngChunk('IEND', Buffer.alloc(0))]);
+const adGIF = Buffer.from([...Buffer.from('GIF89a'), 144, 1, 44, 1, 128, 0, 0, 255, 0, 0, 0, 0, 255,
+  44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59]);
 const doc = (title, body) => `<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>${title}</title></head><body>${body}</body></html>`;
 const candidates = count => Array.from({ length: count }, (_, i) => `<img data-src="/tile.svg?i=${i}" alt="合成候補${i}">`).join('');
 const fixture = doc('ImageCrate UX 合成ページ', `
@@ -44,6 +61,9 @@ const fixture = doc('ImageCrate UX 合成ページ', `
 `);
 const server = createServer((request, response) => {
   const path = new URL(request.url, 'http://localhost').pathname;
+  if (path === '/ad-known.gif' || path === '/ad-opaque') { response.setHeader('Content-Type', 'image/gif'); return response.end(adGIF); }
+  if (path === '/ad-disguised.gif') { response.setHeader('Content-Type', 'image/png'); return response.end(adPNG); }
+  if (path === '/ad-unknown') { response.setHeader('Content-Type', 'image/svg+xml'); return response.end(svg()); }
   if (path === '/original-image' || path === '/retry-image') {
     response.setHeader('Content-Type', 'image/svg+xml');
     return response.end(originalSVG);
@@ -53,9 +73,10 @@ const server = createServer((request, response) => {
     if (path === '/held-high.svg' && !releaseHigh) {
       held.add(response); response.on('close', () => held.delete(response)); return;
     }
-    return response.end(svg(path.includes('high') || path.includes('large') ? 1800 : 400, path.includes('high') || path.includes('large') ? 1200 : 300, path.includes('blue') ? '#56a4bf' : '#6351d9'));
+    return response.end(svg(path === '/ad-banner.svg' ? 900 : path.includes('high') || path.includes('large') ? 1800 : 400, path === '/ad-small.svg' ? 199 : path.includes('high') || path.includes('large') ? 1200 : 300, path.includes('blue') ? '#56a4bf' : '#6351d9'));
   }
   response.setHeader('Content-Type', 'text/html; charset=utf-8');
+  if (path === '/ad-filter') return response.end(doc('広告候補の除外テスト', '<img src="/ad-normal.svg"><img src="/ad-banner.svg"><img src="/ad-small.svg"><img data-src="/ad-known.gif"><img data-src="/ad-opaque"><img data-src="/ad-disguised.gif"><img data-src="/ad-unknown">'));
   if (path === '/candidates' || path === '/mutation') return response.end(doc(path, candidates(501)));
   // html/head/meta/title/body = five elements, plus 11995 divs and the final img.
   if (path === '/nodes') return response.end(doc('12001 elements', '<div></div>'.repeat(11995) + '<img data-src="/after-nodes.svg">'));
@@ -174,6 +195,84 @@ try {
   assert.deepEqual(rejected.selectedURLs, selectedBefore.selectedURLs);
   checked('DOM mutation invalidates continuation while preserving the old page and selection');
   await pagedManager.close();
+
+  // Advertising heuristics remain reversible and operate before any media
+  // request. Verified preview metadata is applied only on explicit refresh.
+  await source.goto(`${origin}/ad-filter`);
+  await source.waitForFunction(() => [...document.images].filter(image => image.currentSrc).every(image => image.complete && image.naturalWidth));
+  const adManager = await openWorkspace(source);
+  const adCard = name => adManager.locator(`.card[data-url="${origin}/${name}"]`);
+  assert.equal(await adManager.locator('#exclude-ad-like').isChecked(), false);
+  assert.equal(await adManager.locator('.card').count(), 7);
+  await adCard('ad-banner.svg').locator('.image-select').check();
+  await adCard('ad-disguised.gif').locator('.image-select').check();
+  await selectedCount(adManager, 2);
+  await adManager.locator('#filters > summary').click();
+  await adManager.locator('#exclude-ad-like').focus(); await adManager.keyboard.press('Space');
+  await waitState(adManager, { 'ui.excludeAdLike': true });
+  assert.equal(await adManager.locator('.card').count(), 3, 'source banner/small dimensions and a GIF suffix exclude candidates without a preview');
+  assert.equal(await adCard('ad-opaque').count(), 1, 'unknown format and dimensions remain available');
+  assert.equal(await adCard('ad-unknown').count(), 1);
+  assert.equal(await adManager.locator('[data-filter="exclude-ad-like"]').count(), 1);
+  assert.equal(await adManager.locator('#filter-count').textContent(), '1');
+  assert.match(await adManager.locator('#selection').textContent(), /非表示2件/);
+  assert.match(await adManager.locator('#selection-hint').textContent(), /非表示の画像も保存/);
+  assert.deepEqual(adManager.__previewRequests, [], 'turning on the heuristic never fetches images');
+  await adManager.locator('#view-selected').click();
+  assert.equal(await adManager.locator('.card').count(), 2, 'selected view exposes both excluded selections');
+  await waitState(adManager, { 'ui.view': 'selected', 'ui.excludeAdLike': true });
+  const adSelection = (await stateFor(adManager)).selectedURLs;
+  await adManager.reload();
+  await adManager.waitForFunction(() => document.querySelector('#message').textContent.includes('前回'));
+  assert.equal(await adManager.locator('#exclude-ad-like').isChecked(), true);
+  assert.equal(await adManager.locator('.image-select:checked').count(), 2);
+  assert.deepEqual((await stateFor(adManager)).selectedURLs, adSelection);
+  const freshAdSource = await context.newPage(); await freshAdSource.goto(`${origin}/ad-filter?new-workspace=1`);
+  const freshAdManager = await openWorkspace(freshAdSource);
+  assert.equal(await freshAdManager.locator('#exclude-ad-like').isChecked(), false, 'a new workspace starts OFF even while another is ON');
+  await freshAdManager.close(); await freshAdSource.close();
+  checked('advertising heuristic toggles with Space, groups one chip, retains hidden selections and restores only the current workspace');
+
+  await adCard('ad-disguised.gif').locator('.preview-permission').click();
+  await pollSession(adManager, state => state.items.some(item => item.url.endsWith('/ad-disguised.gif') && item.detectedFormat === 'png'));
+  await adManager.locator('#view-all').click();
+  assert.equal(await adCard('ad-disguised.gif').count(), 1, 'verified PNG overrides the GIF URL hint');
+  await pollSession(adManager, state => state.items.some(item => item.url.endsWith('/ad-opaque') && item.detectedFormat === 'gif'));
+  assert.equal(await adCard('ad-opaque').count(), 1, 'newly inspected GIF stays in place until the user updates conditions');
+  await adManager.locator('#measure-refresh').waitFor({ state: 'visible' });
+  await adManager.locator('#measure-refresh').click();
+  assert.equal(await adCard('ad-opaque').count(), 0, 'explicit refresh excludes an extensionless GIF');
+  assert.equal(await adCard('ad-disguised.gif').count(), 1);
+  assert.equal(await adManager.locator('.card').count(), 3);
+  await adManager.locator('[data-filter="exclude-ad-like"]').click();
+  assert.equal(await adManager.locator('#exclude-ad-like').isChecked(), false);
+  assert.equal(await adManager.locator('.card').count(), 7);
+  if (!(await adManager.locator('#filters').evaluate(node => node.open))) await adManager.locator('#filters > summary').click();
+  await adManager.locator('#exclude-ad-like').check();
+  await adManager.locator('#query').fill('no-ad-filter-match');
+  assert.equal(await adManager.locator('.card').count(), 0);
+  await adManager.locator('#empty button').click();
+  assert.equal(await adManager.locator('#exclude-ad-like').isChecked(), false);
+  assert.equal(await adManager.locator('#active-filters .filter-chip').count(), 0);
+  assert.equal(await adManager.locator('#filter-count').isVisible(), false);
+  await waitState(adManager, { 'ui.excludeAdLike': false, 'ui.query': '' });
+  assert.equal(await adManager.locator('.card').count(), 7, 'reset recovers an empty list and clears the grouped setting');
+  checked('verified PNG/GIF format overrides URL hints; explicit information refresh, chip removal and reset recover the list');
+
+  if (!(await adManager.locator('#filters').evaluate(node => node.open))) await adManager.locator('#filters > summary').click();
+  await adManager.locator('#exclude-ad-like').check();
+  assert.equal(await adCard('ad-banner.svg').count(), 0);
+  assert.deepEqual((await stateFor(adManager)).selectedURLs, adSelection);
+  const adDownloadSession = await context.newCDPSession(adManager);
+  await adDownloadSession.send('Browser.setDownloadBehavior', { behavior: 'default', eventsEnabled: true });
+  await adManager.locator('#save').click();
+  const adSaved = await pollSession(adManager, state => state.jobs.length === 2 && state.jobs.every(job => job.status === 'complete'));
+  assert.deepEqual(adSaved.jobs.map(job => job.url).sort(), [...adSelection].sort(), 'saving includes the excluded selected banner');
+  const hiddenBannerJob = adSaved.jobs.find(job => job.url.endsWith('/ad-banner.svg'));
+  const hiddenBannerDownload = await worker.evaluate(async id => (await chrome.downloads.search({ id }))[0], hiddenBannerJob.downloadId);
+  assert.equal(await readFile(hiddenBannerDownload.filename, 'utf8'), svg(900, 300));
+  checked('a filtered-out selected banner is saved through Chrome with its original bytes');
+  await adManager.close();
 
   // Main UI fixture: source dimensions from a 2x descriptor are not file pixels.
   await source.goto(`${origin}/ux`);
@@ -438,9 +537,15 @@ try {
     await manager.locator('#height').fill('100');
     await manager.locator('#type').selectOption('svg');
     await screenshot(manager, `filters-${width}`);
-    const fields = await manager.locator('#filter-panel input, #filter-panel select').evaluateAll(elements => elements.map(element => { const r = element.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height }; }));
+    const fields = await manager.locator('#filter-panel input:not([type="checkbox"]), #filter-panel select').evaluateAll(elements => elements.map(element => { const r = element.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height }; }));
     assert.ok(fields.every(field => field.left >= 0 && field.right <= width + 1 && field.height >= 44));
     for (let i = 0; i < fields.length; i++) for (let j = i + 1; j < fields.length; j++) assert.equal(Math.min(fields[i].right, fields[j].right) - Math.max(fields[i].left, fields[j].left) > 1 && Math.min(fields[i].bottom, fields[j].bottom) - Math.max(fields[i].top, fields[j].top) > 1, false, 'filter controls do not overlap');
+    const adControl = await manager.locator('#exclude-ad-like').evaluate(input => {
+      const rect = element => { const r = element.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, height: r.height, width: r.width }; };
+      return { label: rect(input.closest('label')), help: rect(document.getElementById(input.getAttribute('aria-describedby'))) };
+    });
+    assert.ok(adControl.label.left >= 0 && adControl.label.right <= width + 1 && adControl.label.height >= 44, 'advertising checkbox retains a full-height labeled hit area');
+    assert.ok(adControl.help.left >= 0 && adControl.help.right <= width + 1 && adControl.help.top >= adControl.label.bottom - 1, 'advertising criteria wrap below the control without overflow or overlap');
     await manager.locator('#reset-filters').click();
     await manager.locator('#width').press('Escape');
     await manager.locator('#destination-change').click();

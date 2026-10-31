@@ -71,7 +71,7 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
   };
   const handle=entry=>{
     if(entry.dropped)throw new DOMException('古いプレビューです。','AbortError');if(!entry.url)entry.url=createObjectURL(entry.output);entry.refs++;cache.delete(entry.key);cache.set(entry.key,entry);let released=false;
-    return {url:entry.url,width:entry.metadata.width,height:entry.metadata.height,displayWidth:entry.result.displayWidth,displayHeight:entry.result.displayHeight,release(){if(released)return;released=true;entry.refs=Math.max(0,entry.refs-1);if(!entry.refs&&entry.url){revokeObjectURL(entry.url);entry.url='';}}};
+    return {url:entry.url,width:entry.metadata.width,height:entry.metadata.height,detectedFormat:entry.metadata.format,displayWidth:entry.result.displayWidth,displayHeight:entry.result.displayHeight,release(){if(released)return;released=true;entry.refs=Math.max(0,entry.refs-1);if(!entry.refs&&entry.url){revokeObjectURL(entry.url);entry.url='';}}};
   };
   const invalidateHost=(key,{clearConsent=true}={})=>{
     epochs.set(key,hostEpoch(key)+1);if(clearConsent)consent.delete(key);
