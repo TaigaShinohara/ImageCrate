@@ -33,6 +33,7 @@
           <li><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>選んだ画像を保存</span></li>
         </ol>
         <p>元ページにある画像を探します。多いときは「続きの候補」へ進めます。元ページに画像を追加したら再スキャンしてください。</p>
+        <p>プレビューは表示された配信元ごとに許可して読み込みます。許可しなくても画像の選択と元の形式での保存はできます。プレビューできない画像も、元形式で保存できます。</p>
         <p>保存先・画像をまとめるフォルダ名・保存形式は画面下の「変更」から指定できます。最初は元の形式のまま、Chromeのダウンロード先 / ImageCrate / ページ名に保存します。</p>
         <p>非表示にした選択画像も保存します。</p>
       </div>
@@ -136,7 +137,7 @@
 <dialog id="image-preview" class="image-preview" aria-labelledby="preview-title">
   <header class="settings-header"><h2 id="preview-title">画像の確認</h2><button id="preview-close" class="quiet" type="button">閉じる</button></header>
   <div id="preview-stage" class="preview-stage"></div>
-  <div class="preview-controls"><p id="preview-meta"></p><button id="preview-zoom" class="quiet" aria-pressed="false">100%で表示</button><button id="preview-prev" class="secondary">前の画像</button><button id="preview-next" class="secondary">次の画像</button><label class="preview-selection"><input id="preview-select" type="checkbox">この画像を選択</label></div>
+  <div class="preview-controls"><p id="preview-meta"></p><button id="preview-zoom" class="quiet" aria-pressed="false">プレビューを等倍で表示</button><button id="preview-prev" class="secondary">前の画像</button><button id="preview-next" class="secondary">次の画像</button><label class="preview-selection"><input id="preview-select" type="checkbox">この画像を選択</label></div>
   <div id="preview-variants" class="preview-variants" aria-label="同じ要素の別候補"></div>
 </dialog>
 <script type="module" src="workspace.js"></script>

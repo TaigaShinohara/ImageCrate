@@ -1,5 +1,11 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## 配信元ごとのプレビュー同意 — 2026-10-31
+
+workspaceを開いただけでは遠隔画像のfetch・Image読込を開始しない。各カード/viewerにscheme・host・portと全path/portへの許可範囲、ログイン状態を使う取得であることを表示する。実click内で具体hostだけのChrome任意許可を要求し、workspace固有の同意も記録する。既存のChrome許可だけで新workspaceのプレビューを始めない。data画像も明示的なローカル同意を必要とする。拒否・未対応・容量超過ではplaceholderを表示し、通常の選択・元形式Chrome保存は利用できる。
+
+previewは入力8MiB・20秒・24MP・8192pxまで、workspace累積256MiB。可視領域から外れた画像、絞込、再描画、viewer閉鎖、非表示化でconsumerを解放し、最後のconsumerがなくなれば進行中の処理を停止する。queue64・cache64件とし、権限はqueue実行時・cache使用時・生成後にも確認する。取消時は表示/cache/URLを失効させる。元画像URLをImageへ設定せず、検査済みの生成PNG Blobだけを表示する。thumbnail384px、viewer2048pxへの縮小と、元画像の検査済み寸法を分ける。「等倍」は生成プレビューの等倍表示を指す。
+
 ## 画像の事前検査と共有codec — 2026-10-31
 
 プレビューと形式変換は共通のmetadata検査と専用workerを使う。PNG/APNG・JPEG・GIF・WebP・BMP・ICOのcontainer、寸法、frameや埋込画像の合計画素をnative decode前に検査する。入力1枚24MP、aggregate64MP・64frame・8192chunkまで。破損・未対応・不確実な形式は拒否し、元形式保存へ自動で切り替えない。AVIFと一般的なSVGは拒否する。SVGは明示的寸法を持つ単純な塗り矩形だけを独自に描画し、元SVGをnative Image/codecへ渡さない。

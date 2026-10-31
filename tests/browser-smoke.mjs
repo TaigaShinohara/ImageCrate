@@ -76,6 +76,7 @@ try {
   await page.reload();
   const tab=await worker.evaluate(async origin=>(await chrome.tabs.query({})).find(t=>t.url?.startsWith(origin)),origin);
   const [manager]=await Promise.all([context.waitForEvent('page'),worker.evaluate(tab=>globalThis.__openWorkspace(tab),tab)]);
+  const previewRequests=[];manager.on('request',request=>{if(request.url().startsWith(origin))previewRequests.push(request.url());});
   await manager.waitForLoadState();
   const errors=[];manager.on('pageerror',e=>errors.push(e.message));
   await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('候補を取得'));
@@ -84,6 +85,13 @@ try {
   if(manifest.name==='ImageCrate') {
     assert.ok(await manager.locator('.card').count()>=5,'DOM, background, shadow and frame collection');
     assert.equal(await manager.locator('.image-select:checked').count(),0,'initial selection is empty');
+    assert.equal(await manager.locator('.thumb img').count(),0,'pregranted Chrome host access does not establish this workspace preview consent');
+    assert.deepEqual(previewRequests,[],'the workspace makes no fixture request before an actual preview consent click');
+    await manager.locator('.card .preview-permission:visible').first().click();
+    await manager.waitForFunction(()=>{const image=document.querySelector('.thumb img');return image?.complete&&image.naturalWidth>0&&image.src.startsWith('blob:');});
+    assert.equal(await manager.locator('.thumb img').first().evaluate(image=>image.naturalWidth<=384),true,'the thumbnail is a bounded generated static image');
+    await manager.waitForFunction(()=>[...document.querySelectorAll('[data-dimensions]')].some(node=>node.textContent.includes('400 × 300')));
+    assert.equal(await manager.locator('.image-select:checked').count(),0,'preview consent does not select images');
     // Native disclosures must remain keyboard-operable and return focus on Escape.
     for(const disclosureId of ['filters','help']) {
       const summary=manager.locator(`#${disclosureId} > summary`);
@@ -122,7 +130,7 @@ try {
       const checkbox=card.querySelector('input[type="checkbox"]'),meta=card.querySelector('.meta'),format=card.querySelector('.file-type');
       const descriptions=checkbox.getAttribute('aria-describedby')?.split(/\s+/).map(id=>document.getElementById(id));
       return checkbox.getAttribute('aria-label')?.endsWith('を選択') && descriptions?.length===2 && descriptions.every(Boolean)
-        && /×|寸法不明/.test(meta.textContent) && !!format.textContent && getComputedStyle(meta).display!=='none' && getComputedStyle(format).display!=='none';
+        && /×|寸法未確認/.test(meta.textContent) && !!format.textContent && getComputedStyle(meta).display!=='none' && getComputedStyle(format).display!=='none';
     }));
     assert.equal(cardSemantics,true,'every checkbox names its image and describes always-present dimensions/type and save state');
     await manager.locator('.image-select').first().focus();await manager.keyboard.press('Space');
