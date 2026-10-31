@@ -1,5 +1,13 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## 収集処理の資源制限 — 2026-10-31
+
+候補数・要素数・保存情報量に加え、無効・重複URLを含む字句処理を1回128Ki文字・4096試行・25ms目標で区切る。途中位置は明示的なparser stateへ保持し、候補0件でも「続きの候補」で再開できる。属性は1Mi文字、URL/baseは131072文字、descriptorは64文字まで。scan全体は16Mi文字・65536試行・100000要素までとし、継続で予算を初期化しない。大量のmutationはNodeListを展開せず保守的に継続を無効化する。観測root/document数も制限する。これは協調的なアプリ処理量であり、ブラウザ内部のDOM/style呼出しやGCの実時間上限ではない。
+
+workerは取得の開始・採用だけを変更queueで直列化し、executeScript/disposeの応答をqueue内で待たない。source epoch、document ID、operation IDと所有workspaceを照合して最新の選択へ候補を統合する。同URLの再読込も旧取得を失効させる。注入の応答期限は5秒。同じ文書で未settleの注入は重ねず、全体4件まで保持する。期限切れは注入そのものの停止を意味しない。閉鎖や元ページ移動後の古い結果は採用しない。仕事量だけ進んだ空の応答は、既存候補・選択を消さない。
+
+注入と後始末の予約はworkspaceとは別のsession記録へ保存し、worker再起動や作業タブの閉鎖で未確定の予約を忘れない。loading中の元ページへ新しい注入をしない。workerが応答を再取得できない予約は保守的に保持し、元タブを閉じた通知で解放する。通常の新規取得はcollector自身が旧controllerを整理し、重複したdispose注入を増やさない。
+
 ## ImageCrate — 全14項目の現行契約、2026-10-31
 
 ImageCrateについては、この節と [UX-COMPLETION.md](UX-COMPLETION.md) を旧版より優先する。下のv1/v2、VideoHarbor、従来の実施結果は設計履歴であり、本変更の最終合格や人間による体験確認を表さない。公開・ストア申請は行わない。

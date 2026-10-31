@@ -1,5 +1,10 @@
 # QA — v0.1
 
+## セキュリティ補強・収集処理 — 2026-10-31
+
+- `node --test tests/background.test.js tests/collector.test.js`: 98 PASS / 1既存の録画対象外SKIP。重複・不正token、途中再開、累積上限、mutation/root制限、空work応答、別workspaceの操作継続、同URL reload、旧結果破棄、未settle注入/後始末の再起動をまたぐ予約、元タブ閉鎖後の回復を確認。
+- この時点の結果は単体検証。実toolbarのactiveTab、実Chrome権限UI、ブラウザ内部の処理時間上限を確認したものではない。実ブラウザの統合結果は後続の検証記録へ追記する。
+
 以下の実施結果と、未実施の手順を区別します。
 
 ## 全14項目の現在の到達点 — 2026-10-31

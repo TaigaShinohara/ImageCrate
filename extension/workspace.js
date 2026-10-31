@@ -142,7 +142,10 @@ function renderImages() {
 async function scan(continuation=false) {
   if(isBusy() || recorder?.busy) return;
   loading=true;clearError();updateSummary();$('message').textContent='画像を探しています…';
-  try { await uiWrites.catch(()=>{});applyState(await send('scan',{continuation}));render();const added=state.scan?.addedURLs?.length || 0;$('message').textContent=continuation?`次の${state.items.length}件の候補を取得`:`${state.items.length}件の候補を取得 · 今回追加${added}件`; }
+  try { await uiWrites.catch(()=>{});applyState(await send('scan',{continuation}));render();const added=state.scan?.addedURLs?.length || 0;
+    $('message').textContent=state.scan?.workLimited ? '処理量で区切りました。「続きの候補」で再開できます。選択した画像は保持しています。'
+      : state.scan?.scanLimited ? '取得の上限に達しました。取得済みの画像を確認してください。'
+      : continuation?`次の${state.items.length}件の候補を取得`:`${state.items.length}件の候補を取得 · 今回追加${added}件`; }
   catch(e){error(e);$('message').textContent='取得できませんでした。元ページからやり直せます。';}
   finally {loading=false;updateSummary();}
 }

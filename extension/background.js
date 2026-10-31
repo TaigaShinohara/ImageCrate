@@ -8,10 +8,14 @@ const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
 const FILENAME_DECISION_TTL = 5 * 60 * 1000;
 const RECOVERY_ALARM = 'imagecrate-pending-downloads';
+const SCAN_TIMEOUT = 5000;
+const workerInstance = crypto.randomUUID();
+const scanFlights = new Map();
+const SOURCE_FLIGHTS_KEY = 'imagecrate.sourceFlights.v1';
 let operations = Promise.resolve();
 // One mutation queue protects storage read/modify/write across concurrent events.
 const serial = task => { const next = operations.then(task); operations = next.catch(() => {}); return next; };
-const save = async state => {
+const save = async (state, extra = {}) => {
   const candidate=sessionDefaults(state);
   applyJobCompletions(candidate);
   if(!candidate.closed) {
@@ -21,7 +25,7 @@ const save = async state => {
   }
   candidate.revision++;
   await assertSessionBudget(candidate,await all());
-  try { await chrome.storage.session.set({[PREFIX + candidate.id]:candidate}); }
+  try { await chrome.storage.session.set({[PREFIX + candidate.id]:candidate,...extra}); }
   catch (error) {
     if (/quota|QUOTA_BYTES|storage.*limit/i.test(String(error?.message || error))) throw new Error('作業情報の容量上限に達しました。選択を減らすか、使い終わった作業タブを閉じてからもう一度操作してください。');
     throw error;
@@ -93,27 +97,77 @@ chrome.action.onClicked.addListener(tab => {
   });
 });
 
-async function disposeScan(state) {
+const sourceFlights = async () => (await chrome.storage.session.get(SOURCE_FLIGHTS_KEY))[SOURCE_FLIGHTS_KEY] || {};
+async function releaseSourceFlight(request) {
+  const flights=await sourceFlights();delete flights[request.id];
+  const state=await load(request.sessionId);
+  if (state?.scanRequest?.id===request.id && state.scanRequest.expired) {
+    delete state.scanRequest;await save(state,{[SOURCE_FLIGHTS_KEY]:flights});
+  } else await chrome.storage.session.set({[SOURCE_FLIGHTS_KEY]:flights});
+}
+function disposeScan(state) {
   const cursor=state.scan?.pendingCursor || state.scan?.cursor || state.scan?.retryCursor;
   if (!cursor) return;
-  try { await chrome.scripting.executeScript({target:{tabId:state.tabId},func:collect,args:[{dispose:true,cursor}]}); } catch {}
+  // Disposal is best effort. A nonresponsive source must not hold the global
+  // mutation queue, and a late dispose may touch only this cursor/document.
+  const target=state.sourceDocumentId ? {tabId:state.tabId,documentIds:[state.sourceDocumentId]} : {tabId:state.tabId};
+  const request={id:crypto.randomUUID(),tabId:state.tabId,sessionId:state.id,workerInstance,kind:'dispose'};
+  serial(async()=>{
+    const flights=await sourceFlights();
+    // Cleanup shares the same persistent four-call pool. If a scan already
+    // owns the document, its bounded collector/TTL will perform the cleanup.
+    if (Object.keys(flights).length>=4 || Object.values(flights).some(f=>f.tabId===state.tabId)) return;
+    if (!await liveTab(state.tabId)) return;
+    flights[request.id]=request;await chrome.storage.session.set({[SOURCE_FLIGHTS_KEY]:flights});
+    Promise.resolve().then(()=>chrome.scripting.executeScript({target,func:collect,args:[{dispose:true,cursor,scanId:state.scan?.scanId}]}))
+      .finally(()=>serial(()=>releaseSourceFlight(request))).catch(()=>{});
+  }).catch(()=>{});
 }
-async function scan(state, continuation = false) {
+async function beginScan(state, continuation = false) {
   if (active(state)) throw new Error('保存処理が終わってから再スキャンしてください。');
   const tab = await liveTab(state.tabId);
-  if (!tab || tab.url !== state.url) { await disposeScan(state); throw new Error('元ページが閉じられたか移動しました。そのページで拡張アイコンを押し直してください。'); }
+  if (!tab || tab.url !== state.url) { disposeScan(state); throw new Error('元ページが閉じられたか移動しました。そのページで拡張アイコンを押し直してください。'); }
   if (!/^https?:\/\//.test(tab.url)) throw new Error('通常のHTTP/HTTPSページで拡張アイコンを押してください。Chromeの設定・ストア等は取得できません。');
+  if (tab.status==='loading') throw new Error('元ページを読み込み中です。読み込みが終わってから取得してください。');
+  const sourceEpoch=state.sourceEpoch || 0;
+  const key=`${state.tabId}:${sourceEpoch}`;
+  const flights=await sourceFlights();
+  if (Object.values(flights).some(f=>f.tabId===state.tabId) || scanFlights.has(key) || state.scanRequest?.sourceEpoch === sourceEpoch) throw new Error('元ページの取得が終了していません。しばらく待つか、元ページを閉じて開き直してください。');
+  if (Object.keys(flights).length >= 4) throw new Error('応答を待っているページが多すぎます。取得元のタブを閉じてからやり直してください。');
   if (continuation && !state.scan?.cursor) throw new Error('続きの取得情報がありません。先頭から再スキャンしてください。');
   const pending=state.scan?.pendingContinuation === continuation ? state.scan.pendingCursor : null;
-  if (!continuation && !pending) await disposeScan(state);
+  // A fresh collect replaces its old controller itself. Do not inject an
+  // additional asynchronous disposal into the same document before starting.
   const sessions=await all();
   const otherCandidates=sessions.filter(other=>other.id !== state.id).reduce((bytes,other)=>bytes+serializedBytes(other.items),0);
   const allBytes=serializedBytes(Object.fromEntries(sessions.map(other=>[PREFIX+other.id,other])));
   const maxSerializedBytes=Math.min(1572864,CANDIDATE_BYTE_LIMIT-otherCandidates,SESSION_BYTE_LIMIT-allBytes+serializedBytes(state.items)-65536);
   if (maxSerializedBytes < 65536) throw new Error('次の候補を取得する容量が足りません。使い終わった作業タブを閉じてからもう一度取得してください。');
   const options={maxSerializedBytes,...(pending ? {cursor:pending} : continuation ? {cursor:state.scan.cursor} : {})};
-  const results = await chrome.scripting.executeScript({target:{tabId:state.tabId},func:collect,args:[options]});
+  const request={id:crypto.randomUUID(),sessionId:state.id,workerInstance,sourceEpoch,url:state.url,tabId:state.tabId,workspaceTabId:state.workspaceTabId,
+    documentId:state.sourceDocumentId || null,expectedCursor:options.cursor || null,continuation,deadline:Date.now()+SCAN_TIMEOUT};
+  state.scanRequest=request;
+  flights[request.id]={id:request.id,tabId:request.tabId,sessionId:request.sessionId,workerInstance,kind:'scan'};
+  await save(state,{[SOURCE_FLIGHTS_KEY]:flights});
+  const flight={request,key,sessionId:state.id};
+  scanFlights.set(key,flight);
+  return {request,options,flight};
+}
+async function finishScan(sessionId, request, results) {
+  const state=await load(sessionId);
+  if (!state || state.closed || state.scanRequest?.id !== request.id || state.sourceEpoch !== undefined && state.sourceEpoch !== request.sourceEpoch) throw new Error('取得元が変わったため、古い取得結果を破棄しました。元ページからやり直してください。');
+  const tab=await liveTab(state.tabId);
+  if (!tab || tab.url !== request.url || state.workspaceTabId !== request.workspaceTabId || !await ownsWorkspaceTab(state,await liveTab(state.workspaceTabId))) {
+    delete state.scanRequest;await save(state);
+    throw new Error('元ページか作業ページが変わりました。元ページからやり直してください。');
+  }
+  delete state.scanRequest;
+  if (Date.now() >= request.deadline) {await save(state);throw new Error('元ページの取得期限を超えました。先頭から取り直してください。');}
+  const injection=results[0];
+  if (request.documentId && injection?.documentId && request.documentId !== injection.documentId) { await save(state);throw new Error('取得したページが再読み込みされました。先頭から取り直してください。'); }
+  if (injection?.documentId) state.sourceDocumentId=injection.documentId;
   const result = results[0]?.result;
+  if (result?.sourceURL && result.sourceURL !== state.url) {await save(state);throw new Error('元ページが移動しました。拡張を開き直してください。');}
   if (!result) throw new Error('ページの画像を取得できませんでした。元ページからやり直してください。');
   if (result.capacityLimited && !result.items?.length) throw new Error('次の候補を取得する容量が足りません。使い終わった作業タブを閉じてからもう一度取得してください。');
   if (result.invalidated) {
@@ -124,11 +178,14 @@ async function scan(state, continuation = false) {
   const incoming = (result.items || []).map(item => ({...item, type:KIND === 'videos' ? mediaType(item.url,item.mime) : item.type || 'image'}));
   const before = new Set(selectableItems(state).map(item=>item.url));
   const records = new Map(selectableItems(state).map(item=>[item.url,item]));
-  state.items = incoming.slice(0,500);
+  // A work slice can consume only rejected/duplicate tokens. It has made
+  // progress, but it must not erase the previous candidate page or selection.
+  if (!((result.workLimited || result.scanLimited) && !incoming.length)) state.items = incoming.slice(0,500);
   for (const item of incoming) records.set(item.url,item);
   state.selectedItems = state.selectedURLs.filter(url=>!state.items.some(item=>item.url === url)).map(url=>records.get(url)).filter(Boolean);
   state.notices = result.notices || [];
   state.scan = {cursor:result.cursor || null,retryCursor:result.retryCursor || null,hasMore:Boolean(result.hasMore),scanId:result.scanId || null,
+    workLimited:Boolean(result.workLimited),scanLimited:Boolean(result.scanLimited),
     addedURLs:incoming.filter(item=>!before.has(item.url)).map(item=>item.url)};
   state.scanned = true;
   try { await save(state); } catch (error) {
@@ -136,12 +193,43 @@ async function scan(state, continuation = false) {
     // The source retains this serialized page until the next page is accepted.
     if (result.retryCursor) {
       const previous=await load(state.id);
-      previous.scan={...(previous.scan || {}),pendingCursor:result.retryCursor,pendingContinuation:continuation};
+      delete previous.scanRequest;
+      previous.scan={...(previous.scan || {}),pendingCursor:result.retryCursor,pendingContinuation:request.continuation};
       try { await save(previous); } catch {}
     }
     throw error;
   }
   return state;
+}
+async function scanWorkspace(message,sender) {
+  const prepared=await serial(async()=>{
+    const state=await load(message.sessionId);
+    if (!state || state.closed || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
+    return beginScan(state,Boolean(message.continuation));
+  });
+  const {request,options,flight}=prepared;
+  const target=request.documentId ? {tabId:request.tabId,documentIds:[request.documentId]} : {tabId:request.tabId};
+  let timer;
+  const execution=Promise.resolve().then(()=>chrome.scripting.executeScript({target,func:collect,args:[options]}));
+  execution.finally(()=>{
+    if(scanFlights.get(flight.key)===flight)scanFlights.delete(flight.key);
+    serial(()=>releaseSourceFlight(request)).catch(()=>{});
+  }).catch(()=>{});
+  try {
+    const results=await Promise.race([execution,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('元ページの取得が5秒以内に応答しませんでした。他の作業は続けられます。元ページを再読み込みしてからやり直してください。')),SCAN_TIMEOUT);timer.unref?.();})]);
+    return await serial(()=>finishScan(message.sessionId,request,results));
+  } catch (error) {
+    await serial(async()=>{
+      const state=await load(message.sessionId);
+      if (!state || state.scanRequest?.id !== request.id) return;
+      // A timed-out injection can still be running. Keep its reservation until
+      // it settles or the source changes; never reinject into the same document.
+      if (scanFlights.get(flight.key)===flight) state.scanRequest.expired=true;
+      else delete state.scanRequest;
+      await save(state);
+    }).catch(()=>{});
+    throw error;
+  } finally {clearTimeout(timer);}
 }
 function matchesSubmissionPath(job,item) {
   const requested=job.submission?.filename || job.filename;
@@ -334,8 +422,10 @@ async function stopJobs(state, reason) {
   }
 }
 async function closeWorkspace(state) {
-  await disposeScan(state);
+  disposeScan(state);
+  delete state.scanRequest;
   state.closed=true;state.items=[];state.selectedItems=[];state.selectedURLs=[];state.ui={};state.notices=[];state.history=[];state.scan=null;
+  await save(state);
   if (managed(state)) await stopJobs(state,'作業ページが閉じられ、保存が中断しました。');
   if (active(state)) await pump(state);
   if (!active(state)) { await chrome.storage.session.remove(PREFIX + state.id); await syncRecoveryAlarm().catch(()=>{}); }
@@ -371,6 +461,10 @@ function requireDirectoryKey(state,key) {
 }
 chrome.runtime.onMessage.addListener((message,sender,respond) => {
   if (!sender.url?.startsWith(chrome.runtime.getURL('workspace.html')) || sender.id !== chrome.runtime.id) return;
+  if (message.type==='scan') {
+    scanWorkspace(message,sender).then(data=>respond({ok:true,data}),error=>respond({ok:false,error:publicError(error)}));
+    return true;
+  }
   serial(async () => {
     const state = await load(message.sessionId);
     if (!state || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
@@ -391,7 +485,6 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         }
         await save(state); return state;
       }
-      case 'scan': return scan(state,Boolean(message.continuation));
       case 'source': { const tab = await liveTab(state.tabId); if(!tab) throw new Error('元ページは閉じられています。'); await chrome.tabs.update(state.tabId,{active:true}); return {}; }
       case 'save': {
         if (active(state)) throw new Error('保存処理中です。');
@@ -531,22 +624,30 @@ chrome.alarms?.onAlarm.addListener(alarm=>{
 });
 chrome.tabs.onRemoved.addListener(tabId => {
   serial(async()=> {
+    const flights=await sourceFlights();
+    for(const [id,flight] of Object.entries(flights)) if(flight.tabId===tabId)delete flights[id];
+    await chrome.storage.session.set({[SOURCE_FLIGHTS_KEY]:flights});
+    for(const [key,flight] of scanFlights)if(flight.request.tabId===tabId)scanFlights.delete(key);
     const lock = (await chrome.storage.session.get('captureLock')).captureLock;
     if(lock?.tabId === tabId) await chrome.storage.session.remove('captureLock');
     for(const state of await all()) {
       if(state.workspaceTabId === tabId) await closeWorkspace(state);
-      else if (state.tabId === tabId && state.scan) { await disposeScan(state); state.scan={cursor:null,hasMore:false,invalidated:true}; await save(state); }
+      else if (state.tabId === tabId) {
+        disposeScan(state);state.sourceEpoch=(state.sourceEpoch || 0)+1;delete state.sourceDocumentId;delete state.scanRequest;
+        state.scan={cursor:null,hasMore:false,invalidated:true};await save(state);
+      }
     }
   }).catch(()=>{});
 });
 
 chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
-  if (!changeInfo.url) return;
+  if (!changeInfo.url && changeInfo.status !== 'loading') return;
   serial(async()=>{
     for (const state of await all()) {
-      if (state.workspaceTabId === tabId && (tab.url || changeInfo.url) !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state);
-      else if (state.tabId === tabId && tab.url !== state.url && state.scan) {
-        await disposeScan(state);
+      if (state.workspaceTabId === tabId && (tab.url || changeInfo.url) && (tab.url || changeInfo.url) !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state);
+      else if (state.tabId === tabId) {
+        disposeScan(state);
+        state.sourceEpoch=(state.sourceEpoch || 0)+1;delete state.sourceDocumentId;delete state.scanRequest;
         state.scan={cursor:null,hasMore:false,invalidated:true};
         await save(state);
       }
