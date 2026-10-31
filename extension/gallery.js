@@ -20,8 +20,8 @@ export function representativeCandidates(items) {
 }
 
 export class Gallery {
-  constructor({getState,getSelected,onSelect,onView,onMeasure,onError,status}) {
-    Object.assign(this,{getState,getSelected,onSelect,onView,onMeasure,onError,status});
+  constructor({getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status}) {
+    Object.assign(this,{getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status});
     this.visible=[];this.measured=new Map();this.mode='all';this.lastURL='';this.viewerURLs=[];this.viewerIndex=0;
     $('view-all').addEventListener('click',()=>this.setMode('all'));
     $('view-selected').addEventListener('click',()=>this.setMode('selected'));
@@ -77,7 +77,7 @@ export class Gallery {
     if(this.busy)return;
     const next=new Set(this.getSelected());checked?next.add(url):next.delete(url);
     this.lastURL=url;
-    try {await this.onSelect([...next]);this.sync();if(this.mode==='selected' && !checked)this.render();}
+    try {await this.onSelect([...next]);this.sync();if(this.mode==='selected')this.render();}
     catch(e){this.onError(e);this.sync();}
   }
   sync() {
@@ -169,6 +169,7 @@ export class Gallery {
     this.sync();
     if(oldURL)this.restoreFocus(oldURL,oldRole,oldIndex);
     else if(active===$('measure-refresh')&&active.hidden)$('gallery-heading').focus();
+    this.onRender?.(this.visible);
   }
   openViewer(url,origin=document.activeElement) {
     this.returnURL=url;this.viewerURLs=this.visible.map(i=>i.url);

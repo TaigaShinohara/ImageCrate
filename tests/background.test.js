@@ -43,12 +43,17 @@ async function browser(t, options = {}) {
   const determining = event();
   const updated = event();
   const scriptCalls=[];
+  const contexts=[];
+  const contextCalls=[];
+  const tabCreates=[];
   const scriptResults=[];
   const removed = event();
   const messages = event();
   const clone = (value) => value === undefined ? undefined : structuredClone(value);
   const chrome = {
-    runtime: { id: 'test', getURL: (path) => `chrome-extension://test/${path}`, onMessage: messages },
+    runtime: { id: 'test', getURL: (path) => `chrome-extension://test/${path}`, onMessage: messages,
+      async getContexts(filter) { contextCalls.push(clone(filter)); return clone(contexts.filter(context=>(!filter.tabIds || filter.tabIds.includes(context.tabId)) && (!filter.documentUrls || filter.documentUrls.includes(context.documentUrl)))); },
+    },
     action: { onClicked: event(), setBadgeText: async () => {}, setTitle: async () => {} },
     storage: { session: {
       async get(key) {
@@ -64,6 +69,7 @@ async function browser(t, options = {}) {
     } },
     scripting: { async executeScript(request) { scriptCalls.push(request); return [{result:scriptResults.shift() || {items:[],notices:[]}}]; } },
     tabs: { onRemoved: removed,onUpdated:updated,
+      async create(values) { const tab={id:500+tabCreates.length,...values};tabCreates.push(clone(tab));tabs.set(tab.id,tab);return clone(tab); },
       async get(id) { if (!tabs.has(id)) throw new Error('No such tab'); return clone(tabs.get(id)); },
       async update(id, values) { Object.assign(tabs.get(id), values); return clone(tabs.get(id)); },
     },
@@ -104,7 +110,7 @@ async function browser(t, options = {}) {
     if (previous) Object.defineProperty(globalThis, 'chrome', previous); else delete globalThis.chrome;
   });
   // Each test gets a new worker module and independent event registrations/storage.
-  await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
+  let worker=await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
   const state = {
     id: 'work', tabId: 1, workspaceTabId: 100, url: 'https://source.test/', title: 'Source',
     items: [], notices: [], scanned: true, jobs: [],
@@ -112,10 +118,11 @@ async function browser(t, options = {}) {
   const persist = () => store.set('workspace:work', clone(state));
   persist();
   return {
-    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,
+    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,contexts,contextCalls,tabCreates,
+    openWorkspace:tab=>worker.openWorkspace(tab),
     async restartWorker() {
       changed.clear();created.clear();alarmEvent.clear();removed.clear();messages.clear();determining.clear();updated.clear();
-      await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
+      worker=await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
     },
     closeWorkspace() { tabs.delete(100); removed.emit(100); },
     complete(id) {
@@ -1057,4 +1064,125 @@ test('a delayed filename decision preserves the completed Chrome absolute actual
   assert.equal(final.filename,'ImageCrate/Frozen/001_image.svg','requested path remains relative');
   assert.equal(final.actualFilename,actual,'the late requested-path decision cannot replace Chrome actual path or its conflict suffix');
   assert.deepEqual(calls,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
+});
+
+test('Stop persists cancellation before a late accepted ID is found, cancels progress and retry clears the intent',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  const stopped=await h.send({type:'cancel'});
+  assert.equal(stopped.ok,true,stopped.error);
+  assert.equal(stopped.data.jobs[0].status,'in_progress');
+  assert.equal(stopped.data.jobs[0].cancelRequested,true);
+  assert.equal(stopped.data.jobs[0].cancelReason,'停止しました。');
+  const cancel=h.chrome.downloads.cancel;
+  h.chrome.downloads.cancel=async id=>{
+    assert.equal(h.store.get('workspace:work').jobs[0].cancelRequested,true,'the Stop intent is durable before Chrome cancellation');
+    return cancel(id);
+  };
+  const item=acceptedSubmission(source,91);
+  h.downloads.set(item.id,item);h.created.emit(item);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'interrupted','late acceptance is cancelled rather than allowed to continue');
+  assert.deepEqual(h.cancelled,[91]);
+  assert.equal(h.store.get('workspace:work').jobs[0].downloadId,91);
+  assert.equal(h.downloads.get(91).state,'interrupted');
+  assert.deepEqual(h.store.get('workspace:work').selectedURLs,[source.url]);
+  const retried=await h.send({type:'retry'});
+  assert.equal(retried.ok,true,retried.error);
+  assert.equal(retried.data.jobs[0].cancelRequested,undefined);
+  assert.equal(retried.data.jobs[0].cancelReason,undefined);
+  assert.equal(retried.data.jobs[0].status,'in_progress');
+});
+
+test('Stop preserves a late accepted file that Chrome has already completed',async t=>{
+  const h=await browser(t);const source=pendingSubmission(h);
+  await h.send({type:'cancel'});
+  const item=acceptedSubmission(source,92,{state:'complete',bytesReceived:10});
+  h.downloads.set(item.id,item);h.created.emit(item);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'complete','completion wins the race with Stop');
+  assert.equal(h.store.get('workspace:work').jobs[0].downloadId,92);
+  assert.deepEqual(h.cancelled,[]);
+  assert.equal(h.downloads.get(92).state,'complete');
+  assert.deepEqual(h.store.get('workspace:work').selectedURLs,[]);
+});
+
+test('Stop cancellation survives worker restart and applies when its accepted ID arrives later',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  await h.send({type:'cancel'});
+  await h.restartWorker();
+  await eventually(()=>h.alarms.size === 1,'the restarted pending cancellation retains its persistent wake');
+  assert.equal(h.store.get('workspace:work').jobs[0].cancelRequested,true);
+  const item=acceptedSubmission(source,93);
+  h.downloads.set(item.id,item);h.changed.emit({id:93,filename:{current:item.filename}});
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'interrupted','the restarted worker cancels newly reconciled progress');
+  assert.deepEqual(h.cancelled,[93]);
+  assert.equal(h.downloads.get(93).state,'interrupted');
+});
+
+test('startup honors a Stop saved before queued jobs were marked interrupted and never starts their Chrome APIs',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);
+  h.state.batch={id:'prepared-stop',format:'original',destination:'downloads'};
+  h.state.jobs=urls.map((url,index)=>({id:`prepared-${index}`,url,filename:`ImageCrate/Frozen/${index}.png`,status:'queued',cancelRequested:true,cancelReason:'停止しました。'}));
+  h.persist();
+  await h.restartWorker();
+  await eventually(()=>h.store.get('workspace:work').jobs.every(job=>job.status === 'interrupted'),'the prepared Stop reaches terminal state after startup');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+  assert.equal(h.alarms.size,0);
+});
+
+test('known IDs whose cancellation has not settled remain recoverable by alarm after worker restart',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);
+  const saved=await h.send({type:'save',urls:[urls[0]]});
+  const id=saved.data.jobs[0].downloadId;
+  const cancel=h.chrome.downloads.cancel;
+  h.chrome.downloads.cancel=async()=>{throw new Error('Chrome has not settled cancellation');};
+  const stopped=await h.send({type:'cancel'});
+  assert.equal(stopped.data.jobs[0].status,'in_progress');
+  assert.equal(stopped.data.jobs[0].cancelRequested,true);
+  await h.restartWorker();
+  await eventually(()=>h.alarms.size === 1,'known-ID cancellation is still background recovery work');
+  h.chrome.downloads.cancel=cancel;
+  h.alarmEvent.emit({name:[...h.alarms.keys()][0]});
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'interrupted','the alarm retries a durable Chrome cancellation');
+  assert.deepEqual(h.cancelled,[id]);
+  await eventually(()=>h.alarms.size === 0,'terminal cancellation clears the recovery alarm');
+});
+
+test('Chrome 116 URL-less workspace tabs stay alive through a matching main-frame extension context',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  h.tabs.set(100,{id:100});
+  h.contexts.push({contextType:'TAB',tabId:100,frameId:0,documentUrl:'chrome-extension://test/workspace.html?id=work'});
+  await h.restartWorker();
+  await eventually(()=>h.alarms.size === 1 && h.contextCalls.length > 0,'startup confirms the otherwise URL-less owner through getContexts');
+  const state=h.store.get('workspace:work');
+  assert.notEqual(state.closed,true);
+  assert.deepEqual(state.selectedURLs,[source.url]);
+  const existing=await h.openWorkspace(h.tabs.get(1));
+  assert.equal(existing,'work','opening the source focuses its existing workspace');
+  assert.equal(h.tabCreates.length,0);
+  assert.deepEqual(h.contextCalls[0],{contextTypes:['TAB'],tabIds:[100],documentUrls:['chrome-extension://test/workspace.html?id=work']});
+});
+
+test('a URL-less workspace is rejected when contexts do not contain its exact main-frame document',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  h.tabs.set(100,{id:100});
+  h.contexts.push({contextType:'TAB',tabId:100,frameId:1,documentUrl:'chrome-extension://test/workspace.html?id=work'},
+    {contextType:'TAB',tabId:100,frameId:0,documentUrl:'chrome-extension://test/workspace.html?id=other'});
+  await h.restartWorker();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'a mismatched context cannot own this session');
+  const next=await h.openWorkspace(h.tabs.get(1));
+  assert.notEqual(next,'work');
+  assert.equal(h.tabCreates.length,1);
+});
+
+test('an explicit foreign workspace URL and a genuinely missing tab cannot be rescued by stale contexts',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  h.tabs.set(100,{id:100,url:'https://unrelated.test/'});
+  h.contexts.push({contextType:'TAB',tabId:100,frameId:0,documentUrl:'chrome-extension://test/workspace.html?id=work'});
+  await h.restartWorker();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'an explicit foreign URL is rejected directly');
+  assert.equal(h.contextCalls.length,0);
+  const state=h.store.get('workspace:work');delete state.closed;h.store.set('workspace:work',state);h.tabs.delete(100);
+  await h.restartWorker();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'a missing tab is closed even when a stale context is listed');
+  assert.equal(h.contextCalls.length,0);
 });

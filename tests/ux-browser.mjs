@@ -22,7 +22,7 @@ const workerPath = join(extension, 'background.js');
 await writeFile(workerPath, (await readFile(workerPath, 'utf8'))
   .replace('let finished=false;', 'globalThis.__qaFilenameEvents ||= [];globalThis.__qaFilenameEvents.push(item);let finished=false;')
   .replace('if (alarm.name !== RECOVERY_ALARM)', 'globalThis.__qaAlarmEvents ||= [];globalThis.__qaAlarmEvents.push(alarm.name);if (alarm.name !== RECOVERY_ALARM)')
-  + '\nglobalThis.__qaOpenWorkspace=openWorkspace;globalThis.__qaCollect=collect;\n');
+  + '\nglobalThis.__qaOpenWorkspace=openWorkspace;globalThis.__qaCollect=collect;globalThis.__qaSerial=serial;\n');
 const manifestPath = join(extension, 'manifest.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 manifest.host_permissions = ['http://127.0.0.1/*'];
@@ -217,6 +217,21 @@ try {
   assert.equal(await manager.evaluate(() => document.activeElement?.closest('.card')?.dataset.url), returnURL, 'Escape returns focus to the originating card control');
   checked('group alternatives, explicit variant selection, fit/100%, next and Escape focus');
 
+  await manager.locator('#view-selected').click();
+  await manager.locator('.card .preview-open').click();
+  await manager.locator('#preview-variants button').filter({ hasText: 'variant-small.svg' }).click();
+  await manager.locator('#preview-select').check(); await selectedCount(manager, 2);
+  await manager.waitForFunction(() => document.querySelectorAll('.card').length === 2);
+  assert.equal(await manager.evaluate(() => document.activeElement?.id), 'preview-select', 'updating the selected gallery keeps dialog focus');
+  await manager.keyboard.press('Escape');
+  await manager.waitForFunction(url => document.activeElement?.closest('.card')?.dataset.url === url, `${origin}/variant-large.svg`);
+  assert.equal(await manager.locator('.card').count(), 2, 'a newly selected alternative appears immediately in the selected gallery');
+  assert.equal(await manager.locator(`.card[data-url="${origin}/variant-small.svg"] .image-select`).isChecked(), true);
+  assert.equal(await manager.locator('#selection').textContent(), '選択2件', 'the summary counts both newly rendered selections as visible');
+  assert.equal(await manager.evaluate(() => document.activeElement?.closest('.card')?.dataset.url), `${origin}/variant-large.svg`);
+  await manager.locator('#view-all').click();
+  checked('selecting an alternative from selected-only preview immediately updates the gallery and restores focus');
+
   await manager.locator('#clear').click(); await selectedCount(manager, 0);
   const firstCheckbox = manager.locator('.image-select').first();
   const firstURL = await firstCheckbox.getAttribute('data-url');
@@ -312,6 +327,11 @@ try {
   const appliedA = await appliedSnapshot();
   assert.equal(appliedA.saveSettings.destination, 'directory'); assert.equal(appliedA.saveSettings.format, 'png');
   assert.deepEqual(appliedA.last, { destination: 'directory', name: 'UX 保存先 A' });
+  const inheritedSource = await context.newPage(); await inheritedSource.goto(`${origin}/?snapshot=A`);
+  const inheritedManager = await openWorkspace(inheritedSource);
+  const inheritedA = (await stateFor(inheritedManager)).saveSettings;
+  assert.equal(inheritedA.destination, 'directory'); assert.equal(inheritedA.format, 'original');
+  assert.ok(inheritedA.directoryKey, 'the inherited destination owns a session-specific handle before opening settings');
   await manager.locator('#destination-change').click();
   await manager.evaluate(() => { window.__qaPickerChoice = 'B'; });
   await manager.locator('#choose-directory').click();
@@ -345,6 +365,23 @@ try {
   assert.match(await manager.locator('#chosen-directory').textContent(), /UX 保存先 B/);
   await closeSettings(manager);
   checked('Apply commits settings and a cloneable OPFS handle; picker cancel and reload retain the applied destination');
+  const assertInheritedA = async () => {
+    await inheritedManager.reload();
+    await inheritedManager.waitForFunction(() => document.querySelector('#message').textContent.includes('前回'));
+    assert.deepEqual((await stateFor(inheritedManager)).saveSettings, inheritedA);
+    assert.equal(await inheritedManager.evaluate(async key => {
+      const { getDirectory } = await import('./directory-store.js'); return (await getDirectory(key)).name;
+    }, inheritedA.directoryKey), 'UX 保存先 A');
+    assert.match(await inheritedManager.locator('#destination-summary').textContent(), /UX 保存先 A/);
+  };
+  await assertInheritedA();
+  const changerSource = await context.newPage(); await changerSource.goto(`${origin}/?snapshot=chrome`);
+  const changer = await openWorkspace(changerSource);
+  await changer.locator('#destination-change').click(); await changer.locator('#destination-downloads').check();
+  await closeSettings(changer, '#settings-done');
+  await assertInheritedA();
+  await inheritedManager.close(); await inheritedSource.close(); await changer.close(); await changerSource.close();
+  checked('new workspaces snapshot inherited folders; other tabs changing folder or Chrome destination cannot redirect them');
   await manager.evaluate(()=>{
     const send=chrome.runtime.sendMessage.bind(chrome.runtime);let drop=true;
     chrome.runtime.sendMessage=async message=>{const response=await send(message);if(drop&&message.type==='settings'&&response?.ok){drop=false;throw new Error('Synthetic acknowledgement loss after commit');}return response;};
@@ -405,6 +442,18 @@ try {
     await manager.keyboard.press('Escape');
     checked(`${width}px geometry, filter controls, long settings draft and preview screenshots`);
   }
+
+  await manager.setViewportSize({width:1280,height:900});
+  const zoomTab=(await stateFor(manager)).workspaceTabId;
+  await worker.evaluate(tabId=>chrome.tabs.setZoom(tabId,2),zoomTab);
+  assert.equal(await worker.evaluate(tabId=>chrome.tabs.getZoom(tabId),zoomTab),2);
+  await manager.waitForFunction(()=>innerWidth<=650);
+  await manager.evaluate(()=>document.querySelector('#filters').open=false);
+  const zoomGeometry=await manager.evaluate(()=>({width:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth,save:document.querySelector('#save').getBoundingClientRect().bottom,height:innerHeight}));
+  assert.equal(zoomGeometry.overflow,false);assert.ok(zoomGeometry.save<=zoomGeometry.height+1);
+  await screenshot(manager,'actual-zoom-200');
+  await worker.evaluate(tabId=>chrome.tabs.setZoom(tabId,1),zoomTab);
+  report.actualZoom={factor:2,...zoomGeometry};checked('real Chrome 200% tab zoom keeps the interface and save action usable');
 
   // P14: preserve the actual response bytes while resolving an extensionless
   // original download from Chrome's MIME information. CDP controls only this
@@ -500,11 +549,13 @@ try {
   await manager.emulateMedia({ reducedMotion: 'no-preference', forcedColors: 'none' });
   assert.deepEqual(errors, [], 'no uncaught workspace errors');
   checked('reduced motion and forced-colors native checkbox regression');
-  // A real Chrome alarm must wake the extension with no workspace polling.
-  // Only its scheduled time is shortened at the boundary for this test.
+  // Exercise Chrome's real alarm event with no workspace polling. The separate
+  // smoke test covers an explicit worker stop/restart. DevTools stopAllWorkers
+  // is not a reliable way to model natural alarm wake in this test harness.
   await manager.close();
   const alarmStateId='ux-alarm-orphan';
-  await worker.evaluate(async({origin,id})=>{
+  await source.waitForTimeout(500);
+  await worker.evaluate(async({origin,id})=>globalThis.__qaSerial(async()=>{
     const now=Date.now();
     await chrome.storage.session.set({[`workspace:${id}`]:{
       id,tabId:-2,workspaceTabId:-1,url:origin,title:'Alarm recovery',closed:true,items:[],selectedItems:[],selectedURLs:[],history:[],notices:[],ui:{},revision:1,
@@ -513,23 +564,20 @@ try {
         {id:'queued-after-orphan',url:origin+'/red.svg',filename:'ImageCrate/Alarm recovery/002_red.svg',status:'queued'}]
     }});
     await chrome.alarms.create('imagecrate-pending-downloads',{when:now+3000,periodInMinutes:1});
-  },{origin,id:alarmStateId});
-  const wake=context.waitForEvent('serviceworker',{timeout:90000,predicate:value=>value.url().includes(id)});
-  const stopSession=await context.newCDPSession(source);
-  await stopSession.send('ServiceWorker.enable');await stopSession.send('ServiceWorker.stopAllWorkers');
-  const awakened=await wake;
-  const wakeDeadline=Date.now()+15000;let recovered=false;
+  }),{origin,id:alarmStateId});
+  const awakened=worker;
+  const wakeDeadline=Date.now()+90000;let recovered=false;
   while(Date.now()<wakeDeadline){
     recovered=await awakened.evaluate(async id=>!(await chrome.storage.session.get(`workspace:${id}`))[`workspace:${id}`] && globalThis.__qaAlarmEvents?.includes('imagecrate-pending-downloads'),alarmStateId);
     if(recovered)break;await source.waitForTimeout(50);
   }
-  assert.equal(recovered,true,'the alarm reconciles the orphan and completes queued files without a workspace');
+  assert.equal(recovered,true,'the real alarm event reconciles the orphan and completes queued files without a workspace');
   const recoveredDownloads=await awakened.evaluate(()=>chrome.downloads.search({filenameRegex:'Alarm recovery'}));
   assert.equal(recoveredDownloads.length,1);assert.equal(recoveredDownloads[0].state,'complete');
   assert.match(await readFile(recoveredDownloads[0].filename,'utf8'),/<svg/);
   assert.equal(await awakened.evaluate(()=>chrome.alarms.get('imagecrate-pending-downloads')),undefined,'the recovery alarm is removed after reconciliation');
   report.limits.push('The real Chrome alarm wake test moves only the alarm scheduled time to 3 seconds; production uses a one-minute delay.');
-  checked('real alarm wakes a stopped worker after workspace closure, reconciles an orphan, completes the queue and clears the alarm');
+  checked('real Chrome alarm after workspace closure reconciles an orphan, completes the queue and clears the alarm');
   await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2));
   console.log(`ImageCrate UX browser PASS: ${report.checks.length} checks. Screenshots/report: ${output}`);
   console.log('OS picker, real toolbar consent, screen reader and human experience remain unverified.');

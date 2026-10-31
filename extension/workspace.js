@@ -93,6 +93,7 @@ function persistUI(patch) {
 }
 const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,
   onSelect:urls=>persistUI({selectedURLs:urls}),onView:patch=>persistUI(patch).catch(error),onError:error,
+  onRender:items=>{visible=items;updateSummary();},
   onMeasure:update=>{measureUpdates.set(update.url,update);clearTimeout(measureTimer);measureTimer=setTimeout(()=> {
     const updates=[...measureUpdates.values()];measureUpdates.clear();
     send('dimensions',{updates}).then(next=>{applyState(next);}).catch(error);
@@ -226,12 +227,27 @@ function cancelSettings() {
   if(closingSettings)return;
   settingsGeneration++;draft=null;draftHandle=null;$('save-settings').close();renderDestination();$('destination-change').focus();
 }
+async function commitSettings(input,handle) {
+  const candidate={...input};let preparedKey;
+  try {
+    if(handle){preparedKey=`session:${sessionId}:${crypto.randomUUID()}`;await send('settings-prepare',{directoryKey:preparedKey});await putDirectory(preparedKey,handle);candidate.directoryKey=preparedKey;}
+    return await send('settings',{settings:candidate});
+  } catch(e) {
+    let current;try{current=await send('get');}catch{}
+    const committed=current?.saveSettings && (!preparedKey||current.saveSettings.directoryKey===preparedKey)
+      && ['destination','folderName','format'].every(key=>(current.saveSettings[key] || (key==='format'?'original':''))===(candidate[key] || (key==='format'?'original':'')));
+    if(committed)return current;
+    // An unacknowledged commit may already own the handle. Only remove it once
+    // a worker snapshot confirms that it belongs to no applied settings.
+    if(preparedKey && current && current.saveSettings?.directoryKey!==preparedKey){await send('settings-abort',{directoryKey:preparedKey}).catch(()=>{});await deleteDirectory(preparedKey).catch(()=>{});}
+    throw current?e:new Error('設定の適用結果を確認できません。接続が戻ってから「設定を適用」で確認してください。');
+  }
+}
 async function closeSettings() {
   if(closingSettings || !draft)return;
   const candidate={...draft},handle=draftHandle,permission=draftPermission;
   if(candidate.destination==='directory' && !handle){settingsError('保存するフォルダを選んでください。');return;}
   closingSettings=true;renderDestination();$('settings-done').disabled=true;$('settings-done').textContent='設定を保存中…';
-  let preparedKey;
   const accept=async next=>{
     settings={...next.saveSettings};directoryHandle=handle;directoryPermission=permission;applyState(next);
     try {await putLastDestination({handle,destination:settings.destination});}
@@ -239,20 +255,9 @@ async function closeSettings() {
     draft=null;draftHandle=null;settingsGeneration++;$('save-settings').close();
   };
   try {
-    if(handle){preparedKey=`session:${sessionId}:${crypto.randomUUID()}`;await send('settings-prepare',{directoryKey:preparedKey});await putDirectory(preparedKey,handle);candidate.directoryKey=preparedKey;}
-    const next=await send('settings',{settings:candidate});
-    await accept(next);
+    await accept(await commitSettings(candidate,handle));
   } catch(e) {
-    let current;try{current=await send('get');}catch{}
-    const committed=current?.saveSettings && (!preparedKey||current.saveSettings.directoryKey===preparedKey)
-      && ['destination','folderName','format'].every(key=>(current.saveSettings[key] || (key==='format'?'original':''))===(candidate[key] || (key==='format'?'original':'')));
-    if(committed)await accept(current);
-    else {
-      // A lost acknowledgement does not prove that commit failed. Preserve the
-      // prepared handle until a worker snapshot confirms it is unreferenced.
-      if(preparedKey && current && current.saveSettings?.directoryKey!==preparedKey){await send('settings-abort',{directoryKey:preparedKey}).catch(()=>{});await deleteDirectory(preparedKey).catch(()=>{});}
-      settingsError(current?publicError(e):'設定の適用結果を確認できません。接続が戻ってから「設定を適用」で確認してください。');
-    }
+    settingsError(publicError(e));
   }
   finally {closingSettings=false;$('settings-done').disabled=false;$('settings-done').textContent='設定を適用';renderDestination();updateSummary();if(!$('save-settings').open)$('destination-change').focus();}
 }
@@ -411,12 +416,26 @@ try {
   state=await send('hello');selected=new Set(state.selectedURLs || []);$('source-title').textContent=state.title;$('source-title').title=state.title;
   let remembered;
   try {
-    await send('prune-directories');remembered=await getLastDestination();
-    directoryHandle=state.saveSettings?.directoryKey?await getDirectory(state.saveSettings.directoryKey):(await getDirectory(`session:${sessionId}`) || remembered?.handle);
-    if(directoryHandle)directoryPermission=await directoryHandle.queryPermission({mode:'readwrite'});
+    await send('prune-directories');
+    if(!state.saveSettings&&!state.batch)remembered=await getLastDestination();
     if(state.batch?.destination==='directory'){batchDirectoryHandle=await getDirectory(`batch:${state.batch.id}`);if(batchDirectoryHandle)batchDirectoryPermission=await batchDirectoryHandle.queryPermission({mode:'readwrite'});}
-  } catch(e){error(e);}
-  settings={format:'original',...(state.saveSettings || {destination:remembered?.destination==='directory'&&directoryHandle?'directory':'downloads',folderName:state.title,directoryName:directoryHandle?.name || ''})};
+    if(state.saveSettings)directoryHandle=await getDirectory(state.saveSettings.directoryKey || `session:${sessionId}`);
+    else if(state.batch)directoryHandle=state.batch.destination==='directory'?(batchDirectoryHandle || await getDirectory(`session:${sessionId}`)):null;
+    else directoryHandle=await getDirectory(`session:${sessionId}`) || remembered?.handle;
+    if(directoryHandle)directoryPermission=await directoryHandle.queryPermission({mode:'readwrite'});
+  } catch(e){error(e);if(!state.saveSettings)throw e;}
+  let sessionSettings=state.saveSettings;
+  if(!sessionSettings) {
+    // Inherit the last location once. Pin its handle and defaults to this
+    // session before any interaction; another workspace may change "last".
+    const initial=state.batch?saveSettings(state.batch,state.title):{destination:remembered?.destination==='directory'&&directoryHandle?'directory':'downloads',
+      folderName:state.title,directoryName:directoryHandle?.name || '',format:'original'};
+    // Older sessions could start a batch before recording settings. Its fixed
+    // snapshot is authoritative while active; commit it on a later reload.
+    if(state.batch&&summarizeJobs(state.jobs).active)sessionSettings=initial;
+    else {state=await commitSettings(initial,directoryHandle);sessionSettings=state.saveSettings;}
+  }
+  settings={format:'original',...sessionSettings};
   if(settings.destination==='directory'&&directoryHandle)settings.directoryName=directoryHandle.name;
   $('folder-name').value=settings.folderName;$('output-format').value=settings.format;renderDestination();
   try{$('source-domain').textContent=new URL(state.url).hostname;}catch{}

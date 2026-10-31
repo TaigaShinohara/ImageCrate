@@ -11,7 +11,9 @@ const {chromium}=await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const repo=fileURLToPath(new URL('../',import.meta.url));
 const scratch=await mkdtemp(join(tmpdir(),'media-extension-qa-'));
 const extension=join(scratch,'extension');await cp(join(repo,'extension'),extension,{recursive:true});
-const workerPath=join(extension,'background.js');await writeFile(workerPath,(await readFile(workerPath,'utf8'))+'\nglobalThis.__openWorkspace=openWorkspace;globalThis.__workerBoot=crypto.randomUUID();\n');
+const workerPath=join(extension,'background.js');await writeFile(workerPath,(await readFile(workerPath,'utf8'))+'\nglobalThis.__openWorkspace=openWorkspace;globalThis.__workerBoot=crypto.randomUUID();globalThis.__restoreQA=({key,original})=>serial(()=>chrome.storage.session.set({[key]:original}));\n');
+// Fixture replacement must not race the real UI's queued persistence writes.
+const workspacePath=join(extension,'workspace.js');await writeFile(workspacePath,(await readFile(workspacePath,'utf8'))+'\nglobalThis.__flushQAUI=async()=>{clearTimeout(scrollTimer);clearTimeout(measureTimer);await uiWrites.catch(()=>{});clearTimeout(scrollTimer);clearTimeout(measureTimer);};\n');
 const manifest=JSON.parse(await readFile(join(extension,'manifest.json'),'utf8'));
 manifest.host_permissions=['http://127.0.0.1/*'];await writeFile(join(extension,'manifest.json'),JSON.stringify(manifest));
 let clip=Buffer.alloc(0), failedOnce=true, slowDirectoryWrites=false;
@@ -484,6 +486,7 @@ try {
     await manager.locator('#clear').click();await manager.emulateMedia({forcedColors:'none',reducedMotion:'no-preference'});
     await manager.setViewportSize({width:1280,height:900});
     // The synthetic session belongs only to this temporary Chrome profile. Restore it afterward.
+    await manager.evaluate(()=>globalThis.__flushQAUI());
     const stressState=await restartedWorker.evaluate(async ({managerUrl,origin})=>{
       const key=`workspace:${new URL(managerUrl).searchParams.get('id')}`,original=(await chrome.storage.session.get(key))[key];
       const items=Array.from({length:500},(_,index)=>({url:`${origin}/stress-${String(index).padStart(3,'0')}.svg`,width:640,height:480,alt:`Synthetic image ${index}`,type:'image'}));
@@ -506,7 +509,8 @@ try {
       }
       console.log(`ImageCrate 500-candidate synchronous filter timings (ms): ${stressResults.map(result=>result.elapsedMs).join(', ')}. These are local measurements, not human usability results.`);
     } finally {
-      await restartedWorker.evaluate(async ({key,original})=>chrome.storage.session.set({[key]:original}),stressState);
+      await manager.evaluate(()=>globalThis.__flushQAUI());
+      await restartedWorker.evaluate(state=>globalThis.__restoreQA(state),stressState);
       await manager.reload();await manager.waitForFunction(()=>document.querySelector('#count').textContent.includes('全7件'));
     }
   }
