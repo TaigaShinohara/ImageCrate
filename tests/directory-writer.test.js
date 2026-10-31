@@ -66,7 +66,7 @@ test('directory writes choose a new name and never open existing files writable'
     fetchImpl:async (_url, settings) => { options = settings; return image(); },
     onProgress:value => progress.push(value)
   });
-  assert.deepEqual(result, {filename:'001_photo (3).png', bytesReceived:3, totalBytes:3});
+  assert.deepEqual(result, {filename:'001_photo (3).png', bytesReceived:3, totalBytes:3, formatKnown:true, mime:'image/png'});
   assert.deepEqual([...h.entries.get('001_photo.png').data], [9]);
   assert.deepEqual([...h.entries.get('001_photo (1).png').data], [8]);
   assert.deepEqual(h.events.filter(([type]) => type === 'open'), [['open', '001_photo (3).png']]);
@@ -217,4 +217,61 @@ test('an already cancelled write performs no request and invalid leaf paths are 
     await assert.rejects(writeImage(h.directory, name, 'https://images.test/photo.png'), /不正/);
   }
   assert.equal(h.entries.size, 0);
+});
+
+test('original image names use the received MIME before collision reservation', async () => {
+  const h = directoryFixture({existing:{'photo.png':[9]}});
+  const result = await writeImage(h.directory, 'photo.img', 'https://images.test/render', {
+    fetchImpl:async () => image()
+  });
+  assert.equal(result.filename, 'photo (1).png');
+  assert.equal(result.formatKnown, true); assert.equal(result.mime, 'image/png');
+  assert.equal(h.entries.has('photo.img'), false);
+  assert.deepEqual([...h.entries.get('photo.png').data], [9]);
+});
+
+test('unknown MIME sniffs split prefixes and streams all original bytes before completion', async () => {
+  const h = directoryFixture(); const written = deferred();
+  const prefix = Uint8Array.from([137,80,78,71,13,10,26,10]);
+  let stream;
+  const body = new ReadableStream({start(controller) {
+    stream = controller; controller.enqueue(prefix.subarray(0, 3)); controller.enqueue(prefix.subarray(3));
+  }});
+  const saving = writeImage(h.directory, 'photo.img', 'https://images.test/render', {
+    fetchImpl:async () => new Response(body, {headers:{'content-type':'application/octet-stream'}}),
+    onProgress:({bytesReceived}) => { if (bytesReceived === 8) written.resolve(); }
+  });
+  await written.promise;
+  assert.ok(h.events.some(([event]) => event === 'write'), 'writes begin before the body ends');
+  assert.equal(h.events.some(([event]) => event === 'close'), false);
+  stream.enqueue(Uint8Array.from([2,3,4])); stream.close();
+  const result = await saving;
+  assert.equal(result.filename, 'photo.png'); assert.equal(result.formatKnown, true);
+  assert.equal(result.bytesReceived, 11);
+  assert.deepEqual([...h.entries.get('photo.png').data], [...prefix,2,3,4]);
+});
+
+test('unrecognized content keeps a neutral suffix and reports that the format is unknown', async () => {
+  const h = directoryFixture(); const contents = Uint8Array.from([1,2,3,4]);
+  const result = await writeImage(h.directory, 'photo.jpg', 'https://images.test/render', {
+    fetchImpl:async () => new Response(contents)
+  });
+  assert.deepEqual(result, {filename:'photo.img', bytesReceived:4, totalBytes:4, formatKnown:false, mime:''});
+  assert.deepEqual([...h.entries.get('photo.img').data], [...contents]);
+});
+
+test('cancel while waiting for an unknown signature creates no file', async () => {
+  const h = directoryFixture(); const controller = new AbortController(); const reading = deferred();
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(stream) { stream.enqueue(Uint8Array.from([137,80,78])); },
+    pull() { reading.resolve(); },
+    cancel() { cancelled = true; }
+  });
+  const saving = writeImage(h.directory, 'photo.img', 'https://images.test/render', {
+    signal:controller.signal, fetchImpl:async () => new Response(body)
+  });
+  await reading.promise; controller.abort();
+  await assert.rejects(saving, {name:'AbortError'});
+  assert.equal(cancelled, true); assert.equal(h.entries.size, 0);
 });

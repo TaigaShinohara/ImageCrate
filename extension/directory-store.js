@@ -48,6 +48,27 @@ export const getDirectory = key => access(key, 'readonly', store => store.get(ke
 export const putDirectory = (key, handle) => access(key, 'readwrite', store => store.put(handle, key));
 export const deleteDirectory = key => access(key, 'readwrite', store => store.delete(key));
 
+export async function getLastDestination() {
+  const stored = await access('last-destination', 'readonly', store => store.get('last-destination'));
+  if (stored && ['directory','downloads'].includes(stored.destination)) {
+    return {handle:stored.handle || null, destination:stored.destination};
+  }
+  const handle = await getDirectory('last');
+  return handle ? {handle, destination:'directory'} : null;
+}
+
+export function putLastDestination({handle = null, destination} = {}) {
+  if (!['directory','downloads'].includes(destination) || (destination === 'directory' && !handle)) {
+    return Promise.reject(new Error('保存先の設定が不正です。もう一度フォルダを選んでください。'));
+  }
+  // The selected handle and destination mode are one record. Update the old
+  // handle-only entry in the same transaction for existing callers and data.
+  return access('last-destination', 'readwrite', store => {
+    if (handle) store.put(handle, 'last'); else store.delete('last');
+    return store.put({handle, destination}, 'last-destination');
+  });
+}
+
 export async function pruneDirectories(validKeys) {
   const keep = new Set(validKeys);
   const db = await database();

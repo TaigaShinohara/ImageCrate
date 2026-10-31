@@ -1,3 +1,5 @@
+import {extensionForMime, resolveImageFilename} from './image-format.js';
+
 const encoder = new TextEncoder();
 const LOCK = 'imagecrate-directory-write';
 const IDLE_TIMEOUT = 30000;
@@ -103,25 +105,45 @@ async function transfer(directory, filename, url, {signal, onProgress, fetchImpl
     while (!chunk.done && !chunk.value?.byteLength) chunk = await waitFor(reader.read(), controller.signal);
     if (chunk.done) throw new Error('画像データが空です。元ページや接続を確認してください。');
     progress();
-    entry = await reserve(directory, filename, controller.signal);
+    const pending = [chunk.value];
+    let prefix = chunk.value.subarray(0, 64);
+    // Untyped responses may split a signature across small network chunks.
+    // Retain only a short prefix and the current chunks, never the full body.
+    while (!extensionForMime(mime) && prefix.byteLength < 64
+      && !resolveImageFilename(filename, mime, prefix).known) {
+      chunk = await waitFor(reader.read(), controller.signal);
+      if (chunk.done) break;
+      if (!chunk.value?.byteLength) continue;
+      progress();
+      pending.push(chunk.value);
+      const next = new Uint8Array(Math.min(64, prefix.byteLength + chunk.value.byteLength));
+      next.set(prefix); next.set(chunk.value.subarray(0, next.length - prefix.byteLength), prefix.byteLength);
+      prefix = next;
+    }
+    const format = resolveImageFilename(filename, mime, prefix);
+    entry = await reserve(directory, format.filename, controller.signal);
     checkAbort(controller.signal);
     writable = await entry.handle.createWritable();
-    do {
+    const write = async value => {
       checkAbort(controller.signal);
-      if (chunk.value?.byteLength) {
-        await waitFor(writable.write(chunk.value), controller.signal);
-        bytesReceived += chunk.value.byteLength;
+      if (value?.byteLength) {
+        await waitFor(writable.write(value), controller.signal);
+        bytesReceived += value.byteLength;
         progress();
         // Progress reporting must not turn an otherwise valid file into a failure.
         try { Promise.resolve(onProgress?.({bytesReceived, totalBytes})).catch(() => {}); } catch {}
       }
+    };
+    for (const value of pending) await write(value);
+    while (!chunk.done) {
       chunk = await waitFor(reader.read(), controller.signal);
-    } while (!chunk.done);
+      if (!chunk.done) await write(chunk.value);
+    }
     checkAbort(controller.signal);
     await waitFor(writable.close(), controller.signal);
     // close() is the point at which a successful write becomes a saved file.
     committed = true;
-    return {filename:entry.name, bytesReceived, totalBytes:bytesReceived};
+    return {filename:entry.name, bytesReceived, totalBytes:bytesReceived, formatKnown:format.known, mime:format.mime};
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener('abort', stop);
