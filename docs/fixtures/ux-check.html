@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ImageCrate 本人試用・合成画像</title>
+  <style>
+    body { max-width: 960px; margin: 32px auto; padding: 0 18px 40px; font: 16px/1.7 system-ui, sans-serif; color: #252631; background: #f7f8fb; }
+    h1 { font-size: 26px; } h2 { font-size: 20px; } button { min-height: 44px; margin: 4px; padding: 8px 12px; font: inherit; }
+    .examples { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; }
+    figure { margin: 0; padding: 14px; border: 1px solid #d8dce7; border-radius: 10px; background: white; }
+    figure img { display: block; width: 100%; height: 160px; object-fit: contain; background: #eef0f5; }
+    figcaption { margin-top: 8px; } #status { min-height: 2em; } #many img { width: 12px; height: 12px; }
+    :focus-visible { outline: 3px solid #6351d9; outline-offset: 3px; }
+  </style>
+</head>
+<body>
+  <h1>ImageCrate 本人試用・合成画像</h1>
+  <p>すべてこのページ内のSVG画像です。外部画像・個人データ・認証は使いません。ImageCrateの拡張アイコンを押し、画像を見比べて少数を選んでください。</p>
+  <p>赤い四角A/Bは右下の白い図形が違います。pictureには400pxと1600pxの候補があります。元ページの表示サイズと、候補の実画素数を見比べられます。</p>
+  <div id="examples" class="examples"></div>
+  <h2>元ページを変えて再スキャン</h2>
+  <p>下の操作後はImageCrateで再スキャンしてください。501候補追加後は「続きの候補」を試せます。全候補を選択する必要はありません。</p>
+  <button id="add-one" type="button">紫の三角を1件追加</button>
+  <button id="remove-a" type="button">赤い四角Aを元ページから外す</button>
+  <button id="add-many" type="button">501候補を追加</button>
+  <p id="status" role="status"></p>
+  <div id="many" aria-label="data-srcで追加した501候補"></div>
+  <script>
+    const svg = (name, width, height, color, shape = 'circle') => {
+      const mark = shape === 'triangle' ? '<path d="M240 160 330 260 150 260Z" fill="white"/>'
+        : shape === 'square' ? '<rect x="210" y="180" width="95" height="75" fill="white"/>'
+        : '<circle cx="260" cy="220" r="48" fill="white"/>';
+      const text = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 400 300"><rect width="400" height="300" fill="${color}"/>${mark}<text x="20" y="55" font-size="26" fill="white">${name}</text></svg>`;
+      return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`;
+    };
+    function example(id, title, url, alt) {
+      const figure = document.createElement('figure'); figure.id = id;
+      const image = new Image(); image.src = url; image.alt = alt;
+      const caption = document.createElement('figcaption'); caption.textContent = title;
+      figure.append(image, caption); document.querySelector('#examples').append(figure); return figure;
+    }
+    example('red-a', '赤い四角A：右下が白い丸', svg('RED A', 800, 600, '#bf424e'), '赤い四角A、右下に白い丸');
+    example('red-b', '赤い四角B：右下が白い三角', svg('RED B', 800, 600, '#bf424e', 'triangle'), '赤い四角B、右下に白い三角');
+    example('blue', '青い画像：白い丸', svg('BLUE', 640, 480, '#347db4'), '青い背景と白い丸');
+    example('green', '緑の画像：altで意味を説明', svg('GREEN', 900, 600, '#3b8059', 'square'), '緑の背景、右下に白い長方形、左上にGREEN');
+    const pictureFigure = document.createElement('figure'); pictureFigure.id = 'picture';
+    const picture = document.createElement('picture'), source = document.createElement('source'), fallback = new Image();
+    source.type = 'image/svg+xml';
+    source.srcset = `${svg('SMALL 400', 400, 300, '#7053a6')} 1x, ${svg('LARGE 1600', 1600, 1200, '#7053a6', 'triangle')} 2x`;
+    fallback.src = svg('FALLBACK 800', 800, 600, '#7053a6', 'square'); fallback.alt = '紫のpicture、400pxと1600pxの別候補';
+    picture.append(source, fallback);
+    const pictureCaption = document.createElement('figcaption'); pictureCaption.textContent = '同じpicture：400 / 1600pxとfallback候補';
+    pictureFigure.append(picture, pictureCaption); document.querySelector('#examples').append(pictureFigure);
+    document.querySelector('#add-one').onclick = event => {
+      example('added', '再スキャンで追加される紫の三角', svg('ADDED', 1000, 750, '#8c439c', 'triangle'), '今回追加した紫の三角');
+      event.currentTarget.disabled = true; document.querySelector('#status').textContent = '紫の三角を追加しました。ImageCrateで再スキャンしてください。';
+    };
+    document.querySelector('#remove-a').onclick = event => {
+      document.querySelector('#red-a')?.remove(); event.currentTarget.disabled = true;
+      document.querySelector('#status').textContent = '赤い四角AをDOMから外しました。ImageCrateで再スキャンすると、選択していたAは選択済みに残ります。';
+    };
+    document.querySelector('#add-many').onclick = event => {
+      const fragment = document.createDocumentFragment();
+      for (let index = 1; index <= 501; index++) {
+        const image = new Image(); image.dataset.src = svg(`Candidate ${String(index).padStart(3, '0')}`, 600, 450, '#565b70', index % 2 ? 'circle' : 'triangle');
+        image.alt = `追加候補${String(index).padStart(3, '0')}`; fragment.append(image);
+      }
+      document.querySelector('#many').append(fragment); event.currentTarget.disabled = true;
+      document.querySelector('#status').textContent = 'data-srcの候補を501件追加しました。再スキャン後、「続きの候補」で残りを確認してください。';
+    };
+  </script>
+</body>
+</html>
