@@ -1,5 +1,9 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## ImageCrate — 保存先とフォルダ名、2026-10-31
+
+保存先の指定・まとめるフォルダ名・batch固定・権限と状態の契約は [SAVE-DESTINATION.md](SAVE-DESTINATION.md) を優先する。従来のChromeダウンロード先を初期値にし、任意フォルダへの直接保存を選べる。保存先はfooterで確認、編集はdialog。通常保存のタブ閉鎖後継続を維持し、直接保存方式だけタブ保持を開始前に表示する。
+
 ## ImageCrate v3 — gallery refinement, 2026-10-31
 
 ImageCrateの画面表現は [UX-REFINEMENT.md](UX-REFINEMENT.md) の詳細案v1を優先する。検索、画像グリッド、選択保存を常時表示。最小寸法/形式と使い方は開閉式とし、適用条件のチップと解除経路は閉鎖時も残す。カードの寸法/形式/保存状態、非表示選択件数、完了/中断/再試行は維持する。ローカルSVG、短い選択/開閉の反応、実状態に対応した進捗バーを用い、reduced-motionに対応。権限、取得、保存、sessionデータの契約はv2から変更しない。独立審査、案の比較、検証条件と人間評価の未確認範囲はリンク先を参照。

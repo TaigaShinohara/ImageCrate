@@ -1,9 +1,34 @@
 export function sanitizePart(value, fallback = 'untitled') {
   const clean = String(value ?? '').normalize('NFKC')
     .replace(/[\x00-\x1f\x7f<>:"/\\|?*\u202a-\u202e\u2066-\u2069]/g, '_')
-    .replace(/\s+/g, ' ').replace(/^\.+|[. ]+$/g, '').trim().slice(0, 90);
-  const safe = clean || fallback;
-  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(safe) ? `_${safe}` : safe;
+    .replace(/\s+/g, ' ').trim().replace(/^\.+|[. ]+$/g, '');
+  // Leave room for a file extension, sequence number and conflict suffix on
+  // filesystems whose component limit is measured in UTF-8 bytes.
+  const candidate = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(clean) ? `_${clean}` : clean;
+  let safe = ''; let bytes = 0; let count = 0;
+  for (const character of candidate) {
+    const size = new TextEncoder().encode(character).length;
+    if (bytes + size > 160 || count >= 90) break;
+    safe += character; bytes += size; count++;
+  }
+  safe = safe.replace(/[. ]+$/g, '') || fallback;
+  return safe;
+}
+export function saveSettings(input = {}, title = 'ページ') {
+  return {destination: input.destination === 'directory' ? 'directory' : 'downloads',
+    folderName: sanitizePart(String(input.folderName || '').trim() || title, 'ページ'),
+    directoryName: String(input.directoryName || '').slice(0, 512)};
+}
+export function destinationLabel(settings) {
+  return settings.destination === 'directory'
+    ? `選択した「${settings.directoryName || 'フォルダ'}」 / ${settings.folderName}`
+    : `Chromeのダウンロード先 / ImageCrate / ${settings.folderName}`;
+}
+export function permissionOrigins(urls) {
+  return [...new Set(urls.flatMap(value => {
+    try { const url = new URL(value); return /^https?:$/.test(url.protocol) && url.hostname && !url.hostname.includes('*') ? [`${url.protocol}//${url.hostname}/*`] : []; }
+    catch { return []; }
+  }))];
 }
 export function mediaType(url, mime = '') {
   if (/mpegurl|dash\+xml/i.test(mime)) return 'stream';
@@ -17,7 +42,7 @@ export function allowedURL(value, kind) {
   try {
     const u = new URL(value);
     if (u.username || u.password) return false;
-    if (u.protocol === 'http:' || u.protocol === 'https:') return true;
+    if (u.protocol === 'http:' || u.protocol === 'https:') return !u.hostname.includes('*');
     return kind === 'images' && /^data:image\/(png|jpe?g|gif|webp|avif|svg\+xml|bmp|x-icon);/i.test(value)
       && value.length <= 131072;
   } catch { return false; }

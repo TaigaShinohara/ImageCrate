@@ -10,6 +10,7 @@
     "downloads",
     "storage"
   ],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "action": {
     "default_title": "ImageCrateを開く"
   },

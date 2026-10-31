@@ -68,3 +68,16 @@
 - 変更前後の同じ合成fixtureで常設説明と条件欄が減り、通常状態のグリッド開始が504pxから365pxへ前進。理解・読みやすさ・快適さの改善は人間未確認。
 
 今回の残件: 新UIを通常Chromeで再読込し、初回/反復の選択→絞込→非表示選択込み保存→結果確認を本人が試す。特に条件の見つけやすさ、保存対象の理解、文字の読みやすさ、動きのテンポ、スクリーンリーダーを確認する。実サイトの互換性の残件は継続。
+
+## 保存先・フォルダ名の指定 — 2026-10-31
+
+- `npm test`: 32 PASS / 1 SKIP（既存の関連動画製品用テスト）。Chrome既定先の名前指定、任意先batchのowner/更新/停止/閉鎖/再読込、元の先への中断分再試行、ファイル非上書き、close確定待ち、通信/書込失敗、空応答、30秒無進捗、同時保存、日本語/絵文字/予約名、安全化の冪等性、具体hostだけの許可要求を確認。
+- `npm run check` と `git diff --check`: PASS。Chrome116+ / MV3 / buildlessを維持。常時host権限・Cookie・debugger・webRequest・実行時ライブラリは追加していない。HTTP/S optional host宣言を追加し、保存対象の具体hostだけを任意方式の保存clickで要求する。
+- `npm run test:browser`: 隔離Chrome156.0.8078.79 / Playwright1.64.1 / localhost合成画像でPASS。通常の収集/選択/非表示選択込み保存/解除/再スキャン/中断再試行/worker再起動/500件検索も回帰確認。
+- 新規UI: dialogのkeyboard移動・Escape・閉鎖後focus、空名のページ名補完・安全化preview・リセット、確定時の設定保存、任意名を渡したChrome downloadの実完了とSVG内容を確認。CDPのdownloadPath制御が拡張の相対フォルダ/ファイル名を上書きするため、通常方式はAPIへ渡した相対pathの完全一致と実ファイル内容の検証に限定。通常Chromeで今回の新しい任意名を物理サブフォルダに作る操作は未実施。
+- 任意先: OS pickerだけを境界で差し替え、実際のOPFS DirectoryHandleを使用。IndexedDBへのhandleのstructured clone、実fetch→stream→File System Access write→close→SVG内容、再選択保存でsuffix付与と旧ファイル保持、再読込後の場所/名前復元を確認。配信元の許可拒否・復元handleの許可拒否は権限API境界を差し替え、選択/旧設定/batch保持と無書込を確認。実OSの許可操作とは区別する。
+- 実fetchを先頭chunk後で止め、Stop→自分の未完成ファイルの後片付け→設定名変更→元batchの場所へretryを確認。別の保存でbeforeunload警告を受け入れて再読込し、未完了を中断へ回復→retry→実ファイル完成まで確認。
+- 640 CSS pxと360×800で長い日本語名・custom説明・batch表示が共存し、横overflowなし、保存ボタンとfooterがviewport内、dialogの全文折返し・sticky閉じる・scrollによる確定操作への到達を確認。スクリーンショットも主担当が目視。実ブラウザzoom操作・スクリーンリーダー・人間の理解や快適さは未評価。
+- 独立設計審査とコードレビューを実施。handle整理の別タブ競合、二段許可のuser activation、preview/実pathの安全化差、確定直後reloadと確定中再編集を修正。最終コードレビューで対象範囲の未解決指摘なし。
+
+残件: 通常Chromeで拡張を再読込し、実OS folder pickerで任意の場所を選んで画像を保存する代表試験。実際の書込権限の拒否/再許可、サイト固有の認証/リダイレクト、外付け/ネットワーク保存先、スクリーンリーダー、本人の理解・操作感は未確認。強制終了等で後片付けが走らない場合は、未完成の空ファイルが残ることがある。既存の完成ファイルは上書きせず、新しい名前で再試行する。
