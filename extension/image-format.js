@@ -58,6 +58,8 @@ function formatFromBytes(value) {
   return null;
 }
 
+export function extensionForBytes(value) {return formatFromBytes(value)?.[0] || '';}
+
 export function resolveImageFilename(filename, mime, prefixBytes) {
   const format = formatFromBytes(prefixBytes) || declaredFormat(mime);
   const extension = format?.[0] || 'img';

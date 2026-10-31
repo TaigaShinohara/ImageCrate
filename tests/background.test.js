@@ -23,7 +23,7 @@ function event() {
     emit: (...args) => [...listeners].map((listener) => listener(...args)) };
 }
 
-async function browser(t) {
+async function browser(t, options = {}) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'chrome');
   const store = new Map();
   const tabs = new Map([
@@ -35,6 +35,15 @@ async function browser(t) {
   const cancelled = [];
   let nextDownloadId = 8;
   const changed = event();
+  const created=event();
+  const alarmEvent=event();
+  const alarms=new Map();
+  const alarmCreates=[];
+  const alarmClears=[];
+  const determining = event();
+  const updated = event();
+  const scriptCalls=[];
+  const scriptResults=[];
   const removed = event();
   const messages = event();
   const clone = (value) => value === undefined ? undefined : structuredClone(value);
@@ -46,21 +55,34 @@ async function browser(t) {
         if (key === null) return Object.fromEntries([...store].map(([name, value]) => [name, clone(value)]));
         return { [key]: clone(store.get(key)) };
       },
-      async set(values) { for (const [key, value] of Object.entries(values)) store.set(key, clone(value)); },
+      async set(values) {
+        if (options.rejectStorage) throw new Error('QUOTA_BYTES exceeded');
+        if (options.beforeStorageSet) await options.beforeStorageSet(clone(values));
+        for (const [key, value] of Object.entries(values)) store.set(key, clone(value));
+      },
       async remove(key) { store.delete(key); },
     } },
-    tabs: { onRemoved: removed,
+    scripting: { async executeScript(request) { scriptCalls.push(request); return [{result:scriptResults.shift() || {items:[],notices:[]}}]; } },
+    tabs: { onRemoved: removed,onUpdated:updated,
       async get(id) { if (!tabs.has(id)) throw new Error('No such tab'); return clone(tabs.get(id)); },
       async update(id, values) { Object.assign(tabs.get(id), values); return clone(tabs.get(id)); },
     },
-    downloads: { onChanged: changed,
+    downloads: { onChanged: changed,onCreated:created,onDeterminingFilename:determining,
       async download(options) {
         const id = nextDownloadId++;
         requested.push({ ...options, id });
-        downloads.set(id, { id, state: 'in_progress', bytesReceived: 0, totalBytes: -1, mime: 'video/mp4' });
+        const item={ id,url:options.url,byExtensionId:'test',startTime:new Date().toISOString(),filename:options.filename,state: 'in_progress', bytesReceived: 0, totalBytes: -1, mime: 'video/mp4' };
+        downloads.set(id,item);
+        if (chrome.filenameBeforeResolve) await new Promise(resolve=>{
+          item.mime=chrome.filenameMime || 'image/png';
+          determining.emit(clone(item),suggestion=>{ if(suggestion) item.filename=suggestion.filename; resolve(); });
+        });
         return id;
       },
-      async search({ id }) { return downloads.has(id) ? [clone(downloads.get(id))] : []; },
+      async search(query) {
+        if (Object.hasOwn(query,'id')) return downloads.has(query.id) ? [clone(downloads.get(query.id))] : [];
+        return [...downloads.values()].filter(item=>!query.startedAfter || Date.parse(item.startTime) >= Date.parse(query.startedAfter)).map(clone);
+      },
       async cancel(id) {
         cancelled.push(id);
         const item = downloads.get(id);
@@ -71,6 +93,11 @@ async function browser(t) {
       },
     },
     tabCapture: { getCapturedTabs: async () => [], getMediaStreamId: async () => 'one-use-stream' },
+  };
+  if (options.withAlarms) chrome.alarms={onAlarm:alarmEvent,
+    async get(name) { return clone(alarms.get(name)); },
+    async create(name,info) { alarmCreates.push({name,...info});alarms.set(name,{name,...info}); },
+    async clear(name) { alarmClears.push(name);return alarms.delete(name); },
   };
   Object.defineProperty(globalThis, 'chrome', { configurable: true, value: chrome });
   t.after(() => {
@@ -85,9 +112,9 @@ async function browser(t) {
   const persist = () => store.set('workspace:work', clone(state));
   persist();
   return {
-    state, store, tabs, downloads, requested, cancelled, persist,
+    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,
     async restartWorker() {
-      changed.clear();removed.clear();messages.clear();
+      changed.clear();created.clear();alarmEvent.clear();removed.clear();messages.clear();determining.clear();updated.clear();
       await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
     },
     closeWorkspace() { tabs.delete(100); removed.emit(100); },
@@ -95,11 +122,11 @@ async function browser(t) {
       Object.assign(downloads.get(id), { state: 'complete', bytesReceived: 10, totalBytes: 10 });
       changed.emit({ id, state: { current: 'complete' } });
     },
-    send(message) {
+    send(message,tabId = 100) {
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('Background did not respond')), 1000);
         messages.emit({ sessionId: 'work', instance: 'current-page', ...message },
-          { id: 'test', url: 'chrome-extension://test/workspace.html?id=work', tab: { id: 100 } },
+          { id: 'test', url: 'chrome-extension://test/workspace.html?id=work', tab: { id: tabId } },
           (response) => { clearTimeout(timeout); resolve(response); });
       });
     },
@@ -484,4 +511,550 @@ test('selected folders receive converted extensions without starting Chrome down
   assert.equal(updated.data.jobs[0].status,'complete');
   assert.equal(updated.data.jobs[0].filename,'001_first (1).webp');
   assert.deepEqual(h.requested,[]);
+});
+
+test('session UI and selection survive worker restart and completion deselects only once', async t=>{
+  const h=await browser(t);
+  const urls=imageItems(h);
+  const selected=await h.send({type:'ui',patch:{selectedURLs:urls,query:'first',width:12,view:'selected',scrollY:350,focusAnchor:urls[0]}});
+  assert.equal(selected.ok,true,selected.error);
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{format:'original'}});
+  assert.equal(saved.ok,true,saved.error);
+  h.complete(saved.data.jobs[0].downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'complete','completion reaches session storage');
+  assert.deepEqual(h.store.get('workspace:work').selectedURLs,[urls[1]]);
+  const reselected=await h.send({type:'ui',patch:{selectedURLs:urls}});
+  assert.equal(reselected.ok,true,reselected.error);
+  await h.restartWorker();
+  const restored=await h.send({type:'get'});
+  assert.deepEqual(restored.data.selectedURLs,urls);
+  assert.equal(restored.data.ui.query,'first');
+  assert.equal(restored.data.ui.scrollY,350);
+  assert.equal(restored.data.ui.view,'selected');
+  assert.ok(restored.data.revision > selected.data.revision);
+  const hello=await h.send({type:'hello',instance:'reload'});
+  assert.deepEqual(hello.data.selectedURLs,urls,'old complete results cannot remove a deliberate reselection');
+});
+
+test('a rejected storage write preserves the prior selection and all other UI fields',async t=>{
+  const h=await browser(t);
+  const urls=imageItems(h);
+  const selected=await h.send({type:'ui',patch:{selectedURLs:[urls[0]],query:'previous'}});
+  assert.equal(selected.ok,true,selected.error);
+  const before=structuredClone(h.store.get('workspace:work'));
+  h.options.rejectStorage=true;
+  const rejected=await h.send({type:'ui',patch:{selectedURLs:urls,query:'new'}});
+  assert.equal(rejected.ok,false);
+  assert.deepEqual(h.store.get('workspace:work'),before);
+});
+
+test('continuation replaces the page, preserves off-page selection and can save that selection',async t=>{
+  const h=await browser(t);
+  const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  const next={url:'https://source.test/next.png',width:30,height:20};
+  h.state.scan={cursor:'first-cursor',hasMore:true};
+  const current=h.store.get('workspace:work');current.scan=h.state.scan;h.store.set('workspace:work',current);
+  h.scriptResults.push({items:[next],notices:[],cursor:'next-cursor',hasMore:true,scanId:'scan1'});
+  const scanned=await h.send({type:'scan',continuation:true});
+  assert.equal(scanned.ok,true,scanned.error);
+  assert.deepEqual(scanned.data.items.map(item=>item.url),[next.url]);
+  assert.deepEqual(scanned.data.selectedItems.map(item=>item.url),[urls[0]]);
+  assert.deepEqual(scanned.data.scan.addedURLs,[next.url]);
+  assert.equal(h.scriptCalls.at(-1).args[0].cursor,'first-cursor');
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{format:'original'}});
+  assert.equal(saved.ok,true,saved.error);
+  assert.equal(saved.data.jobs[0].url,urls[0]);
+});
+
+test('invalidated continuation and changed source keep the previous page and selection',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  const state=h.store.get('workspace:work');state.scan={cursor:'old',hasMore:true};h.store.set('workspace:work',state);
+  h.scriptResults.push({items:[],notices:[],invalidated:true,hasMore:false});
+  const rejected=await h.send({type:'scan',continuation:true});
+  assert.equal(rejected.ok,false);
+  assert.match(rejected.error,/先頭/);
+  assert.deepEqual(h.store.get('workspace:work').items,state.items);
+  assert.deepEqual(h.store.get('workspace:work').selectedURLs,[urls[0]]);
+  h.tabs.get(1).url='https://source.test/moved';
+  const moved=await h.send({type:'scan'});
+  assert.equal(moved.ok,false);
+  assert.deepEqual(h.store.get('workspace:work').selectedURLs,[urls[0]]);
+});
+
+test('extensionless original downloads use MIME before download() resolves without deadlocking the queue',async t=>{
+  const h=await browser(t);
+  h.state.items=[{url:'https://source.test/image?id=1',width:20,height:10}];h.persist();
+  h.chrome.filenameBeforeResolve=true;h.chrome.filenameMime='image/png';
+  const saved=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Safe',format:'original'}});
+  assert.equal(saved.ok,true,saved.error);
+  assert.equal(saved.data.jobs[0].filename,'ImageCrate/Safe/001_image.png');
+  assert.equal(saved.data.jobs[0].actualFilename,'ImageCrate/Safe/001_image.png');
+  assert.equal(saved.data.jobs[0].typeKnown,true);
+  assert.equal(h.requested[0].url,h.state.items[0].url,'no image conversion or alternate fetch is used');
+  h.complete(saved.data.jobs[0].downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'complete','first same-URL batch completes');
+  const next=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Other',format:'original'}});
+  assert.equal(next.ok,true,next.error);
+  assert.equal(next.data.jobs[0].filename,'ImageCrate/Other/001_image.png','the same URL in another batch keeps its new path');
+  assert.notEqual(next.data.jobs[0].downloadId,saved.data.jobs[0].downloadId);
+});
+
+test('filename decisions touch only owned jobs and invoke suggest exactly once for unrelated downloads',async t=>{
+  const h=await browser(t);
+  for(const item of [
+    {id:500,url:'https://source.test/image',byExtensionId:'another-extension',mime:'image/png'},
+    {id:501,url:'https://source.test/image',byExtensionId:'test',mime:'image/png'},
+    {id:502,url:'https://source.test/image',mime:'image/png'},
+  ]) {
+    const calls=[];
+    h.determining.emit(item,(...args)=>calls.push(args));
+    await eventually(()=>calls.length > 0,'every filename event gets a decision');
+    assert.deepEqual(calls,[[]]);
+  }
+});
+
+test('filename event after worker restart recovers the persisted job by download ID',async t=>{
+  const h=await browser(t);
+  h.state.items=[{url:'https://source.test/image',width:10,height:10}];h.persist();
+  const saved=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Kept'}});
+  await h.restartWorker();
+  const calls=[];
+  h.determining.emit({id:saved.data.jobs[0].downloadId,url:h.state.items[0].url,byExtensionId:'test',mime:'image/webp'},(...args)=>calls.push(args));
+  await eventually(()=>calls.length > 0,'restarted worker responds without relying on in-memory submissions');
+  assert.equal(calls[0][0].filename,'ImageCrate/Kept/001_image.webp');
+  await eventually(()=>h.store.get('workspace:work').jobs[0].filename.endsWith('.webp'),'resolved name is persisted');
+});
+
+test('a quota-rejected continuation keeps its old page and can replay the uncommitted page',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  const previous=h.store.get('workspace:work');previous.scan={cursor:'before',hasMore:true};h.store.set('workspace:work',previous);
+  const page={items:[{url:'https://source.test/new.png',width:40,height:30,type:'image/png',groupId:'g1'}],notices:[],cursor:'after',retryCursor:'before',hasMore:true,scanId:'scan'};
+  h.scriptResults.push(page);
+  h.options.rejectStorage=true;
+  const refused=await h.send({type:'scan',continuation:true});
+  assert.equal(refused.ok,false);
+  assert.deepEqual(h.store.get('workspace:work'),previous);
+  h.options.rejectStorage=false;
+  h.scriptResults.push(page);
+  const replayed=await h.send({type:'scan',continuation:true});
+  assert.equal(replayed.ok,true,replayed.error);
+  assert.equal(h.scriptCalls.at(-1).args[0].cursor,'before');
+  assert.equal(replayed.data.items[0].url,page.items[0].url);
+  assert.equal(replayed.data.items[0].type,'image/png','responsive source metadata is preserved');
+  assert.equal(replayed.data.items[0].groupId,'g1');
+  assert.deepEqual(replayed.data.selectedItems.map(item=>item.url),[urls[0]]);
+});
+
+test('unknown MIME retains the neutral extension and cannot suggest paths outside the frozen batch',async t=>{
+  const h=await browser(t);
+  h.state.items=[{url:'https://source.test/image',width:10,height:10}];h.persist();
+  h.chrome.filenameBeforeResolve=true;h.chrome.filenameMime='application/octet-stream';
+  const saved=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Safe'}});
+  assert.equal(saved.ok,true,saved.error);
+  assert.equal(saved.data.jobs[0].filename,'ImageCrate/Safe/001_image.img');
+  assert.equal(saved.data.jobs[0].typeKnown,false);
+  const state=h.store.get('workspace:work');state.jobs[0].filename='../outside.img';h.store.set('workspace:work',state);
+  const calls=[];
+  h.determining.emit({id:saved.data.jobs[0].downloadId,url:h.state.items[0].url,byExtensionId:'test',mime:'image/png'},(...args)=>calls.push(args));
+  await eventually(()=>calls.length > 0,'unsafe persisted paths get a neutral filename decision');
+  assert.deepEqual(calls,[[]]);
+});
+
+test('a filename decision still uses the frozen original path after its workspace closes',async t=>{
+  const h=await browser(t);
+  h.state.items=[{url:'https://source.test/image',width:10,height:10}];h.persist();
+  const saved=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Background'}});
+  h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'worker retains the unfinished background batch');
+  const calls=[];
+  h.determining.emit({id:saved.data.jobs[0].downloadId,url:h.state.items[0].url,byExtensionId:'test',mime:'image/jpeg'},(...args)=>calls.push(args));
+  await eventually(()=>calls.length > 0,'closed workspace does not own the naming decision');
+  assert.equal(calls[0][0].filename,'ImageCrate/Background/001_image.jpg');
+});
+
+test('source navigation releases continuation state without clearing retained candidates or selection',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  const state=h.store.get('workspace:work');state.scan={cursor:'old',hasMore:true};h.store.set('workspace:work',state);
+  h.tabs.get(1).url='https://source.test/moved';
+  h.updated.emit(1,{url:'https://source.test/moved'},h.tabs.get(1));
+  await eventually(()=>h.store.get('workspace:work').scan.invalidated,'source navigation is recorded');
+  const next=h.store.get('workspace:work');
+  assert.equal(next.scan.cursor,null);
+  assert.deepEqual(next.items,state.items);
+  assert.deepEqual(next.selectedURLs,[urls[0]]);
+  assert.equal(h.scriptCalls.at(-1).args[0].dispose,true);
+});
+
+test('starting a new failed-only batch preserves ordinary selection and records its source batch',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const selected=await h.send({type:'ui',patch:{selectedURLs:[urls[1]]}});
+  assert.equal(selected.ok,true,selected.error);
+  const old=await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Old',folderName:'Old',format:'png'}});
+  const stopped=await h.send({type:'cancel'});
+  assert.equal(stopped.data.jobs[0].status,'interrupted');
+  const scoped=await h.send({type:'ui',patch:{saveScope:'failed',failedBatchId:old.data.batch.id}});
+  assert.equal(scoped.ok,true,scoped.error);
+  await h.restartWorker();
+  const restored=await h.send({type:'get'});
+  assert.equal(restored.data.ui.saveScope,'failed');
+  assert.deepEqual(restored.data.selectedURLs,[urls[1]]);
+  // The failed file can be off the current scan page and unselected.
+  const state=h.store.get('workspace:work');state.items=state.items.filter(item=>item.url !== urls[0]);h.store.set('workspace:work',state);
+  const next=await h.send({type:'save',sourceBatchId:old.data.batch.id,urls:[urls[0]],settings:{destination:'directory',directoryName:'New',folderName:'New',format:'webp'}});
+  assert.equal(next.ok,true,next.error);
+  assert.equal(next.data.batch.sourceBatchId,old.data.batch.id);
+  assert.equal(next.data.batch.format,'webp');
+  assert.equal(next.data.jobs[0].url,urls[0]);
+  assert.deepEqual(next.data.selectedURLs,[urls[1]],'changing the pending save scope never replaces another selection');
+  assert.equal(next.data.ui.saveScope,'selection');
+  assert.equal(next.data.ui.failedBatchId,null);
+  assert.notEqual(next.data.batch.id,old.data.batch.id);
+});
+
+test('failed-only save scope rejects stale batch IDs and URLs outside its interrupted jobs',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const old=await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Old'}});
+  await h.send({type:'cancel'});
+  const invalid=await h.send({type:'ui',patch:{saveScope:'failed',failedBatchId:'old-batch'}});
+  assert.equal(invalid.ok,false);
+  for(const request of [{sourceBatchId:'old-batch',urls:[urls[0]]},{sourceBatchId:old.data.batch.id,urls:[urls[1]]}]) {
+    const result=await h.send({type:'save',...request,settings:{destination:'directory',directoryName:'New'}});
+    assert.equal(result.ok,false);
+  }
+  assert.equal(h.store.get('workspace:work').batch.id,old.data.batch.id);
+});
+
+test('a prepared directory survives another workspace pruning before settings commit and abort releases it',async t=>{
+  const h=await browser(t);
+  const records=new Map([['session:work:old',{name:'Old'}],['session:stale:old',{name:'Stale'}]]);
+  const previous=globalThis.indexedDB;
+  globalThis.indexedDB={open(){
+    const request={};
+    queueMicrotask(()=>{request.result={close(){},transaction(){
+      const transaction={};
+      transaction.objectStore=()=>({delete:key=>records.delete(key),openKeyCursor(){
+        const request={};const keys=[...records.keys()];let index=0;
+        const next=()=>queueMicrotask(()=>{
+          request.result=index < keys.length ? {key:keys[index++],continue:next} : null;
+          request.onsuccess?.();
+          if (!request.result) transaction.oncomplete?.();
+        });
+        next();return request;
+      }});
+      return transaction;
+    }};request.onsuccess?.();});
+    return request;
+  }};
+  t.after(()=>{if(previous === undefined) delete globalThis.indexedDB; else globalThis.indexedDB=previous;});
+  h.state.saveSettings={destination:'directory',directoryName:'Old',directoryKey:'session:work:old'};h.persist();
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{...h.state,id:'other',workspaceTabId:200,saveSettings:{destination:'downloads'}});
+  const draft='session:work:draft';
+  const prepared=await h.send({type:'settings-prepare',directoryKey:draft});
+  assert.equal(prepared.ok,true,prepared.error);
+  assert.equal(prepared.data.saveSettings.directoryKey,'session:work:old','preparation does not apply a draft setting');
+  records.set(draft,{name:'Draft'});
+  const pruned=await h.send({sessionId:'other',type:'prune-directories'},200);
+  assert.equal(pruned.ok,true,pruned.error);
+  assert.equal(records.has(draft),true,'the prepared draft is reserved before its handle is written');
+  assert.equal(records.has('session:work:old'),true);
+  assert.equal(records.has('session:stale:old'),false);
+  const hello=await h.send({type:'hello'});
+  assert.ok(hello.data.activeDirectoryKeys.includes(draft));
+  h.options.rejectStorage=true;
+  const failedCommit=await h.send({type:'settings',settings:{destination:'directory',directoryName:'Draft',directoryKey:draft}});
+  assert.equal(failedCommit.ok,false);
+  assert.equal(h.store.get('workspace:work').saveSettings.directoryKey,'session:work:old');
+  h.options.rejectStorage=false;
+  const aborted=await h.send({type:'settings-abort',directoryKey:draft});
+  assert.equal(aborted.ok,true,aborted.error);
+  await h.send({sessionId:'other',type:'prune-directories'},200);
+  assert.equal(records.has(draft),false);
+  assert.equal(records.has('session:work:old'),true);
+  const first='session:work:first',last='session:work:last';
+  await h.send({type:'settings-prepare',directoryKey:first});records.set(first,{name:'First'});
+  await h.send({type:'settings-prepare',directoryKey:last});records.set(last,{name:'Last'});
+  await h.send({type:'settings-abort',directoryKey:first});
+  await h.send({sessionId:'other',type:'prune-directories'},200);
+  assert.equal(records.has(first),false);
+  assert.equal(records.has(last),true,'an abort for an old draft cannot clear its replacement');
+  const committed=await h.send({type:'settings',settings:{destination:'directory',directoryName:'Last',directoryKey:last}});
+  assert.equal(committed.ok,true,committed.error);
+  assert.equal(committed.data.pendingDirectoryKey,undefined);
+  assert.equal(committed.data.saveSettings.directoryKey,last);
+  await h.send({sessionId:'other',type:'prune-directories'},200);
+  assert.equal(records.has(last),true);
+  assert.equal(records.has('session:work:old'),false);
+  const foreign=await h.send({type:'settings-prepare',directoryKey:'session:other:foreign'});
+  assert.equal(foreign.ok,false);
+  const unprepared=await h.send({type:'settings',settings:{destination:'directory',directoryName:'Missing',directoryKey:'session:work:unprepared'}});
+  assert.equal(unprepared.ok,false);
+  assert.equal(h.store.get('workspace:work').saveSettings.directoryKey,last);
+});
+
+test('explicit restart replaces a full old page with new candidates and retains only selected old records',async t=>{
+  const h=await browser(t);
+  h.state.items=Array.from({length:500},(_,index)=>({url:`https://source.test/old-${index}.png`,width:10,height:10}));
+  h.state.selectedURLs=[h.state.items[0].url];h.persist();
+  const incoming={url:'https://source.test/new.png',width:20,height:20};
+  h.scriptResults.push({items:[incoming],notices:[],cursor:null,retryCursor:'restart-first',hasMore:false,scanId:'restart'});
+  const result=await h.send({type:'scan'});
+  assert.equal(result.ok,true,result.error);
+  assert.deepEqual(result.data.items.map(item=>item.url),[incoming.url]);
+  assert.deepEqual(result.data.scan.addedURLs,[incoming.url]);
+  assert.equal(result.data.scan.hasMore,false);
+  assert.deepEqual(result.data.selectedItems.map(item=>item.url),[h.state.items[0].url]);
+  assert.deepEqual(result.data.selectedURLs,h.state.selectedURLs);
+});
+
+function pendingSubmission(h,age = 0) {
+  const url='https://source.test/pending';
+  const filename='ImageCrate/Frozen/001_pending.img';
+  const startedAt=Date.now()-age;
+  h.state.items=[{url,width:20,height:20}];h.state.selectedURLs=[url];
+  h.state.batch={id:'batch',format:'original',destination:'downloads',folderName:'Frozen'};
+  h.state.jobs=[{id:'pending-job',url,filename,status:'in_progress',completionApplied:false,submission:{url,filename,startedAt}}];
+  h.persist();
+  return {url,filename,startedAt};
+}
+function acceptedSubmission(source,id,patch = {}) {
+  return {id,url:source.url,filename:`/Downloads/${source.filename.replace(/\.img$/,'.png')}`,byExtensionId:'test',startTime:new Date(source.startedAt+1).toISOString(),state:'in_progress',mime:'image/png',bytesReceived:1,totalBytes:10,...patch};
+}
+
+test('a worker stopped before Chrome acceptance recovers an expired submission as interrupted and permits explicit retry',async t=>{
+  const h=await browser(t);const source=pendingSubmission(h,60000);
+  await h.restartWorker();
+  const restored=await h.send({type:'get'});
+  assert.equal(restored.ok,true,restored.error);
+  assert.equal(restored.data.jobs[0].status,'interrupted');
+  assert.match(restored.data.jobs[0].error,/保存結果を確認できませんでした/);
+  assert.equal(restored.data.jobs[0].submission,undefined);
+  assert.deepEqual(restored.data.selectedURLs,[source.url]);
+  assert.deepEqual(h.requested,[],'uncertain acceptance never starts another download automatically');
+  const retry=await h.send({type:'retry'});
+  assert.equal(retry.ok,true,retry.error);
+  assert.equal(h.requested.length,1);
+  assert.equal(h.requested[0].url,source.url);
+  assert.equal(h.requested[0].conflictAction,'uniquify','a delayed old file or an existing completed file is never overwritten');
+});
+
+test('cancel waits for recent unresolved acceptance but recovers it after the bounded reconciliation period',async t=>{
+  const h=await browser(t);pendingSubmission(h);
+  const waiting=await h.send({type:'cancel'});
+  assert.equal(waiting.ok,true,waiting.error);
+  assert.equal(waiting.data.jobs[0].status,'in_progress');
+  assert.match(waiting.data.jobs[0].error,/30秒/);
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  const expired=await h.send({type:'cancel'});
+  assert.equal(expired.data.jobs[0].status,'interrupted');
+  assert.match(expired.data.jobs[0].error,/保存結果を確認できませんでした/);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('submission recovery requires unique owned URL, start time and frozen path, excluding IDs used by another job',async t=>{
+  const h=await browser(t);const source=pendingSubmission(h);
+  h.downloads.set(21,acceptedSubmission(source,21,{filename:'/Downloads/ImageCrate/Other/001_pending.png'}));
+  h.downloads.set(22,acceptedSubmission(source,22,{byExtensionId:'other-extension'}));
+  h.downloads.set(23,acceptedSubmission(source,23,{startTime:new Date(source.startedAt-1).toISOString()}));
+  h.downloads.set(24,acceptedSubmission(source,24));
+  h.downloads.set(25,acceptedSubmission(source,25,{filename:'/Downloads/ImageCrate/Frozen/001_pending (1).png'}));
+  h.store.set('workspace:other',{id:'other',items:[],jobs:[{id:'other-job',url:source.url,downloadId:24,status:'in_progress'}],notices:[]});
+  const recovered=await h.send({type:'get'});
+  assert.equal(recovered.ok,true,recovered.error);
+  assert.equal(recovered.data.jobs[0].downloadId,25);
+  assert.equal(recovered.data.jobs[0].status,'in_progress');
+  assert.equal(recovered.data.jobs[0].submission,undefined);
+  assert.deepEqual(h.requested,[]);
+});
+
+test('ambiguous submission candidates stay unresolved until the deadline and no existing download is cancelled',async t=>{
+  const h=await browser(t);const source=pendingSubmission(h);
+  h.downloads.set(31,acceptedSubmission(source,31));
+  h.downloads.set(32,acceptedSubmission(source,32,{filename:'/Downloads/ImageCrate/Frozen/001_pending (1).png'}));
+  const unresolved=await h.send({type:'get'});
+  assert.equal(unresolved.data.jobs[0].downloadId,undefined);
+  assert.equal(unresolved.data.jobs[0].status,'in_progress');
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt-=31000;h.store.set('workspace:work',state);
+  const expired=await h.send({type:'get'});
+  assert.equal(expired.data.jobs[0].status,'interrupted');
+  assert.match(expired.data.jobs[0].error,/保存結果を確認できませんでした/);
+  assert.deepEqual(h.cancelled,[]);
+  assert.equal(h.downloads.get(31).state,'in_progress');
+  assert.equal(h.downloads.get(32).state,'in_progress');
+});
+
+test('a completed unique accepted submission is recovered after the deadline and is not retried',async t=>{
+  const h=await browser(t);const source=pendingSubmission(h,60000);
+  h.downloads.set(41,acceptedSubmission(source,41,{state:'complete',bytesReceived:10}));
+  const stopped=await h.send({type:'cancel'});
+  assert.equal(stopped.ok,true,stopped.error);
+  assert.equal(stopped.data.jobs[0].downloadId,41);
+  assert.equal(stopped.data.jobs[0].status,'complete');
+  assert.deepEqual(stopped.data.selectedURLs,[]);
+  const retried=await h.send({type:'retry'});
+  assert.equal(retried.data.jobs[0].status,'complete');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('a filename event after download() resolves retains its accepted ID while a stale storage candidate is being saved',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  const suggestions=[];let emitted=false;
+  h.options.beforeStorageSet=async values=>{
+    const job=values['workspace:work']?.jobs[0];
+    if (!job?.downloadId || emitted) return;
+    emitted=true;
+    const item=h.downloads.get(job.downloadId);
+    Object.assign(item,{filename:'original-image.svg',mime:'image/svg+xml'});
+    h.determining.emit(structuredClone(item),(...args)=>{
+      suggestions.push(args);
+      if (args[0]) item.filename=args[0].filename;
+    });
+    assert.equal(suggestions.length,1,'the ID cache answers immediately without waiting for the blocked storage queue');
+    assert.equal(suggestions[0][0].filename,'ImageCrate/Frozen/001_image.svg');
+    // The caller is about to persist the candidate captured before this event.
+    assert.equal(job.filename,'ImageCrate/Frozen/001_image.img');
+    await nextTurn();
+  };
+  const saved=await h.send({type:'save',urls:[url],settings:{folderName:'Frozen'}});
+  assert.equal(saved.ok,true,saved.error);
+  assert.equal(emitted,true);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].filename === 'ImageCrate/Frozen/001_image.svg','the immutable filename decision survives the older candidate overwriting its mutable job');
+  const persisted=h.store.get('workspace:work').jobs[0];
+  assert.equal(persisted.actualFilename,'ImageCrate/Frozen/001_image.svg');
+  assert.equal(persisted.typeKnown,true);
+  assert.equal(persisted.mime,'image/svg+xml');
+  assert.deepEqual(suggestions,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
+});
+
+test('known originals and converted downloads explicitly suggest their fixed batch paths after download() resolves',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const original=await h.send({type:'save',urls:[urls[0]],settings:{folderName:'Known'}});
+  const first=original.data.jobs[0];
+  const originalCalls=[];
+  h.determining.emit({id:first.downloadId,url:first.url,byExtensionId:'test',filename:'server-default.png',mime:'image/png'},(...args)=>originalCalls.push(args));
+  assert.deepEqual(originalCalls,[[{filename:'ImageCrate/Known/001_first.png',conflictAction:'uniquify'}]]);
+  h.complete(first.downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'complete','original batch completes');
+  const converted=await h.send({type:'save',urls:[urls[1]],settings:{folderName:'Converted',format:'jpg'}});
+  const accepted=await beginConverted(h,converted.data);
+  assert.equal(accepted.ok,true,accepted.error);
+  const second=accepted.data.jobs[0];
+  const convertedCalls=[];
+  h.determining.emit({id:second.downloadId,url:'blob:chrome-extension://test/converted-image',byExtensionId:'test',filename:'browser-default.jpg',mime:'image/jpeg'},(...args)=>convertedCalls.push(args));
+  assert.deepEqual(convertedCalls,[[{filename:'ImageCrate/Converted/001_second.jpg',conflictAction:'uniquify'}]]);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].actualFilename === 'ImageCrate/Converted/001_second.jpg','converted filenames are persisted through the same decision path');
+});
+
+test('late filename events for the same URL in two workspaces match accepted IDs before URL',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/shared-image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{...structuredClone(h.state),id:'other',workspaceTabId:200});
+  const first=await h.send({type:'save',urls:[url],settings:{folderName:'First'}});
+  const second=await h.send({sessionId:'other',type:'save',urls:[url],settings:{folderName:'Second'}},200);
+  for (const [response,folder] of [[first,'First'],[second,'Second']]) {
+    assert.equal(response.ok,true,response.error);
+    const calls=[];
+    h.determining.emit({id:response.data.jobs[0].downloadId,url,byExtensionId:'test',filename:'server.svg',mime:'image/svg+xml'},(...args)=>calls.push(args));
+    assert.deepEqual(calls,[[{filename:`ImageCrate/${folder}/001_shared-image.svg`,conflictAction:'uniquify'}]]);
+  }
+  await eventually(()=>h.store.get('workspace:work').jobs[0].filename.endsWith('.svg') && h.store.get('workspace:other').jobs[0].filename.endsWith('.svg'),'both ID-specific filename decisions are stored');
+  assert.equal(h.store.get('workspace:work').jobs[0].filename,'ImageCrate/First/001_shared-image.svg');
+  assert.equal(h.store.get('workspace:other').jobs[0].filename,'ImageCrate/Second/001_shared-image.svg');
+});
+
+test('an alarm reconciles a closed pending submission without UI polling and unrelated saves do not postpone it',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  const first=await h.send({type:'get'});
+  assert.equal(first.ok,true,first.error);
+  assert.equal(h.alarmCreates.length,1);
+  const alarm=h.alarmCreates[0];
+  assert.equal(alarm.delayInMinutes,1);
+  assert.equal(alarm.periodInMinutes,1);
+  h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'the workspace closes while acceptance is unresolved');
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{id:'other',workspaceTabId:200,items:[],jobs:[],notices:[]});
+  const other=await h.send({sessionId:'other',type:'ui',patch:{query:'other tab'}},200);
+  assert.equal(other.ok,true,other.error);
+  assert.equal(h.alarmCreates.length,1,'existing alarms keep their original wake-up time through all state writes');
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.alarmEvent.emit({name:alarm.name});
+  await eventually(()=>!h.store.has('workspace:work'),'the alarm expires and removes the closed unresolved session');
+  await eventually(()=>!h.alarms.has(alarm.name),'the last pending submission clears its recovery alarm');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('worker startup recreates a missing pending alarm and expires a closed submission without a UI message',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  await h.restartWorker();
+  await eventually(()=>h.alarms.size === 1,'startup schedules the pending reconciliation even without get/polling');
+  const state=h.store.get('workspace:work');state.closed=true;state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.tabs.delete(100);
+  await h.restartWorker();
+  await eventually(()=>!h.store.has('workspace:work'),'startup reconciles the expired closed submission');
+  await eventually(()=>h.alarms.size === 0,'startup removes a no-longer-needed alarm');
+  assert.deepEqual(h.requested,[]);
+});
+
+test('onCreated reconciles an unknown accepted ID after its workspace closes and preserves the completed file',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  await h.send({type:'get'});h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'closed pending work remains for recovery');
+  const item=acceptedSubmission(source,81,{state:'complete',bytesReceived:10});
+  h.downloads.set(item.id,item);
+  h.created.emit(structuredClone(item));
+  await eventually(()=>!h.store.has('workspace:work'),'an event with the unpersisted ID recovers and retires the completed batch');
+  await eventually(()=>h.alarms.size === 0,'recovered acceptance clears its pending alarm');
+  assert.equal(h.downloads.get(item.id).state,'complete');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('onChanged for an unknown download ID wakes pending sessions after their polling workspace has closed',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  await h.send({type:'get'});h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'the original page no longer polls');
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.changed.emit({id:999,filename:{current:'unrelated-file.png'}});
+  await eventually(()=>!h.store.has('workspace:work'),'even an unknown ID causes the persisted pending submission to be reconciled');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('a delayed filename decision preserves the completed Chrome absolute actual filename',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  const saved=await h.send({type:'save',urls:[url],settings:{folderName:'Frozen'}});
+  assert.equal(saved.ok,true,saved.error);
+  const id=saved.data.jobs[0].downloadId;
+  const actual='/Users/synthetic/Downloads/ImageCrate/Frozen/001_image (1).svg';
+  Object.assign(h.downloads.get(id),{filename:actual,mime:'image/svg+xml'});
+  let emitted=false;const calls=[];
+  h.options.beforeStorageSet=async values=>{
+    const job=values['workspace:work']?.jobs[0];
+    if (emitted || job?.status !== 'complete') return;
+    emitted=true;
+    assert.equal(job.actualFilename,actual,'Chrome search already reported its completed absolute path');
+    h.determining.emit(structuredClone(h.downloads.get(id)),(...args)=>calls.push(args));
+    assert.equal(calls[0][0].filename,'ImageCrate/Frozen/001_image.svg');
+    await nextTurn();
+  };
+  h.complete(id);
+  await eventually(()=>emitted && h.store.get('workspace:work').jobs[0].filename.endsWith('.svg'),'the late filename patch is persisted after completion');
+  const final=h.store.get('workspace:work').jobs[0];
+  assert.equal(final.status,'complete');
+  assert.equal(final.filename,'ImageCrate/Frozen/001_image.svg','requested path remains relative');
+  assert.equal(final.actualFilename,actual,'the late requested-path decision cannot replace Chrome actual path or its conflict suffix');
+  assert.deepEqual(calls,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
 });

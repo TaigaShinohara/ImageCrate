@@ -8,6 +8,7 @@ assert.equal(manifest.background.type,'module');
 assert.ok(!manifest.host_permissions && !manifest.content_scripts && !manifest.externally_connectable);
 assert.deepEqual(manifest.optional_host_permissions, ['http://*/*','https://*/*'], 'Site access is optional; request only concrete selected-image hosts at runtime');
 assert.ok(!manifest.permissions.some(x=>['debugger','webRequest','history','cookies','tabs'].includes(x)));
+assert.deepEqual([...manifest.permissions].sort(),['activeTab','scripting','downloads','storage','alarms'].sort(),'Only the internal recovery alarm supplements temporary page access');
 const html=await readFile(new URL('extension/workspace.html',root),'utf8');
 assert.ok(!/<script[^>]*>\s*[^<\s]/i.test(html),'Inline scripts are forbidden');
 for(const m of html.matchAll(/(?:src|href)="([^"#]+)"/g)) assert.ok(!/^https?:/i.test(m[1]),'No remote executable UI assets');
