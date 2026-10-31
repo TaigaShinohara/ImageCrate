@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import {createTransferBudget} from '../extension/transfer-budget.js';
+import {MEDIA_LIMITS} from '../extension/media-limits.js';
 
 const manifest = JSON.parse(readFileSync(new URL('../extension/manifest.json', import.meta.url)));
 const supportsRecording = manifest.permissions.includes('tabCapture');
@@ -384,6 +386,345 @@ test('directory retry keeps its original destination after settings change and n
     updates: [{ id: original.jobs[1].id, status: 'complete', bytesReceived: 100, totalBytes: 100 }] });
   assert.equal(h.store.get('workspace:work').jobs[1].status, 'queued', 'a late result cannot mark the retried file complete');
   assert.deepEqual(h.requested, [], 'retry must keep using the selected directory');
+});
+
+test('managed reservation is durably acknowledged before fetch authorization and idempotently keeps its deadline',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}});
+  assert.equal(saved.ok,true,saved.error);
+  const batchId=saved.data.batch.id,job=saved.data.jobs[0];
+  assert.ok(job.logicalJobId);assert.notEqual(job.logicalJobId,job.id);
+  assert.equal(saved.data.batch.transferBudget.reservedBytes,0);
+  h.options.rejectStorage=true;
+  const rejected=await h.send({type:'managed-reserve',batchId,jobId:job.id});
+  assert.equal(rejected.ok,false);assert.equal(h.store.get('workspace:work').jobs[0].status,'queued');
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.reservedBytes,0);
+  h.options.rejectStorage=false;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId:job.id});
+  assert.equal(reserved.ok,true,reserved.error);
+  const transfer=reserved.data.jobs[0].transfer;
+  assert.equal(transfer.maxBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(transfer.maxOutputBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(transfer.deadline,Math.min(reserved.data.batch.transferBudget.deadline,transfer.startedAt+120000));
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.reservedBytes,transfer.maxBytes);
+  const twice=await h.send({type:'managed-reserve',batchId,jobId:job.id});
+  assert.equal(twice.ok,true,twice.error);assert.deepEqual(twice.data.jobs[0].transfer,transfer);
+  assert.equal(twice.data.batch.transferBudget.logicalAttempts[job.logicalJobId],1);
+  assert.equal(h.requested.length,0,'managed reservations never start a native original download');
+});
+
+test('managed reserve and settlement reject stale owners, batches and attempts without changing the ledger',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}});
+  const batchId=saved.data.batch.id,jobId=saved.data.jobs[0].id;
+  assert.equal((await h.send({type:'managed-reserve',batchId,jobId})).ok,true);
+  const ledger=structuredClone(h.store.get('workspace:work').batch.transferBudget);
+  for(const type of ['managed-reserve','managed-settle'])for(const wrong of [{instance:'old-owner'},{batchId:'old-batch'},{jobId:'old-attempt'}]) {
+    const response=await h.send({type,batchId,jobId,bytesReceived:1,outcome:'interrupted',outputBytes:0,...wrong});
+    assert.equal(response.ok,false);assert.deepEqual(h.store.get('workspace:work').batch.transferBudget,ledger);
+  }
+});
+
+test('managed source settlement still accounts bytes after Chrome has already completed the converted download',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const job=state.jobs[0];
+  const reserved=await h.send({type:'managed-reserve',batchId:state.batch.id,jobId:job.id});
+  assert.equal(reserved.ok,true,reserved.error);assert.equal(reserved.data.jobs[0].transfer.maxBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  const accepted=await beginConverted(h,reserved.data);
+  const downloadId=accepted.data.jobs[0].downloadId;h.complete(downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='complete','Chrome completed first');
+  const settled=await h.send({type:'managed-settle',batchId:state.batch.id,jobId:job.id,bytesReceived:11,outcome:'complete',outputBytes:23});
+  assert.equal(settled.ok,true,settled.error);assert.equal(settled.data.jobs[0].status,'complete');
+  assert.equal(settled.data.batch.transferBudget.consumedBytes,11);
+  assert.equal(settled.data.batch.transferBudget.outputBytes,23);assert.equal(settled.data.batch.transferBudget.reservedBytes,0);
+  const twice=await h.send({type:'managed-settle',batchId:state.batch.id,jobId:job.id,bytesReceived:11,outcome:'complete',outputBytes:23});
+  assert.equal(twice.data.batch.transferBudget.consumedBytes,11);assert.equal(twice.data.batch.transferBudget.outputBytes,23);
+  assert.equal(h.requested.length,1);
+});
+
+test('a lost terminal report after complete settlement monotonically blocks retry of the committed directory file',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  await h.send({type:'managed-reserve',batchId,jobId});
+  await h.send({type:'managed-settle',batchId,jobId,bytesReceived:3,outcome:'complete',outputBytes:3});
+  const uncertain=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:3,outcome:'unknown',outputUnknown:true});
+  assert.equal(uncertain.ok,true,uncertain.error);assert.equal(uncertain.data.jobs[0].outcomeUnknown,true);
+  assert.equal(uncertain.data.jobs[0].status,'interrupted');
+  assert.equal(uncertain.data.batch.transferBudget.consumedBytes,3);assert.equal(uncertain.data.batch.transferBudget.outputBytes,3);
+  assert.equal(uncertain.data.batch.transferBudget.attempts[jobId].status,'complete','known accounting remains committed');
+  const later=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:3,outcome:'complete',outputBytes:3});
+  assert.equal(later.data.jobs[0].outcomeUnknown,true,'a repeated known notification cannot erase uncertainty');
+  await h.send({type:'managed-update',batchId,updates:[{id:jobId,status:'interrupted'}]});
+  assert.equal((await h.send({type:'retry'})).ok,false);
+});
+
+test('a complete directory terminal record stays complete after a later unknown acknowledgement',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  await h.send({type:'managed-reserve',batchId,jobId});
+  await h.send({type:'managed-settle',batchId,jobId,bytesReceived:3,outcome:'complete',outputBytes:3});
+  await h.send({type:'managed-update',batchId,updates:[{id:jobId,status:'complete',bytesReceived:3}]});
+  const unknown=await h.send({type:'managed-settle',batchId,jobId,outcome:'unknown'});
+  assert.equal(unknown.data.jobs[0].status,'complete');assert.equal(unknown.data.jobs[0].outcomeUnknown,true);
+  await h.send({type:'managed-update',batchId,updates:[{id:jobId,status:'interrupted'}]});
+  const retry=await h.send({type:'retry'});
+  assert.equal(retry.data.jobs[0].status,'complete');assert.equal(retry.data.jobs[0].id,jobId);
+});
+
+test('managed retry retains logical identity, consumed bytes and batch deadline and stops after three real attempts',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  let state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  state.batch.transferBudget=createTransferBudget({now:Date.now(),maxBytes:1000,timeoutMs:10000});
+  h.store.set('workspace:work',structuredClone(state));
+  const deadline=state.batch.transferBudget.deadline,logicalJobId=state.jobs[0].logicalJobId;
+  const ids=[];
+  for(let index=0;index<3;index++) {
+    const jobId=state.jobs[0].id;ids.push(jobId);
+    const reserved=await h.send({type:'managed-reserve',batchId:state.batch.id,jobId});
+    assert.equal(reserved.ok,true,reserved.error);assert.equal(reserved.data.jobs[0].transfer.maxBytes,1000-index*10);
+    const settled=await h.send({type:'managed-settle',batchId:state.batch.id,jobId,bytesReceived:10,outcome:'interrupted'});
+    assert.equal(settled.ok,true,settled.error);
+    await h.send({type:'managed-update',batchId:state.batch.id,updates:[{id:jobId,status:'interrupted'}]});
+    if(index<2) {
+      await h.restartWorker();const retry=await h.send({type:'retry'});
+      assert.equal(retry.ok,true,retry.error);state=retry.data;
+      assert.equal(state.jobs[0].logicalJobId,logicalJobId);assert.equal(state.jobs[0].transfer,undefined);
+      assert.equal(state.batch.transferBudget.deadline,deadline);assert.equal(state.batch.transferBudget.consumedBytes,(index+1)*10);
+    }
+  }
+  assert.equal(new Set(ids).size,3);
+  const refused=await h.send({type:'retry'});assert.equal(refused.ok,false);assert.match(refused.error,/回数/);
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.logicalAttempts[logicalJobId],3);
+});
+
+test('retry and idempotent reserve cannot renew an expired absolute batch or attempt deadline',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  const deadline=reserved.data.jobs[0].transfer.deadline;
+  t.mock.method(Date,'now',()=>deadline+1);
+  assert.equal((await h.send({type:'managed-reserve',batchId,jobId})).ok,false);
+  await h.send({type:'managed-settle',batchId,jobId,bytesReceived:1,outcome:'interrupted'});
+  await h.send({type:'managed-update',batchId,updates:[{id:jobId,status:'interrupted'}]});
+  Date.now.mock.mockImplementation(()=>state.batch.transferBudget.deadline+1);
+  const retry=await h.send({type:'retry'});assert.equal(retry.ok,false);assert.match(retry.error,/制限時間/);
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.deadline,state.batch.transferBudget.deadline);
+});
+
+test('reload conservatively charges an abandoned directory reservation and blocks uncertain-file retry',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  const reservation=await h.send({type:'managed-reserve',batchId,jobId});
+  const before=reservation.data.batch.transferBudget;
+  const reloaded=await h.send({type:'hello',instance:'new-owner'});
+  assert.equal(reloaded.ok,true,reloaded.error);assert.equal(reloaded.data.jobs[0].status,'interrupted');
+  assert.equal(reloaded.data.jobs[0].outcomeUnknown,true);
+  assert.equal(reloaded.data.batch.transferBudget.consumedBytes,before.reservedBytes);
+  assert.equal(reloaded.data.batch.transferBudget.reservedBytes,0);
+  assert.equal(reloaded.data.batch.transferBudget.deadline,before.deadline);
+  assert.equal((await h.send({type:'retry',instance:'new-owner'})).ok,false);
+  assert.equal((await h.send({type:'managed-settle',batchId,jobId,bytesReceived:0,outcome:'interrupted'})).ok,false,'departed owner cannot refund');
+  const same=await h.send({type:'managed-settle',batchId,jobId,instance:'new-owner',bytesReceived:0,outcome:'interrupted'});
+  assert.equal(same.data.batch.transferBudget.consumedBytes,before.reservedBytes,'a late known claim cannot refund an already unknown result');
+});
+
+test('abandoned converter source is fully charged while a known Chrome outcome remains authoritative',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  const accepted=await beginConverted(h,reserved.data);const id=accepted.data.jobs[0].downloadId;
+  h.chrome.downloads.cancel=async()=>{throw new Error('still pending');};
+  const reload=await h.send({type:'hello',instance:'new-owner'});
+  assert.equal(reload.data.jobs[0].status,'in_progress');assert.equal(reload.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  assert.equal((await h.send({type:'retry',instance:'new-owner'})).ok,false);
+  h.complete(id);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='complete','real Chrome terminal state observed');
+  const stored=h.store.get('workspace:work');
+  assert.equal(stored.batch.transferBudget.attempts[jobId].status,'complete');
+  assert.equal(stored.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  assert.equal(stored.jobs[0].outcomeUnknown,undefined);
+  assert.equal((await h.send({type:'retry',instance:'new-owner'})).ok,true);
+});
+
+test('unknown managed settlement cannot turn an active Chrome download into an interrupted retry or new batch',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  const accepted=await beginConverted(h,reserved.data);const id=accepted.data.jobs[0].downloadId;
+  const unknown=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:10,outcome:'unknown',outputBytes:20});
+  assert.equal(unknown.ok,true,unknown.error);assert.equal(unknown.data.jobs[0].status,'in_progress');
+  assert.equal(unknown.data.jobs[0].downloadId,id);assert.equal(unknown.data.jobs[0].outcomeUnknown,true);
+  assert.equal(unknown.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'save',urls:[state.jobs[0].url]})).ok,false);
+  h.complete(id);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='complete','actual terminal Chrome event arrives');
+  const stored=h.store.get('workspace:work');
+  assert.equal(stored.jobs[0].outcomeUnknown,undefined);assert.equal(stored.batch.transferBudget.attempts[jobId].status,'complete');
+  assert.equal(stored.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  assert.equal(stored.batch.transferBudget.outputBytes,MEDIA_LIMITS.converter.maxOutputBytes);
+});
+
+test('missing Chrome history cannot resolve unknown usage, and a later real terminal result still recovers',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  const accepted=await beginConverted(h,reserved.data);const id=accepted.data.jobs[0].downloadId;
+  await h.send({type:'managed-settle',batchId,jobId,bytesReceived:1,outcome:'unknown'});
+  const item=structuredClone(h.downloads.get(id));h.downloads.delete(id);
+  const absent=await h.send({type:'get'});
+  assert.equal(absent.data.jobs[0].status,'in_progress');assert.equal(absent.data.jobs[0].outcomeUnknown,true);
+  assert.equal(absent.data.batch.transferBudget.attempts[jobId].status,'unknown');
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  h.downloads.set(id,{...item,state:'interrupted',error:'USER_CANCELED'});
+  const terminal=await h.send({type:'get'});
+  assert.equal(terminal.data.jobs[0].status,'interrupted');assert.equal(terminal.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(terminal.data.batch.transferBudget.attempts[jobId].status,'interrupted');
+  await h.send({type:'cancel'}); // Stop the separate, still-queued second image.
+  assert.equal((await h.send({type:'retry'})).ok,true);
+});
+
+test('managed accepted Chrome history stays unresolved even when source accounting was previously known',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  const accepted=await beginConverted(h,reserved.data);const id=accepted.data.jobs[0].downloadId;
+  await h.send({type:'managed-settle',batchId,jobId,bytesReceived:3,outcome:'complete',outputBytes:20});
+  const actual=structuredClone(h.downloads.get(id));h.downloads.delete(id);
+  const missing=await h.send({type:'get'});
+  assert.equal(missing.data.jobs[0].status,'in_progress');assert.equal(missing.data.jobs[0].downloadId,id);
+  assert.equal(missing.data.jobs[0].outcomeUnknown,true);assert.equal(missing.data.jobs[0].chromeOutcomeKnown,undefined);
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'save',urls:[state.jobs[0].url]})).ok,false);
+  await h.restartWorker();const restored=await h.send({type:'get'});
+  assert.equal(restored.data.jobs[0].status,'in_progress');assert.equal(restored.data.jobs[0].outcomeUnknown,true);
+  h.downloads.set(id,{...actual,state:'complete',bytesReceived:20,totalBytes:20});
+  const completed=await h.send({type:'get'});
+  assert.equal(completed.data.jobs[0].status,'complete');assert.equal(completed.data.jobs[0].chromeOutcomeKnown,true);
+  assert.equal(completed.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(completed.data.batch.transferBudget.consumedBytes,3);assert.equal(completed.data.batch.transferBudget.outputBytes,20);
+});
+
+test('expired managed Chrome acceptance retains matching evidence and Blob ownership until a real terminal match',async t=>{
+  const h=await browser(t,{withAlarms:true});const state=await convertedBatch(h);
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const stored=h.store.get('workspace:work');const startedAt=Date.now()-31000;
+  const submission={url:'blob:chrome-extension://test/unresolved',filename:stored.jobs[0].filename,startedAt};
+  stored.jobs[0].submission=submission;stored.jobs[0].status='in_progress';h.store.set('workspace:work',stored);
+  const expired=await h.send({type:'get'});
+  assert.equal(expired.data.jobs[0].status,'in_progress');assert.equal(expired.data.jobs[0].outcomeUnknown,true);
+  assert.deepEqual(expired.data.jobs[0].submission,submission);
+  assert.ok(h.alarms.has('imagecrate-pending-downloads'));
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  await h.restartWorker();const resumed=await h.send({type:'get'});
+  assert.equal(resumed.data.jobs[0].status,'in_progress');assert.deepEqual(resumed.data.jobs[0].submission,submission);
+  h.downloads.set(90,{id:90,url:submission.url,filename:submission.filename,byExtensionId:'test',
+    startTime:new Date(startedAt+1).toISOString(),state:'complete',bytesReceived:20,totalBytes:20,mime:'image/jpeg'});
+  const completed=await h.send({type:'get'});
+  assert.equal(completed.data.jobs[0].downloadId,90);assert.equal(completed.data.jobs[0].status,'complete');
+  assert.equal(completed.data.jobs[0].chromeOutcomeKnown,true);assert.equal(completed.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(completed.data.jobs[0].submission,undefined);assert.equal(h.requested.length,0);
+});
+
+test('an older interrupted managed Chrome ID without terminal proof is normalized before returning a workspace snapshot',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const accepted=await beginConverted(h,state);const id=accepted.data.jobs[0].downloadId;
+  const actual=structuredClone(h.downloads.get(id));h.downloads.delete(id);
+  const stored=h.store.get('workspace:work');
+  stored.jobs[0].status='interrupted';delete stored.jobs[0].chromeOutcomeKnown;delete stored.jobs[0].outcomeUnknown;
+  h.store.set('workspace:work',stored);
+  const resumed=await h.send({type:'get'});
+  assert.equal(resumed.data.jobs[0].status,'in_progress');assert.equal(resumed.data.jobs[0].outcomeUnknown,true);
+  assert.equal(resumed.data.jobs[0].downloadId,id);assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'save',urls:[state.jobs[0].url]})).ok,false);
+  h.downloads.set(id,{...actual,state:'interrupted',error:'USER_CANCELED'});
+  const terminal=await h.send({type:'get'});
+  assert.equal(terminal.data.jobs[0].status,'interrupted');assert.equal(terminal.data.jobs[0].chromeOutcomeKnown,true);
+  assert.equal(terminal.data.jobs[0].outcomeUnknown,undefined);
+});
+
+test('reload before converter Chrome acceptance preserves the full source charge but allows a safe new attempt',async t=>{
+  const h=await browser(t);const state=await convertedBatch(h);
+  const jobId=state.jobs[0].id,batchId=state.batch.id;
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const hello=await h.send({type:'hello',instance:'new-owner'});
+  assert.equal(hello.data.jobs[0].status,'interrupted');assert.equal(hello.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(hello.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  const retry=await h.send({type:'retry',instance:'new-owner'});
+  assert.equal(retry.ok,true,retry.error);assert.notEqual(retry.data.jobs[0].id,jobId);
+  assert.equal(retry.data.jobs[0].logicalJobId,state.jobs[0].logicalJobId);
+  const next=await h.send({type:'managed-reserve',instance:'new-owner',batchId,jobId:retry.data.jobs[0].id});
+  assert.equal(next.ok,true,next.error);
+  assert.equal(next.data.batch.transferBudget.logicalAttempts[state.jobs[0].logicalJobId],2);
+  assert.equal(next.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+});
+
+test('legacy active managed batches are interrupted and cannot resume without a versioned transfer ledger',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  delete state.batch.transferBudget;state.jobs[0].status='in_progress';h.store.set('workspace:work',state);
+  const hello=await h.send({type:'hello'});
+  assert.equal(hello.ok,true,hello.error);assert.equal(hello.data.jobs[0].status,'interrupted');
+  assert.equal(hello.data.batch.transferPolicyLegacy,true);assert.equal(hello.data.jobs[0].outcomeUnknown,true);
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'managed-reserve',batchId:state.batch.id,jobId:state.jobs[0].id})).ok,false);
+});
+
+test('small converter inputs cannot bypass the independent cumulative output allowance',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls,settings:{destination:'directory',directoryName:'Pictures',format:'png'}})).data;
+  state.batch.transferBudget=createTransferBudget({now:Date.now(),maxBytes:1000,maxOutputBytes:100});
+  h.store.set('workspace:work',structuredClone(state));
+  const batchId=state.batch.id;
+  for(const [index,outputBytes] of [80,20].entries()) {
+    const jobId=state.jobs[index].id;
+    const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+    assert.equal(reserved.ok,true,reserved.error);
+    assert.equal(reserved.data.jobs[index].transfer.maxOutputBytes,index===0?100:20);
+    assert.equal(reserved.data.batch.transferBudget.reservedOutputBytes,index===0?100:20);
+    const settled=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:1,outcome:'interrupted',outputBytes});
+    assert.equal(settled.ok,true,settled.error);
+    await h.send({type:'managed-update',batchId,updates:[{id:jobId,status:'interrupted'}]});
+  }
+  const ledger=h.store.get('workspace:work').batch.transferBudget;
+  assert.equal(ledger.consumedBytes,2);assert.equal(ledger.outputBytes,100);assert.equal(ledger.reservedOutputBytes,0);
+  const retry=await h.send({type:'retry'});assert.equal(retry.ok,false);assert.match(retry.error,/出力容量/);
+});
+
+test('original managed input limit also fits the output remainder and failure before write releases output',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures'}})).data;
+  state.batch.transferBudget=createTransferBudget({now:Date.now(),maxBytes:1000,maxOutputBytes:3});
+  h.store.set('workspace:work',structuredClone(state));
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  const reserved=await h.send({type:'managed-reserve',batchId,jobId});
+  assert.equal(reserved.data.jobs[0].transfer.maxBytes,3);assert.equal(reserved.data.jobs[0].transfer.maxOutputBytes,3);
+  const settled=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:2,outcome:'interrupted',outputBytes:0});
+  assert.equal(settled.data.batch.transferBudget.outputBytes,0);assert.equal(settled.data.batch.transferBudget.reservedOutputBytes,0);
+});
+
+test('unknown committed output is charged conservatively and source-only unknown recovery does not charge nonexistent output',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures',format:'png'}})).data;
+  state.batch.transferBudget=createTransferBudget({now:Date.now(),maxBytes:1000,maxOutputBytes:100});
+  h.store.set('workspace:work',structuredClone(state));
+  const batchId=state.batch.id,jobId=state.jobs[0].id;
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const unknown=await h.send({type:'managed-settle',batchId,jobId,bytesReceived:2,outcome:'unknown',outputUnknown:true});
+  assert.equal(unknown.data.batch.transferBudget.outputBytes,100);
+  assert.equal(unknown.data.batch.transferBudget.reservedOutputBytes,0);assert.equal(unknown.data.jobs[0].outcomeUnknown,true);
+  const converted=await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'png'}});
+  const next=converted.data;
+  await h.send({type:'managed-reserve',batchId:next.batch.id,jobId:next.jobs[0].id});
+  const reloaded=await h.send({type:'hello',instance:'new-owner'});
+  assert.equal(reloaded.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.converter.maxInputBytes);
+  assert.equal(reloaded.data.batch.transferBudget.outputBytes,0,'no Blob was accepted by Chrome before reload');
+  assert.equal(reloaded.data.batch.transferBudget.reservedOutputBytes,0);
 });
 
 test('directory updates require the current batch owner and reload recovers unfinished work as interrupted', async (t) => {

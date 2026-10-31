@@ -10,6 +10,9 @@ export function sessionDefaults(input) {
     selectionRevision:Number.isSafeInteger(input.selectionRevision) ? input.selectionRevision : 0,
     items:[...(input.items || [])],selectedItems:[...(input.selectedItems || [])],selectedURLs:[...new Set(input.selectedURLs || [])],
     ui:{...defaultUI(),...(input.ui || {})},jobs:(input.jobs || []).map(job=>({...job,
+      // Retries replace the attempt id, never the identity used by the durable
+      // batch transfer ledger. Old job IDs are stable migration identities.
+      logicalJobId:job.logicalJobId || job.id,
       // An old completed job has already been shown. It cannot deselect a later deliberate selection.
       completionApplied:job.completionApplied ?? job.status === 'complete'}))};
   if (state.ui.saveScope === 'failed' && (state.ui.failedBatchId !== state.batch?.id || !state.jobs.some(job=>job.status === 'interrupted'))) { state.ui.saveScope='selection'; state.ui.failedBatchId=null; }
