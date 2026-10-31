@@ -32,7 +32,7 @@
           <li><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>必要なら絞り込む</span></li>
           <li><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>選んだ画像を保存</span></li>
         </ol>
-        <p>今ページにある画像を探します。追加したいときは、元ページをスクロールして再スキャン。</p>
+        <p>元ページにある画像を探します。多いときは「続きの候補」へ進めます。元ページに画像を追加したら再スキャンしてください。</p>
         <p>保存先・画像をまとめるフォルダ名・保存形式は画面下の「変更」から指定できます。最初は元の形式のまま、Chromeのダウンロード先 / ImageCrate / ページ名に保存します。</p>
         <p>非表示にした選択画像も保存します。</p>
       </div>
@@ -51,20 +51,22 @@
   <div id="notices" class="notice" hidden></div>
 
   <section class="gallery" aria-labelledby="gallery-heading">
-    <div class="gallery-heading"><h2 id="gallery-heading">画像</h2><span id="count" class="count">表示0 / 全0件</span></div>
-    <div class="search-tools">
+    <div class="gallery-heading"><h2 id="gallery-heading" tabindex="-1">画像</h2><span id="count" class="count">表示0 / 全0件</span></div>
+    <nav class="gallery-views" aria-label="表示する画像"><button id="view-all" class="quiet" aria-pressed="true">すべて</button><button id="view-selected" class="quiet" aria-pressed="false">選択済み 0</button><button id="view-added" class="quiet" aria-pressed="false" hidden>今回追加</button></nav>
+    <div id="search-tools" class="search-tools">
       <label class="search-field"><span class="sr-only">画像を検索</span><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><input id="query" type="search" placeholder="画像を検索" autocomplete="off"></label>
       <details id="filters" class="filter-disclosure disclosure">
         <summary aria-controls="filter-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>絞り込み</span><span id="filter-count" class="filter-count" hidden></span><span class="chevron" aria-hidden="true"></span></summary>
         <div id="filter-panel" class="filter-panel disclosure-panel">
           <label class="field">最小幅 <span>px</span><input id="width" type="number" min="0" value="0" inputmode="numeric"></label>
           <label class="field">最小高さ <span>px</span><input id="height" type="number" min="0" value="0" inputmode="numeric"></label>
-          <label class="field">形式<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">IMG</option></select></label>
-          <p class="filter-hint">最小寸法を指定すると、寸法不明の画像は表示されません。</p>
+          <label class="field">形式<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">形式不明</option></select></label>
+          <p class="filter-hint">寸法未確認の候補も表示します。画像を表示すると寸法を確認できます。</p>
         </div>
       </details>
     </div>
     <div id="active-filters" class="active-filters" aria-label="適用中の条件" hidden></div>
+    <p id="dimension-note" class="filter-hint" hidden></p><button id="measure-refresh" class="quiet" hidden>確認した寸法で条件を更新</button>
     <div class="control-row">
       <p class="scan-status" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="message">ページを確認しています</span></p>
       <div class="selection-tools">
@@ -73,20 +75,26 @@
         <button id="clear" class="quiet" disabled><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg><span>すべて解除</span></button>
       </div>
     </div>
+    <a id="skip-save" class="skip-link" href="#save-heading">保存操作へ移動</a>
     <div id="grid" class="grid" aria-label="画像一覧" aria-busy="false"></div>
     <div id="empty" class="empty" hidden></div>
+    <div class="continuation"><button id="next-page" class="secondary" hidden>続きの候補</button><p id="continuation-hint" class="filter-hint" hidden>選択済みは残します。未選択の候補は次の取得結果へ切り替わります。</p></div>
   </section>
 </main>
 <footer id="footer" class="footer">
   <div class="footer-inner">
     <div class="destination-row"><span class="destination-label">保存先</span><p id="destination-summary" class="destination-summary">Chromeのダウンロード先 / ImageCrate / ページ名</p><button id="destination-change" class="quiet" type="button" aria-label="保存設定を変更" aria-haspopup="dialog" aria-controls="save-settings">変更</button><p class="format-summary">保存形式: <strong id="format-summary">元の形式</strong></p></div>
     <p id="directory-warning" class="directory-warning" hidden>選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。</p>
-    <div class="selection-info"><span id="selection-mark" class="selection-mark" aria-hidden="true"><svg class="icon"><use href="#icon-select"/></svg></span><div><strong id="selection" class="selection-summary">選択0件</strong><p id="selection-hint" class="selection-hint">画像をクリックして選択</p></div></div>
+    <h2 id="save-heading" class="sr-only" tabindex="-1">選択した画像の保存</h2>
+    <p id="recovery-summary" class="directory-warning" hidden></p><button id="recovery-cancel" class="quiet" hidden>通常の選択に戻る</button>
+    <div class="selection-info"><span id="selection-mark" class="selection-mark" aria-hidden="true"><svg class="icon"><use href="#icon-select"/></svg></span><div><button id="selection" class="selection-summary selection-link" type="button">選択0件</button><p id="selection-hint" class="selection-hint">画像をクリックして選択</p></div></div>
     <div class="save-actions">
       <button id="cancel" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-stop"/></svg>保存を停止</button>
       <button id="retry" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>中断分を再試行</button>
+      <button id="prepare-failed" class="secondary" hidden>中断分を新しい保存として準備</button>
       <button id="save" class="primary" disabled><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span id="save-label">選択0件を保存</span></button>
     </div>
+    <button id="return-gallery" class="quiet return-gallery" type="button">画像一覧へ戻る</button>
     <div id="batch-panel" class="batch-panel" hidden><progress id="batch-progress" max="1" value="0" aria-label="今回の保存の進捗"></progress><p id="batch" class="batch-status" role="status" aria-live="polite"></p><p id="batch-format" class="batch-format"></p><p id="batch-destination" class="batch-destination"></p></div>
   </div>
 </footer>
@@ -122,8 +130,14 @@
     <section class="destination-result" aria-labelledby="destination-preview-label"><h3 id="destination-preview-label">保存先のプレビュー</h3><p id="destination-preview" class="destination-preview" aria-live="polite">Chromeのダウンロード先 / ImageCrate / ページ名</p></section>
     <p class="settings-note">同じ名前のフォルダがある場合は、その中へ保存します。ファイル名が重なっても上書きせず、別名で保存します。</p>
     <p id="settings-error" class="error settings-error" role="alert" hidden></p>
-    <div class="settings-actions"><button id="settings-done" class="primary" type="button">この設定で戻る</button></div>
+    <div class="settings-actions"><button id="settings-cancel" class="secondary" type="button">キャンセル</button><button id="settings-done" class="primary" type="button">設定を適用</button></div>
   </div>
+</dialog>
+<dialog id="image-preview" class="image-preview" aria-labelledby="preview-title">
+  <header class="settings-header"><h2 id="preview-title">画像の確認</h2><button id="preview-close" class="quiet" type="button">閉じる</button></header>
+  <div id="preview-stage" class="preview-stage"></div>
+  <div class="preview-controls"><p id="preview-meta"></p><button id="preview-zoom" class="quiet" aria-pressed="false">100%で表示</button><button id="preview-prev" class="secondary">前の画像</button><button id="preview-next" class="secondary">次の画像</button><label class="preview-selection"><input id="preview-select" type="checkbox">この画像を選択</label></div>
+  <div id="preview-variants" class="preview-variants" aria-label="同じ要素の別候補"></div>
 </dialog>
 <script type="module" src="workspace.js"></script>
 </body>

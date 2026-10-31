@@ -1,5 +1,6 @@
 import { fileLabel, extensionOf, matchesImage, summarizeJobs, formatBytes, publicError, saveSettings, destinationLabel, permissionOrigins, requiresWorkspace, formatLabel } from './utils.js';
-import { getDirectory, putDirectory } from './directory-store.js';
+import { getDirectory, putDirectory, deleteDirectory, getLastDestination, putLastDestination } from './directory-store.js';
+import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
 
@@ -9,11 +10,13 @@ const sessionId = new URL(location.href).searchParams.get('id');
 const instance = crypto.randomUUID();
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
+let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
+let uiWrites=Promise.resolve(), pendingSelections=0, measureTimer, measureUpdates=new Map();
 let settings, directoryHandle = null, directoryPermission = 'prompt', managedRunning = false, managedController = null;
 let batchDirectoryHandle = null, batchDirectoryPermission = 'prompt';
 let settingsWrites = Promise.resolve();
 let closingSettings = false;
-const handledCompletions = new Set();
+
 // A converted download owns its Blob URL until Chrome reports a terminal state.
 const convertedURLs = new Map();
 async function send(type, extra = {}) {
@@ -59,7 +62,7 @@ function isBusy() { return loading || requestPending || managedRunning || closin
 function jobFor(url) { return state.jobs.find(job=>job.url===url) || state.history?.find(job=>job.url===url); }
 function jobLabel(job) {
   if (!job) return '';
-  if (job.status === 'complete') return '保存完了';
+  if (job.status === 'complete') return `保存完了${job.typeKnown===false?' · 形式不明':''}${job.actualFilename?' · '+job.actualFilename.split(/[\\/]/).pop():''}`;
   if (job.status === 'interrupted') return `中断 · ${job.error || '再試行できます'}`;
   if (job.status === 'queued') return '順番待ち';
   if(state.batch?.format && state.batch.format !== 'original' && !job.downloadId) return `変換・保存中 · ${formatBytes(job.bytesReceived)}`;
@@ -67,22 +70,37 @@ function jobLabel(job) {
 }
 function statusElement(item) { const span = element('span','item-status',jobLabel(jobFor(item.url))); span.dataset.url=item.url;span.dataset.state=jobFor(item.url)?.status || '';  return span; }
 function applyState(next) {
-  state = next;
-  for(const job of state.jobs) {
-    const key=`${job.id || job.downloadId}:${job.url}`;
-    if(job.status === 'complete' && !handledCompletions.has(key)) { selected.delete(job.url); handledCompletions.add(key); }
-    if(['complete','interrupted'].includes(job.status) && convertedURLs.has(job.id)) {
-      URL.revokeObjectURL(convertedURLs.get(job.id));convertedURLs.delete(job.id);
-    }
+  if(state && (next.revision || 0) < (state.revision || 0)) return;
+  const selectionBefore=[...selected].join('\n');
+  state=next;if(!pendingSelections)selected=new Set(state.selectedURLs || []);
+  for(const job of state.jobs) if(['complete','interrupted'].includes(job.status) && convertedURLs.has(job.id)) {
+    URL.revokeObjectURL(convertedURLs.get(job.id));convertedURLs.delete(job.id);
   }
   updateSummary();
-  for(const el of document.querySelectorAll('.item-status')) { const job=jobFor(el.dataset.url);el.textContent=jobLabel(job);el.dataset.state=job?.status || ''; }
-  for(const checkbox of document.querySelectorAll('.image-select')) checkbox.checked=selected.has(checkbox.dataset.url);
+  for(const el of document.querySelectorAll('.item-status')) {const job=jobFor(el.dataset.url);el.textContent=jobLabel(job);el.dataset.state=job?.status || '';}
+  if(gallery.mode==='selected' && selectionBefore!==[...selected].join('\n')){gallery.render();visible=gallery.visible;}
+  gallery.sync();
 }
+function persistUI(patch) {
+  const selecting=Array.isArray(patch.selectedURLs);
+  if(selecting && new Set(patch.selectedURLs).size>500)return Promise.reject(new Error('選択できる画像は500件までです。選択を保存するか、減らしてから操作してください。'));
+  if(selecting){pendingSelections++;selected=new Set(patch.selectedURLs);updateSummary();gallery.sync();}
+  const task=uiWrites.catch(()=>{}).then(async()=> {
+    try {const next=await send('ui',{patch,baseRevision:state.revision || 0});if(selecting)pendingSelections--;applyState(next);return next;}
+    catch(e){if(selecting){pendingSelections--;if(!pendingSelections)selected=new Set(state.selectedURLs || []);updateSummary();gallery.sync();}throw e;}
+  });
+  uiWrites=task;return task;
+}
+const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,
+  onSelect:urls=>persistUI({selectedURLs:urls}),onView:patch=>persistUI(patch).catch(error),onError:error,
+  onMeasure:update=>{measureUpdates.set(update.url,update);clearTimeout(measureTimer);measureTimer=setTimeout(()=> {
+    const updates=[...measureUpdates.values()];measureUpdates.clear();
+    send('dimensions',{updates}).then(next=>{applyState(next);}).catch(error);
+  },250);},status:url=>jobLabel(jobFor(url))});
 function updateSummary() {
   if(!state) return;
   const batch=summarizeJobs(state.jobs), busy=isBusy();
-  $('scan').disabled=busy || Boolean(recorder?.busy);
+  $('scan').disabled=busy || Boolean(recorder?.busy);$('next-page').disabled=busy;$('continuation-hint').hidden=!state.scan?.hasMore;
   document.body.dataset.loading=String(loading);
   $('grid').setAttribute('aria-busy',String(loading));
   $('batch').textContent=batch.total ? `今回 ${batch.total}件中 ${batch.complete}件保存完了 · ${batch.interrupted}件中断${batch.active ? ` · ${batch.active}件処理中` : ''}` : '';
@@ -94,56 +112,36 @@ function updateSummary() {
   $('cancel').hidden=!batch.active;
   $('retry').hidden=!batch.interrupted || batch.active > 0;
   $('retry').disabled=requestPending || managedRunning;
+  const reconnect=state.batch?.destination==='directory' && batchDirectoryHandle && batchDirectoryPermission!=='granted';
+  $('retry').textContent=reconnect?'今回の保存先へ再接続':`中断${batch.interrupted}件を再試行`;
+  $('prepare-failed').hidden=!batch.interrupted || !!batch.active;
+  gallery.setBusy(busy);
   if(settings) renderDestination();
   if(KIND === 'images') {
-    const visibleURLs=new Set(visible.map(i=>i.url));
+    const visibleURLs=new Set(gallery.visible.map(i=>i.url));
     const hidden=[...selected].filter(url=>!visibleURLs.has(url)).length;
     $('selection').textContent=`選択${selected.size}件${hidden ? ` · 非表示${hidden}件を含む` : ''}`;
     $('footer').dataset.selected=String(selected.size > 0);
     $('selection-hint').textContent=hidden ? '非表示の画像も保存します' : selected.size ? '選んだ画像をまとめて保存' : '画像をクリックして選択';
-    $('save-label').textContent=`選択${selected.size}件を保存`;
-    $('save').disabled=!selected.size || busy;
-    $('select-visible').disabled=busy || !visible.length;
+    const failedScope=state.ui?.saveScope==='failed' && state.ui.failedBatchId===state.batch?.id;
+    $('recovery-summary').hidden=!failedScope;$('recovery-cancel').hidden=!failedScope;
+    $('recovery-summary').textContent=`中断した${batch.interrupted}件を新しい保存先・形式で保存します。通常の選択${selected.size}件は保持します。`;
+    $('save-label').textContent=failedScope?`中断${batch.interrupted}件を新しく保存`:`選択${selected.size}件を保存`;
+    $('save').disabled=!(failedScope?batch.interrupted:selected.size) || busy;
+    $('select-visible').disabled=busy || !gallery.visible.length;
     $('clear').disabled=busy || !selected.size;
     for(const el of document.querySelectorAll('.image-select')) el.disabled=busy;
   } else for(const el of document.querySelectorAll('.direct-save')) el.disabled=busy;
 }
 function renderImages() {
+  if(!state)return;
   const filters={query:$('query').value,width:Math.max(0,Number($('width').value)||0),height:Math.max(0,Number($('height').value)||0),type:$('type').value};
-  visible=state.items.filter(item=>matchesImage(item,filters));
-  renderFilterState(filters);
-  $('count').textContent=`表示${visible.length} / 全${state.items.length}件`;
-  $('grid').replaceChildren();
-  for(const [index,item] of visible.entries()) {
-    const card=element('label','card');
-    const thumb=element('div','thumb');
-    const image=new Image(); image.loading='lazy'; image.alt=''; image.referrerPolicy='no-referrer';
-    image.addEventListener('error',()=>{ const fallback=element('span','preview-error');fallback.append(icon('image'),element('span','','プレビューなし'));thumb.replaceChildren(fallback); }); image.src=item.url; thumb.append(image);
-    const body=element('div','card-body');
-    const input=element('input','image-select'); input.type='checkbox';input.dataset.url=item.url; input.checked=selected.has(item.url);
-    input.setAttribute('aria-label',`${fileLabel(item.url)}を選択`);
-    input.setAttribute('aria-describedby',`image-meta-${index} image-status-${index}`);
-    input.addEventListener('change',()=>{input.checked ? selected.add(item.url) : selected.delete(item.url);updateSummary();});
-    const name=element('strong','file-name',fileLabel(item.url)); name.title=fileLabel(item.url);
-    const meta=element('span','meta');meta.id=`image-meta-${index}`;
-    meta.append(element('span','',item.width && item.height ? `${item.width} × ${item.height}` : '寸法不明'),element('span','file-type',extensionOf(item.url,'images').toUpperCase()));
-    const status=statusElement(item);status.id=`image-status-${index}`;
-    body.append(input,name,meta,status);
-    card.append(thumb,body); $('grid').append(card);
-  }
-  $('empty').hidden=visible.length > 0;
-  $('empty').replaceChildren(icon(state.items.length ? 'search' : 'image'),element('h3','',state.items.length ? '一致する画像がありません' : '画像が見つかりませんでした'),element('p','',state.items.length ? '条件を変えるか、リセットしてすべて表示。' : '元ページで画像を表示してから、再スキャンしてください。'));
-  if(state.items.length && !visible.length) {
-    const reset=element('button','secondary','条件をリセット');reset.addEventListener('click',()=>{resetFilters();$('query').focus();});$('empty').append(reset);
-  } else if(!state.items.length) {
-    const source=element('button','secondary','元ページを開く');source.prepend(icon('arrow'));source.addEventListener('click',()=>send('source').catch(error));$('empty').append(source);
-  }
-  updateSummary();
+  renderFilterState(filters);gallery.render();visible=gallery.visible;updateSummary();
 }
-async function scan() {
+async function scan(continuation=false) {
   if(isBusy() || recorder?.busy) return;
   loading=true;clearError();updateSummary();$('message').textContent='画像を探しています…';
-  try { applyState(await send('scan'));render();$('message').textContent=`${state.items.length}件の候補を取得`; }
+  try { await uiWrites.catch(()=>{});applyState(await send('scan',{continuation}));render();const added=state.scan?.addedURLs?.length || 0;$('message').textContent=continuation?`次の${state.items.length}件の候補を取得`:`${state.items.length}件の候補を取得 · 今回追加${added}件`; }
   catch(e){error(e);$('message').textContent='取得できませんでした。元ページからやり直せます。';}
   finally {loading=false;updateSummary();}
 }
@@ -164,7 +162,7 @@ async function saveURLs(urls) {
     if(settings.destination === 'directory' && await directoryHandle.queryPermission({mode:'readwrite'}) !== 'granted') {
       directoryPermission='prompt';openSettings();throw new Error('フォルダへの書き込み許可を再確認してください。');
     }
-    applyState(await send('save',{urls,settings}));
+    await uiWrites;applyState(await send('save',{urls,settings,sourceBatchId:state.ui?.saveScope==='failed'?state.batch?.id:undefined}));
     if(requiresWorkspace(state.batch)) {
       if(state.batch.destination === 'directory') {
         batchDirectoryHandle=directoryHandle;batchDirectoryPermission=directoryPermission;
@@ -218,79 +216,90 @@ function requestImageAccess(urls) {
 }
 function settingsError(message) {$('settings-error').textContent=message;$('settings-error').hidden=false;}
 function openSettings() {
-  if(!settings || !state) return;
-  if(!$('save-settings').open) $('save-settings').showModal();
-  renderDestination();
+  if(!settings || !state || isBusy()) return;
+  draft={...settings};draftHandle=directoryHandle;draftPermission=directoryPermission;settingsGeneration++;
+  $('settings-description').textContent='保存する場所・まとめるフォルダ名・保存形式を指定できます。適用後に保存ボタンを押してください。';
+  $('folder-name').value=draft.folderName;$('output-format').value=draft.format || 'original';$('settings-error').hidden=true;
+  $('save-settings').showModal();renderDestination();
+}
+function cancelSettings() {
+  if(closingSettings)return;
+  settingsGeneration++;draft=null;draftHandle=null;$('save-settings').close();renderDestination();$('destination-change').focus();
 }
 async function closeSettings() {
-  if(closingSettings) return;closingSettings=true;
-  $('settings-done').disabled=true;$('settings-done').textContent='設定を保存中…';
-  updateSummary();
+  if(closingSettings || !draft)return;
+  const candidate={...draft},handle=draftHandle,permission=draftPermission;
+  if(candidate.destination==='directory' && !handle){settingsError('保存するフォルダを選んでください。');return;}
+  closingSettings=true;renderDestination();$('settings-done').disabled=true;$('settings-done').textContent='設定を保存中…';
+  let preparedKey;
+  const accept=async next=>{
+    settings={...next.saveSettings};directoryHandle=handle;directoryPermission=permission;applyState(next);
+    try {await putLastDestination({handle,destination:settings.destination});}
+    catch {error(new Error('今回の設定は適用しましたが、次回の保存先を記憶できませんでした。'));}
+    draft=null;draftHandle=null;settingsGeneration++;$('save-settings').close();
+  };
   try {
-    await settingsWrites.catch(()=>{});
-    await send('settings',{settings:{...settings}});
-    $('save-settings').close();
-  } catch(e) {settingsError(publicError(e));}
-  finally {
-    closingSettings=false;$('settings-done').disabled=false;$('settings-done').textContent='この設定で戻る';updateSummary();
-    if(!$('save-settings').open) $('destination-change').focus();
+    if(handle){preparedKey=`session:${sessionId}:${crypto.randomUUID()}`;await send('settings-prepare',{directoryKey:preparedKey});await putDirectory(preparedKey,handle);candidate.directoryKey=preparedKey;}
+    const next=await send('settings',{settings:candidate});
+    await accept(next);
+  } catch(e) {
+    let current;try{current=await send('get');}catch{}
+    const committed=current?.saveSettings && (!preparedKey||current.saveSettings.directoryKey===preparedKey)
+      && ['destination','folderName','format'].every(key=>(current.saveSettings[key] || (key==='format'?'original':''))===(candidate[key] || (key==='format'?'original':'')));
+    if(committed)await accept(current);
+    else {
+      // A lost acknowledgement does not prove that commit failed. Preserve the
+      // prepared handle until a worker snapshot confirms it is unreferenced.
+      if(preparedKey && current && current.saveSettings?.directoryKey!==preparedKey){await send('settings-abort',{directoryKey:preparedKey}).catch(()=>{});await deleteDirectory(preparedKey).catch(()=>{});}
+      settingsError(current?publicError(e):'設定の適用結果を確認できません。接続が戻ってから「設定を適用」で確認してください。');
+    }
   }
+  finally {closingSettings=false;$('settings-done').disabled=false;$('settings-done').textContent='設定を適用';renderDestination();updateSummary();if(!$('save-settings').open)$('destination-change').focus();}
 }
-function persistSettings() {
-  const snapshot={...settings};
-  settingsWrites=settingsWrites.catch(()=>{}).then(()=>send('settings',{settings:snapshot}));
-  settingsWrites.catch(e=>settingsError(publicError(e)));
-}
+function persistSettings() {return send('settings',{settings:{...settings}});}
 function renderDestination() {
-  const resolved=saveSettings(settings,state.title), label=destinationLabel(resolved), custom=settings.destination === 'directory', converting=resolved.format !== 'original';
-  $('destination-summary').textContent=label;$('destination-summary').title=label;
-  $('destination-preview').textContent=label;
-  $('destination-downloads').checked=!custom;$('destination-directory').checked=custom;
-  $('chosen-directory').textContent=directoryHandle ? `選択した「${directoryHandle.name}」` : 'フォルダを選んで保存';
-  $('directory-status').textContent=!directoryHandle ? '保存するフォルダを選んでください。' : directoryPermission === 'granted' ? 'このフォルダに保存できます。' : '保存前にフォルダへの書き込み許可を確認してください。';
-  $('directory-reconnect').hidden=!custom || !directoryHandle || directoryPermission === 'granted';
-  $('directory-details').hidden=!custom || converting;
-  $('format-summary').textContent=formatLabel(resolved.format);
-  $('format-details').hidden=!converting;
-  $('format-help').hidden=converting;
-  $('format-details').textContent=`アニメーションは1コマの静止画、SVGは固定サイズの画像になります。${resolved.format === 'jpg' ? 'JPEGの透明部分は白背景です。' : '透明部分は保持します。'}選んだ画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
-  $('directory-warning').hidden=!requiresWorkspace(resolved);
-  $('directory-warning').textContent=converting ? '画像を変換して保存します。処理中はこのタブを開いたままにしてください。' : '選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。';
-  $('folder-adjustment').hidden=!settings.folderName.trim() || resolved.folderName === settings.folderName;
-  $('folder-adjustment').textContent=`使用できない文字や長さを調整します。作成する名前: ${resolved.folderName}`;
-  const busy=isBusy();
-  $('destination-change').disabled=busy;
-  for(const control of $('save-settings').querySelectorAll('input,select,button')) {
-    if(!['settings-close','settings-done'].includes(control.id)) control.disabled=busy;
-  }
-  $('destination-directory').disabled=busy || !directoryHandle;
-  $('choose-directory').disabled=busy || !window.showDirectoryPicker;
-  if(!window.showDirectoryPicker) $('directory-status').textContent='この環境ではフォルダ選択に対応していません。Chromeのダウンロード先を使用できます。';
-  $('batch-destination').textContent=state.batch ? `今回の保存先: ${destinationLabel(state.batch)}` : '';
+  if(!settings || !state)return;
+  const applied=saveSettings(settings,state.title);$('destination-summary').textContent=destinationLabel(applied);$('destination-summary').title=destinationLabel(applied);
+  $('format-summary').textContent=formatLabel(applied.format);
+  $('directory-warning').hidden=!requiresWorkspace(applied);
+  $('directory-warning').textContent=applied.format!=='original'?'画像を変換して保存します。処理中はこのタブを開いたままにしてください。':'選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。';
+  $('destination-change').disabled=isBusy();
+  $('batch-destination').textContent=state.batch?`今回の保存先: ${destinationLabel(state.batch)}`:'';
   $('batch-destination').title=$('batch-destination').textContent;
-  $('batch-format').textContent=state.batch ? `今回の形式: ${formatLabel(state.batch.format)}` : '';
+  $('batch-format').textContent=state.batch?`今回の形式: ${formatLabel(state.batch.format)}`:'';
+  if(!draft)return;
+  const resolved=saveSettings(draft,state.title),custom=draft.destination==='directory',converting=resolved.format!=='original';
+  $('destination-preview').textContent=destinationLabel(resolved);
+  $('destination-downloads').checked=!custom;$('destination-directory').checked=custom;
+  $('chosen-directory').textContent=draftHandle?`選択した「${draftHandle.name}」`:'フォルダを選んで保存';
+  $('directory-status').textContent=!draftHandle?'保存するフォルダを選んでください。':draftPermission==='granted'?'このフォルダに保存できます。':'保存前にフォルダへの書き込み許可を確認してください。';
+  $('directory-reconnect').hidden=!custom || !draftHandle || draftPermission==='granted';$('directory-details').hidden=!custom || converting;
+  $('format-details').hidden=!converting;$('format-help').hidden=converting;
+  $('format-details').textContent=`アニメーションは1コマの静止画、SVGは固定サイズの画像になります。${resolved.format==='jpg'?'JPEGの透明部分は白背景です。':'透明部分は保持します。'}画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
+  $('folder-adjustment').hidden=!draft.folderName.trim() || resolved.folderName===draft.folderName;
+  $('folder-adjustment').textContent=`作成する名前: ${resolved.folderName}`;
+  const busy=closingSettings || requestPending;
+  for(const control of $('save-settings').querySelectorAll('input,select,button'))control.disabled=busy;
+  $('destination-directory').disabled=busy || !draftHandle;$('choose-directory').disabled=busy || !window.showDirectoryPicker;
 }
 async function chooseDirectory() {
-  if(isBusy()) return;
-  // Native picker must be invoked before the first await.
-  const picked=window.showDirectoryPicker({id:'imagecrate-destination',mode:'readwrite',startIn:directoryHandle || 'downloads'});
-  requestPending=true;$('settings-error').hidden=true;updateSummary();
+  if(closingSettings || requestPending || !draft)return;
+  const generation=settingsGeneration;
+  const picked=window.showDirectoryPicker({id:'imagecrate-destination',mode:'readwrite',startIn:draftHandle || 'downloads'});
+  requestPending=true;$('settings-error').hidden=true;renderDestination();
   try {
-    const handle=await picked;
-    // Persist before replacing the previous usable setting.
-    await putDirectory(`session:${sessionId}`,handle);await putDirectory('last',handle);
-    directoryHandle=handle;directoryPermission=await handle.queryPermission({mode:'readwrite'});
-    settings.destination='directory';settings.directoryName=handle.name;
-    await chrome.storage.local.set({saveDestination:'directory'});persistSettings();
-  } catch(e) {if(e.name !== 'AbortError') settingsError(publicError(e));}
-  finally {requestPending=false;updateSummary();}
+    const handle=await picked;if(generation!==settingsGeneration || !draft)return;
+    const permission=await handle.queryPermission({mode:'readwrite'});if(generation!==settingsGeneration || !draft)return;
+    draftHandle=handle;draftPermission=permission;draft.destination='directory';draft.directoryName=handle.name;
+  } catch(e){if(e.name!=='AbortError' && generation===settingsGeneration)settingsError(publicError(e));}
+  finally {requestPending=false;renderDestination();}
 }
 async function reconnectDirectory() {
-  if(isBusy() || !directoryHandle) return;
-  const permission=directoryHandle.requestPermission({mode:'readwrite'});
-  requestPending=true;updateSummary();
-  try {directoryPermission=await permission;if(directoryPermission !== 'granted') settingsError('書き込みが許可されませんでした。選択したフォルダはそのまま残っています。');else $('settings-error').hidden=true;}
-  catch(e) {settingsError(publicError(e));} finally {requestPending=false;updateSummary();}
+  if(closingSettings || requestPending || !draftHandle)return;
+  const handle=draftHandle,generation=settingsGeneration,permission=handle.requestPermission({mode:'readwrite'});
+  requestPending=true;renderDestination();
+  try {const result=await permission;if(generation===settingsGeneration && draft){draftPermission=result;if(result!=='granted')settingsError('書き込みが許可されませんでした。選択は残っています。');else $('settings-error').hidden=true;}}
+  catch(e){settingsError(publicError(e));}finally{requestPending=false;renderDestination();}
 }
 async function interruptManagedJobs(reason) {
   // Downloads already handed to Chrome must settle there before a retry.
@@ -319,12 +328,12 @@ async function runManagedBatch(handle) {
           report({id:job.id,status:'in_progress',...progress}).catch(e=>{controller.abort();error(e);});
         }};
         if(batch.format && batch.format !== 'original') {
-          const item=state.items.find(item=>item.url===job.url);
+          const item=candidateCatalog(state).find(item=>item.url===job.url);
           const blob=await convertImage(job.url,batch.format,{...options,knownWidth:item?.width,knownHeight:item?.height});
           if(controller.signal.aborted) throw new DOMException('停止しました。','AbortError');
           if(folder) {
             const result=await writeBlob(folder,job.filename,blob,options);
-            await report({id:job.id,status:'complete',...result});
+            await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
           } else {
             const blobURL=URL.createObjectURL(blob);convertedURLs.set(job.id,blobURL);
             try {
@@ -348,70 +357,71 @@ async function runManagedBatch(handle) {
           }
         } else {
           const result=await writeImage(folder,job.filename,job.url,options);
-          await report({id:job.id,status:'complete',...result});
+          await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
         }
       } catch(e) {
-        const reason=controller.signal.aborted ? '停止しました。中断分を再試行できます。' : e.name === 'TypeError' ? '画像を取得できません。接続・サイトの認証・配信元の制限を確認するか、Chromeのダウンロード先で新しく保存してください。' : publicError(e);
+        const reason=controller.signal.aborted ? '停止しました。中断分を再試行できます。' : e.name==='NotFoundError'?'保存先が見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':e.name === 'TypeError' ? '画像を取得できません。接続・サイトの認証・配信元の制限を確認するか、Chromeのダウンロード先・元の形式で新しく保存してください。' : publicError(e);
         await report({id:job.id,status:'interrupted',error:reason});
       }
     }
     await updates;
     if(controller.signal.aborted) await interruptManagedJobs('停止しました。中断分を再試行できます。');
-  } catch(e) {error(e);await interruptManagedJobs(publicError(e)).catch(()=>{});}
+  } catch(e) {const reason=e.name==='NotFoundError'?'保存先フォルダが見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':publicError(e);error(new Error(reason));await interruptManagedJobs(reason).catch(()=>{});}
   finally {managedRunning=false;managedController=null;$('cancel').disabled=false;updateSummary();}
 }
 
 $('destination-change').addEventListener('click',openSettings);
-for(const id of ['settings-close','settings-done']) $(id).addEventListener('click',closeSettings);
-$('save-settings').addEventListener('cancel',event=>{event.preventDefault();closeSettings();});
+$('settings-done').addEventListener('click',closeSettings);
+for(const id of ['settings-close','settings-cancel'])$(id).addEventListener('click',cancelSettings);
+$('save-settings').addEventListener('cancel',event=>{event.preventDefault();cancelSettings();});
 $('choose-directory').addEventListener('click',()=>chooseDirectory().catch(settingsError));
 $('directory-reconnect').addEventListener('click',reconnectDirectory);
-for(const mode of ['downloads','directory']) $(`destination-${mode}`).addEventListener('change',()=>{
-  if(isBusy()) return;settings.destination=mode;settings.directoryName=directoryHandle?.name || '';
-  chrome.storage.local.set({saveDestination:mode}).catch(e=>settingsError(publicError(e)));persistSettings();renderDestination();
-});
-$('folder-name').addEventListener('input',()=>{settings.folderName=$('folder-name').value;persistSettings();renderDestination();});
-$('output-format').addEventListener('change',()=>{settings.format=$('output-format').value;persistSettings();renderDestination();});
-$('folder-reset').addEventListener('click',()=>{settings.folderName=state.title;$('folder-name').value=settings.folderName;persistSettings();renderDestination();$('folder-name').focus();});
-window.addEventListener('beforeunload',event=>{if(managedRunning || requiresWorkspace(state?.batch) && summarizeJobs(state.jobs).active) {event.preventDefault();event.returnValue='';}});
-$('source').addEventListener('click',()=>send('source').catch(error));$('scan').addEventListener('click',scan);
+for(const mode of ['downloads','directory'])$(`destination-${mode}`).addEventListener('change',()=>{if(!draft)return;draft.destination=mode;draft.directoryName=draftHandle?.name || '';renderDestination();});
+$('folder-name').addEventListener('input',()=>{if(draft){draft.folderName=$('folder-name').value;renderDestination();}});
+$('output-format').addEventListener('change',()=>{if(draft){draft.format=$('output-format').value;renderDestination();}});
+$('folder-reset').addEventListener('click',()=>{if(draft){draft.folderName=state.title;$('folder-name').value=draft.folderName;renderDestination();$('folder-name').focus();}});
+window.addEventListener('beforeunload',event=>{if(managedRunning || requiresWorkspace(state?.batch) && summarizeJobs(state.jobs).active){event.preventDefault();event.returnValue='';}});
+$('source').addEventListener('click',()=>send('source').catch(error));$('scan').addEventListener('click',()=>scan(false));$('next-page').addEventListener('click',()=>scan(true));
 $('retry').addEventListener('click',()=>jobAction('retry'));$('cancel').addEventListener('click',()=>jobAction('cancel'));
-$('reset-filters').addEventListener('click',()=>{resetFilters();$('query').focus();});
+$('prepare-failed').addEventListener('click',async()=>{
+  if(isBusy())return;
+  const urls=state.jobs.filter(j=>j.status==='interrupted').map(j=>j.url);
+  try {await persistUI({saveScope:'failed',failedBatchId:state.batch.id});openSettings();$('settings-description').textContent=`中断した${urls.length}件を、新しい保存先・形式で保存する設定です。他の選択は保持します。適用後に「中断${urls.length}件を新しく保存」を押してください。`;}
+  catch(e){error(e);}
+});
+$('reset-filters').addEventListener('click',()=>{resetFilters();persistUI(gallery.viewPatch()).catch(error);$('query').focus();});
 for(const id of ['filters','help']) {
-  const details=$(id), summary=details.querySelector('summary');
-  details.addEventListener('toggle',()=>summary.setAttribute('aria-expanded',String(details.open)));
-  details.addEventListener('keydown',event=>{if(event.key==='Escape' && details.open){details.open=false;summary.focus();event.preventDefault();}});
+  const details=$(id),summary=details.querySelector('summary');
+  details.addEventListener('toggle',()=>{
+    summary.setAttribute('aria-expanded',String(details.open));if(state)persistUI(gallery.viewPatch()).catch(error);
+    if(id==='filters' && details.open)requestAnimationFrame(()=>{
+      const panel=$('filter-panel').getBoundingClientRect(),footer=$('footer').getBoundingClientRect();
+      if(panel.bottom>footer.top || panel.top<0)window.scrollBy({top:panel.top-Math.max(8,(innerHeight-footer.height-panel.height)/2),behavior:'instant'});
+    });
+  });
+  details.addEventListener('keydown',event=>{if(event.key==='Escape'&&details.open){details.open=false;summary.focus();event.preventDefault();}});
 }
-if(KIND === 'images') {
-  for(const id of ['query','width','height','type']) $(id).addEventListener('input',()=>{if(state)renderImages();});
-  $('select-visible').addEventListener('click',()=>{for(const i of visible)selected.add(i.url);applyState(state);});
-  $('clear').addEventListener('click',()=>{selected.clear();applyState(state);});
-  $('save').addEventListener('click',()=>saveURLs([...selected]));
-}
+for(const id of ['query','width','height','type'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
+$('select-visible').addEventListener('click',()=>{const urls=[...new Set([...selected,...gallery.visible.map(i=>i.url)])];persistUI({selectedURLs:urls}).then(()=>gallery.sync()).catch(error);});
+$('clear').addEventListener('click',()=>persistUI({selectedURLs:[]}).then(()=>renderImages()).catch(error));
+$('recovery-cancel').addEventListener('click',()=>persistUI({saveScope:'selection',failedBatchId:null}).catch(error));
+$('save').addEventListener('click',()=>saveURLs(state.ui?.saveScope==='failed'&&state.ui.failedBatchId===state.batch?.id?state.jobs.filter(j=>j.status==='interrupted').map(j=>j.url):[...selected]));
+let scrollTimer;window.addEventListener('scroll',()=>{if(!state)return;clearTimeout(scrollTimer);scrollTimer=setTimeout(()=>persistUI(gallery.viewPatch()).catch(error),200);},{passive:true});
 try {
-  state=await send('hello');$('source-title').textContent=state.title;$('source-title').title=state.title;
+  state=await send('hello');selected=new Set(state.selectedURLs || []);$('source-title').textContent=state.title;$('source-title').title=state.title;
+  let remembered;
   try {
-    await send('prune-directories');
-    directoryHandle=await getDirectory(`session:${sessionId}`) || await getDirectory('last');
-    if(directoryHandle) {
-      await putDirectory(`session:${sessionId}`,directoryHandle);
-      directoryPermission=await directoryHandle.queryPermission({mode:'readwrite'});
-    }
-    if(state.batch?.destination === 'directory') {
-      batchDirectoryHandle=await getDirectory(`batch:${state.batch.id}`);
-      if(batchDirectoryHandle) batchDirectoryPermission=await batchDirectoryHandle.queryPermission({mode:'readwrite'});
-    }
-  } catch(e) {error(e);}
-  const remembered=(await chrome.storage.local.get('saveDestination')).saveDestination;
-  settings={format:'original',...(state.saveSettings || {destination:remembered === 'directory' && directoryHandle ? 'directory' : 'downloads',folderName:state.title,directoryName:directoryHandle?.name || ''})};
-  if(settings.destination === 'directory' && directoryHandle) settings.directoryName=directoryHandle.name;
-  $('folder-name').value=settings.folderName;$('output-format').value=settings.format;persistSettings();renderDestination();
+    await send('prune-directories');remembered=await getLastDestination();
+    directoryHandle=state.saveSettings?.directoryKey?await getDirectory(state.saveSettings.directoryKey):(await getDirectory(`session:${sessionId}`) || remembered?.handle);
+    if(directoryHandle)directoryPermission=await directoryHandle.queryPermission({mode:'readwrite'});
+    if(state.batch?.destination==='directory'){batchDirectoryHandle=await getDirectory(`batch:${state.batch.id}`);if(batchDirectoryHandle)batchDirectoryPermission=await batchDirectoryHandle.queryPermission({mode:'readwrite'});}
+  } catch(e){error(e);}
+  settings={format:'original',...(state.saveSettings || {destination:remembered?.destination==='directory'&&directoryHandle?'directory':'downloads',folderName:state.title,directoryName:directoryHandle?.name || ''})};
+  if(settings.destination==='directory'&&directoryHandle)settings.directoryName=directoryHandle.name;
+  $('folder-name').value=settings.folderName;$('output-format').value=settings.format;renderDestination();
   try{$('source-domain').textContent=new URL(state.url).hostname;}catch{}
-  render();
+  gallery.restore(state.ui);render();
   if(!state.scanned)await scan();else{$('message').textContent='前回の取得結果を表示';applyState(await send('get'));}
-  setInterval(async()=> {
-    if(pollRunning || loading || requestPending || !state) return;
-    pollRunning=true;
-    try{if(summarizeJobs(state.jobs).active)applyState(await send('get'));}catch(e){error(e);}finally{pollRunning=false;}
-  },1000);
+  requestAnimationFrame(()=>window.scrollTo(0,state.ui?.scrollY || 0));
+  setInterval(async()=>{if(pollRunning||loading||requestPending||!state)return;pollRunning=true;try{if(summarizeJobs(state.jobs).active)applyState(await send('get'));}catch(e){error(e);}finally{pollRunning=false;}},1000);
 } catch(e){error(e);$('message').textContent='元ページで拡張アイコンを押し直してください。';$('scan').disabled=true;}

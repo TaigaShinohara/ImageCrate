@@ -240,7 +240,9 @@ try {
     assert.ok(await manager.locator('#directory-warning').isVisible(),'the open-tab condition is visible before saving to a selected folder');
     assert.equal(await manager.evaluate(async()=>{
       const {getDirectory}=await import('./directory-store.js');
-      const saved=await getDirectory(`session:${new URL(location.href).searchParams.get('id')}`);
+      const id=new URL(location.href).searchParams.get('id');
+      const state=(await chrome.storage.session.get(`workspace:${id}`))[`workspace:${id}`];
+      const saved=await getDirectory(state.saveSettings.directoryKey);
       return !!saved && saved.isSameEntry(window.__qaSelectedDirectory);
     }),true,'the selected real directory handle survives an IndexedDB structured clone');
     const readSelectedDirectory=folder=>manager.evaluate(async({name,folder})=>{
