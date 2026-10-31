@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {createTransferBudget} from '../extension/transfer-budget.js';
 import {MEDIA_LIMITS} from '../extension/media-limits.js';
+import {createImageResourceCoordinator} from '../extension/image-decoder.js';
 
 const manifest = JSON.parse(readFileSync(new URL('../extension/manifest.json', import.meta.url)));
 const supportsRecording = manifest.permissions.includes('tabCapture');
@@ -27,6 +28,9 @@ function event() {
 
 async function browser(t, options = {}) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, 'chrome');
+  const previousNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  let resourceQueue=Promise.resolve();
+  const locks={request:(_name,_options,callback)=>{const result=resourceQueue.then(callback);resourceQueue=result.catch(()=>{});return result;}};
   const store = new Map();
   const tabs = new Map([
     [1, { id: 1, url: 'https://source.test/', title: 'Source' }],
@@ -108,8 +112,10 @@ async function browser(t, options = {}) {
     async clear(name) { alarmClears.push(name);return alarms.delete(name); },
   };
   Object.defineProperty(globalThis, 'chrome', { configurable: true, value: chrome });
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks}});
   t.after(() => {
     if (previous) Object.defineProperty(globalThis, 'chrome', previous); else delete globalThis.chrome;
+    if(previousNavigator)Object.defineProperty(globalThis,'navigator',previousNavigator);else delete globalThis.navigator;
   });
   // Each test gets a new worker module and independent event registrations/storage.
   let worker=await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
@@ -320,6 +326,145 @@ function imageItems(h) {
   h.persist();
   return h.state.items.map((item) => item.url);
 }
+
+test('converted Chrome output lease is handed off and retained through missing history until positive native terminal',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);
+  await h.send({type:'hello'});
+  const saved=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'png'}})).data;
+  const batchId=saved.batch.id,jobId=saved.jobs[0].id,owner='work:current-page:conversion';
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const coordinator=createImageResourceCoordinator();
+  const output=await coordinator.reserve(owner,{encodedBytes:7});
+  const source=await coordinator.reserve(owner,{encodedBytes:9});
+  const preview=await coordinator.reserve('work:current-page:preview',{encodedBytes:3});
+  const missing=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/image'});
+  assert.equal(missing.ok,false,'new real workspaces must provide output ownership');
+  const wrong=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/image',resourceLease:{id:output.id,owner:'other'}});
+  assert.equal(wrong.ok,false);assert.equal(h.requested.length,0);
+  const accepted=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/image',resourceLease:{id:output.id,owner}});
+  assert.equal(accepted.ok,true,accepted.error);const id=accepted.data.jobs[0].downloadId;
+  h.chrome.downloads.cancel=async id=>{h.cancelled.push(id);};
+  const native=h.downloads.get(id);h.downloads.delete(id);h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'positive workspace closure recorded');
+  await eventually(()=>!h.store.get('imagecrate.imageResources.v1')?.[preview.id],'dead preview owner reclaimed');
+  assert.ok(h.store.get('imagecrate.imageResources.v1')[output.id]);
+  assert.ok(h.store.get('imagecrate.imageResources.v1')[source.id],'retired conversion owner remains charged while accepted Chrome result is unknown');
+  h.downloads.set(id,{...native,state:'complete',bytesReceived:7,totalBytes:7,mime:'image/png'});
+  h.changed.emit({id,state:{current:'complete'}});
+  await eventually(()=>!h.store.get('imagecrate.imageResources.v1')?.[output.id]&&!h.store.get('imagecrate.imageResources.v1')?.[source.id],'background terminal confirmation reclaims accepted output and retired owner without the page callback');
+});
+
+test('reload reclaims old preview ownership but retains an uncertain directory output owner',async t=>{
+  const h=await browser(t);const urls=imageItems(h);await h.send({type:'hello'});
+  const saved=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'directory',directoryName:'Pictures',format:'png'}})).data;
+  await h.send({type:'managed-reserve',batchId:saved.batch.id,jobId:saved.jobs[0].id});
+  const coordinator=createImageResourceCoordinator();
+  const output=await coordinator.reserve('work:current-page:conversion',{encodedBytes:8});
+  const preview=await coordinator.reserve('work:current-page:preview',{encodedBytes:4});
+  const reloaded=await h.send({type:'hello',instance:'new-page'});
+  assert.equal(reloaded.ok,true,reloaded.error);assert.equal(reloaded.data.jobs[0].outcomeUnknown,true);
+  await eventually(()=>!h.store.get('imagecrate.imageResources.v1')?.[preview.id],'old preview reclaimed');
+  assert.ok(h.store.get('imagecrate.imageResources.v1')[output.id],'owner transfer cannot free unresolved native writes');
+});
+
+test('an unavailable image cleanup lock does not hold the worker mutation queue',async t=>{
+  const h=await browser(t);imageItems(h);await h.send({type:'hello'});
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks:{request:()=>new Promise(()=>{})}}});
+  const hello=await h.send({type:'hello',instance:'replacement'});
+  assert.equal(hello.ok,true,hello.error);
+  const next=await h.send({type:'get'});assert.equal(next.ok,true,next.error);
+});
+
+test('Back navigation cannot revive a closed cleanup tombstone or reuse its context-gone proof',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const state=h.store.get('workspace:work');state.closed=true;state.imageContextGone=true;state.imageInstance='old-page';
+  state.retiredImageOwners=[{owner:'work:old-page:conversion',blocked:true}];h.store.set('workspace:work',state);
+  for(const message of [{type:'hello'},{type:'save',urls,settings:{destination:'downloads'}},{type:'managed-reserve',batchId:'stale',jobId:'stale'}]){
+    const result=await h.send(message);assert.equal(result.ok,false);assert.match(result.error,/元ページ/);
+  }
+  assert.equal(h.requested.length,0);assert.equal(h.store.get('workspace:work').imageInstance,'old-page');
+});
+
+test('closed image cleanup retains its tombstone after storage failure and reclaims the owner after worker restart',async t=>{
+  const h=await browser(t,{withAlarms:true});imageItems(h);await h.send({type:'hello'});
+  const coordinator=createImageResourceCoordinator();
+  const preview=await coordinator.reserve('work:current-page:preview',{encodedBytes:11});
+  let cleanupFailures=0;
+  h.options.beforeStorageSet=values=>{
+    if(Object.hasOwn(values,'imagecrate.imageResources.v1')) {cleanupFailures++;throw new Error('temporary image ledger storage failure');}
+  };
+  h.closeWorkspace();
+  await eventually(()=>cleanupFailures>=2,'both retired owner cleanup attempts reached the failing storage boundary');
+  await nextTurn();
+  const closed=h.store.get('workspace:work');
+  assert.equal(closed.closed,true);assert.ok(closed.retiredImageOwners.length>0,'durable cleanup evidence survives');
+  assert.ok(h.store.get('imagecrate.imageResources.v1')[preview.id]);
+  assert.ok(h.alarms.has('imagecrate-pending-downloads'),'failed cleanup remains eligible for recovery');
+  delete h.options.beforeStorageSet;
+  await h.restartWorker();
+  await eventually(()=>!h.store.get('imagecrate.imageResources.v1')?.[preview.id],'restarted worker reclaims the positively closed preview owner');
+  await eventually(()=>!h.store.has('workspace:work'),'successful cleanup removes its closed tombstone');
+});
+
+test('a live frozen workspace retains its converted output lease after actual Chrome completion',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);await h.send({type:'hello'});
+  const saved=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'png'}})).data;
+  const batchId=saved.batch.id,jobId=saved.jobs[0].id,owner='work:current-page:conversion';
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const output=await createImageResourceCoordinator().reserve(owner,{encodedBytes:17});
+  const accepted=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/live-image',resourceLease:{id:output.id,owner}});
+  assert.equal(accepted.ok,true,accepted.error);h.complete(accepted.data.jobs[0].downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].chromeOutcomeKnown===true,'actual Chrome terminal state is persisted');
+  await nextTurn();await nextTurn();
+  assert.ok(h.store.get('imagecrate.imageResources.v1')[output.id],'background cannot free bytes still retained by a live Object URL owner');
+  assert.equal(h.store.get('workspace:work').jobs[0].resourceLease.id,output.id);
+  await output.release(); // The page has now revoked its URL and dropped Blob references.
+  await h.send({type:'get'});
+  await eventually(()=>!h.store.get('workspace:work').jobs[0].resourceLease,'background drops only the already-released handoff record');
+  assert.equal(h.store.get('imagecrate.imageResources.v1')[output.id],undefined);
+});
+
+test('converted output handoff does not wait for a pending resource lock or block another workspace state mutation',async t=>{
+  const h=await browser(t);const urls=imageItems(h);await h.send({type:'hello'});
+  const saved=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'png'}})).data;
+  const batchId=saved.batch.id,jobId=saved.jobs[0].id,owner='work:current-page:conversion';
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const coordinator=createImageResourceCoordinator();const output=await coordinator.reserve(owner,{encodedBytes:13});
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{...structuredClone(h.state),id:'other',workspaceTabId:200,jobs:[]});
+  let releaseLock,entered=false;
+  const holding=navigator.locks.request('imagecrate.imageResources.v1',{mode:'exclusive'},()=>{
+    entered=true;return new Promise(resolve=>{releaseLock=resolve;});
+  });
+  await eventually(()=>entered,'test holds the image resource lock');
+  const queued=coordinator.reserve('other:owner:preview',{encodedBytes:1});
+  try {
+    const accepted=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/image',resourceLease:{id:output.id,owner}});
+    assert.equal(accepted.ok,true,accepted.error);assert.ok(accepted.data.jobs[0].downloadId);
+    const changed=await h.send({type:'ui',sessionId:'other',patch:{query:'still responsive'}},200);
+    assert.equal(changed.ok,true,changed.error);assert.equal(changed.data.ui.query,'still responsive');
+    assert.equal((await h.send({type:'get',sessionId:'other'},200)).ok,true);
+  } finally {
+    releaseLock();await holding;const extra=await queued;await extra.release();
+  }
+});
+
+test('positive close clears an already-released output handoff and its tombstone during concurrent owner cleanup',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);await h.send({type:'hello'});
+  const saved=(await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'png'}})).data;
+  const batchId=saved.batch.id,jobId=saved.jobs[0].id,owner='work:current-page:conversion';
+  await h.send({type:'managed-reserve',batchId,jobId});
+  const output=await createImageResourceCoordinator().reserve(owner,{encodedBytes:19});
+  const accepted=await h.send({type:'converted-download',batchId,jobId,blobURL:'blob:chrome-extension://test/image',resourceLease:{id:output.id,owner}});
+  h.complete(accepted.data.jobs[0].downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].chromeOutcomeKnown===true,'Chrome is actually complete');
+  await nextTurn();await nextTurn();
+  await output.release(); // Handoff metadata remains until background next reconciles.
+  assert.ok(h.store.get('workspace:work').jobs[0].resourceLease);
+  h.closeWorkspace();
+  await eventually(()=>!h.store.has('workspace:work'),'missing lease is a successful cleanup, not an unrecoverable tombstone');
+  assert.equal(h.store.get('imagecrate.imageResources.v1')?.[output.id],undefined);
+});
 
 test('saving to Chrome downloads uses the chosen folder name safely and keeps the existing default', async (t) => {
   const h = await browser(t);

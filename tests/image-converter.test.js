@@ -1,183 +1,160 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {convertImage, MAX_SOURCE_BYTES, MAX_OUTPUT_BYTES} from '../extension/image-converter.js';
+import {convertImage,MAX_SOURCE_BYTES,MAX_OUTPUT_BYTES} from '../extension/image-converter.js';
+import {createMediaOperation} from '../extension/media-reader.js';
 
-const deferred = () => {
-  let resolve;let reject;
-  const promise = new Promise((yes,no) => {resolve=yes;reject=no;});
-  return {promise,resolve,reject};
-};
-const imageResponse = (body = new Uint8Array([1,2,3]), headers = {}) => new Response(body, {
-  headers:{'content-type':'image/png',...headers}
-});
-const nextTurn = () => new Promise(resolve => setImmediate(resolve));
-
-function codecs(t, {width=4,height=3,decode,encode,svgWidth=200,svgHeight=150} = {}) {
-  const events = [], bitmaps = [], canvases = [], images = [];
-  const originalBitmap = Object.getOwnPropertyDescriptor(globalThis,'createImageBitmap');
-  const originalCanvas = Object.getOwnPropertyDescriptor(globalThis,'OffscreenCanvas');
-  const originalImage = Object.getOwnPropertyDescriptor(globalThis,'Image');
-  const bitmap = () => {
-    const value={width,height,closeCount:0,close(){this.closeCount++;events.push(['close']);}};
-    bitmaps.push(value);return value;
-  };
-  Object.defineProperty(globalThis,'createImageBitmap',{configurable:true,writable:true,value:async (source,options) => {
-    events.push(['decode',source,options]);
-    return decode ? decode(source,options,bitmap) : bitmap();
-  }});
-  Object.defineProperty(globalThis,'OffscreenCanvas',{configurable:true,writable:true,value:class {
-    constructor(w,h){this.width=w;this.height=h;canvases.push(this);events.push(['canvas',w,h]);}
-    getContext(){return {set fillStyle(value){events.push(['fillStyle',value]);},fillRect(...args){events.push(['fillRect',...args]);},drawImage(...args){events.push(['draw',...args]);}};}
-    async convertToBlob(options){events.push(['encode',options]);return encode ? encode(options) : new Blob(['encoded image'],{type:options.type});}
-  }});
-  Object.defineProperty(globalThis,'Image',{configurable:true,writable:true,value:class {
-    constructor(){this.naturalWidth=svgWidth;this.naturalHeight=svgHeight;images.push(this);}
-    async decode(){events.push(['image-decode',this.src]);}
-  }});
-  t.after(() => {
-    for(const [name,value] of [['createImageBitmap',originalBitmap],['OffscreenCanvas',originalCanvas],['Image',originalImage]]) {
-      if(value)Object.defineProperty(globalThis,name,value);else delete globalThis[name];
-    }
-  });
-  return {events,bitmaps,canvases,images,bitmap};
+const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
+const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
+const response=(body=new Uint8Array([1,2,3]),headers={})=>new Response(body,{headers:{'content-type':'image/png',...headers}});
+function fixture(overrides={}){
+  const events=[],leases=[],releasedOutputs=[];
+  const coordinator={async reserve(owner,amounts){events.push(['reserve',amounts]);const lease={released:0,covers:()=>true,async release(){this.released++;}};leases.push(lease);return lease;}};
+  const options={ownerId:'test-owner',coordinator,fetchImpl:async()=>{events.push(['fetch']);return response();},
+    inspectImpl:async blob=>{events.push(['inspect',blob.size]);return {format:'png',width:4,height:3,decodedPixels:12,frameCount:1};},
+    decodeImpl:async(blob,metadata,settings)=>{events.push(['decode',settings]);return {blob:new Blob(['output'],{type:({jpg:'image/jpeg',png:'image/png',webp:'image/webp'})[settings.format]}),
+      width:metadata.width,height:metadata.height,displayWidth:metadata.width,displayHeight:metadata.height,release:async()=>releasedOutputs.push(settings.format)};},...overrides};
+  return {events,leases,releasedOutputs,options};
 }
 
-test('conversion requests the selected real codec, honors EXIF orientation and whites JPEG transparency', async t => {
-  const h=codecs(t);
-  const progress=[];let request;
-  for(const [format,type] of [['jpg','image/jpeg'],['png','image/png'],['webp','image/webp']]) {
-    const start=h.events.length;
-    const result=await convertImage('https://images.test/photo.png',format,{
-      fetchImpl:async (_url,options)=>{request=options;return imageResponse();},onProgress:value=>progress.push(value)
-    });
-    assert.equal(result.type,type);
-    const events=h.events.slice(start),fill=events.findIndex(([name])=>name==='fillRect'),draw=events.findIndex(([name])=>name==='draw');
-    if(format==='jpg'){assert.ok(fill>=0 && fill<draw);assert.deepEqual(events.find(([name])=>name==='fillStyle'),['fillStyle','#ffffff']);}
-    else assert.equal(fill,-1,'alpha-preserving formats are not filled opaque');
-    assert.deepEqual(events.find(([name])=>name==='decode')[2],{imageOrientation:'from-image'});
-    assert.deepEqual(events.find(([name])=>name==='encode')[1],{type,quality:0.92});
+test('conversion reserves source buffers before fetch and transfers output ownership through file lifetime',async()=>{
+  for(const [format,mime] of [['jpg','image/jpeg'],['png','image/png'],['webp','image/webp']]){
+    const h=fixture();let request;
+    h.options.fetchImpl=async(_url,settings)=>{request=settings;h.events.push(['fetch']);return response();};
+    const blob=await convertImage('https://images.test/a',format,h.options);
+    assert.equal(h.events[0][0],'reserve');assert.equal(h.events[1][0],'fetch');
+    assert.equal(request.credentials,'include');assert.equal(request.referrerPolicy,'no-referrer');assert.equal(request.redirect,'error');
+    assert.equal(blob.type,mime);assert.equal(blob.sourceBytes,3);
+    assert.equal(h.leases[0].released,1,'source accounting ends only after decode settles');
+    assert.equal(h.releasedOutputs.length,0,'output lease remains owned after return');
+    const settings=h.events.find(event=>event[0]==='decode')[1];
+    assert.equal(settings.format,format);assert.equal(settings.sourceReservation,h.leases[0]);
+    assert.equal(settings.maxInputBytes,MAX_SOURCE_BYTES);assert.equal(settings.maxOutputBytes,MAX_OUTPUT_BYTES);
+    assert.equal(settings.ownerId,'test-owner');assert.equal(settings.quality,0.92);
+    await blob.releaseResources();await blob.releaseResources();assert.deepEqual(h.releasedOutputs,[format]);
   }
-  assert.equal(request.credentials,'include');assert.equal(request.referrerPolicy,'no-referrer');
-  assert.deepEqual(progress,[{bytesReceived:3,totalBytes:0},{bytesReceived:3,totalBytes:0},{bytesReceived:3,totalBytes:0}]);
-  assert.ok(h.bitmaps.every(bitmap=>bitmap.closeCount===1));
-  assert.ok(h.canvases.every(canvas=>canvas.width===1 && canvas.height===1));
 });
 
-test('unsupported selection and known oversized dimensions fail before any request', async () => {
-  let requests=0;const fetchImpl=async()=>{requests++;return imageResponse();};
-  for(const format of ['gif','constructor','__proto__']) {
-    await assert.rejects(convertImage('https://images.test/a',format,{fetchImpl}),/対応していない/);
+test('unsupported formats and known oversized source dimensions refuse before any request or reservation',async()=>{
+  const h=fixture();
+  for(const format of ['gif','constructor','__proto__'])await assert.rejects(convertImage('https://images.test/a',format,h.options),/対応していない/);
+  await assert.rejects(convertImage('https://images.test/a','png',{...h.options,knownWidth:16385}),/16384/);
+  await assert.rejects(convertImage('https://images.test/a','png',{...h.options,knownWidth:6000,knownHeight:5000}),/2400/);
+  assert.deepEqual(h.events,[]);
+});
+
+test('HTTP, nonimage responses, empty bodies and declared oversize never reach metadata or codec',async()=>{
+  for(const value of [new Response('denied',{status:403}),response('html',{'content-type':'text/html'}),response('{}',{'content-type':'application/problem+json'}),response(new Uint8Array()),response(new Uint8Array([1]),{'content-length':String(MAX_SOURCE_BYTES+1)})]){
+    const h=fixture({fetchImpl:async()=>value});
+    await assert.rejects(convertImage('https://images.test/a','png',h.options));
+    assert.equal(h.events.some(event=>event[0]==='inspect'),false);assert.equal(h.events.some(event=>event[0]==='decode'),false);
+    assert.equal(h.leases[0].released,1);
   }
-  await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl,knownWidth:16385}),/16384/);
-  await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl,knownWidth:6000,knownHeight:5000}),/2400/);
-  assert.equal(requests,0);
 });
 
-test('HTTP errors, nonimage error responses, empty bodies and declared byte limits are refused before decode', async t => {
-  const h=codecs(t);
-  for(const response of [new Response('blocked',{status:403}),imageResponse('HTML',{'content-type':'text/html'}),
-    imageResponse('{}',{'content-type':'application/problem+json'}),imageResponse('<error/>',{'content-type':'application/xml'}),
-    imageResponse(new Uint8Array()),imageResponse('x',{'content-length':String(MAX_SOURCE_BYTES+1)})]) {
-    await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl:async()=>response}));
+test('observed body bounds are enforced before metadata including a false small length and compressed body',async()=>{
+  for(const headers of [{},{'content-length':'1'},{'content-length':'1','content-encoding':'gzip'}]){
+    const h=fixture({maxInputBytes:2,fetchImpl:async()=>response(new Uint8Array([1,2,3]),headers)});
+    await assert.rejects(convertImage('https://images.test/a','png',h.options),error=>error.code==='byte-limit'&&error.bytesReceived===3);
+    assert.equal(h.events.some(event=>event[0]==='inspect'),false);
   }
-  assert.equal(h.events.length,0);
 });
 
-test('streamed data is bounded even when the response does not declare its size', async t => {
-  const h=codecs(t);let cancelled=false;
-  const chunk=new Uint8Array(1024*1024);
-  const body=new ReadableStream({pull(stream){stream.enqueue(chunk);},cancel(){cancelled=true;}});
-  await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl:async()=>imageResponse(body)}),/32MiB/);
-  assert.equal(h.events.length,0);assert.equal(cancelled,true);
+test('header refusal and untrusted decoded dimensions cannot fall back to page Image or original bytes',async()=>{
+  for(const inspectImpl of [async()=>{throw new Error('unsupported input');},async()=>({width:0,height:0}),async()=>({width:6000,height:5000})]){
+    const h=fixture({inspectImpl});
+    await assert.rejects(convertImage('https://images.test/a','png',h.options));
+    assert.equal(h.events.some(event=>event[0]==='decode'),false);
+    assert.equal(h.releasedOutputs.length,0);
+  }
 });
 
-test('oversized decoded dimensions release the bitmap before a canvas can allocate', async t => {
-  const h=codecs(t,{width:6000,height:5000});
-  await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl:async()=>imageResponse()}),/2400/);
-  assert.equal(h.canvases.length,0);assert.equal(h.bitmaps[0].closeCount,1);
+test('incorrect codec MIME, empty/oversized output and changed dimensions are refused and released',async()=>{
+  const bad=[
+    {blob:new Blob(['x'],{type:'image/png'}),width:4,height:3},
+    {blob:new Blob([],{type:'image/jpeg'}),width:4,height:3},
+    {blob:new Blob(['x'],{type:'image/jpeg'}),width:5,height:3}
+  ];
+  const oversized=new Blob(['x'],{type:'image/jpeg'});Object.defineProperty(oversized,'size',{value:MAX_OUTPUT_BYTES+1});bad.push({blob:oversized,width:4,height:3});
+  for(const value of bad){let releases=0;const h=fixture({decodeImpl:async()=>({...value,release:async()=>releases++})});
+    await assert.rejects(convertImage('https://images.test/a','jpg',h.options));assert.equal(releases,1);}
 });
 
-test('an encoder PNG fallback or empty result is never mislabeled as the selected extension', async t => {
-  let output=new Blob(['PNG'],{type:'image/png'});
-  const h=codecs(t,{encode:async()=>output});
-  await assert.rejects(convertImage('https://images.test/a','webp',{fetchImpl:async()=>imageResponse()}),/選んだ形式/);
-  output=new Blob([],{type:'image/webp'});
-  await assert.rejects(convertImage('https://images.test/a','webp',{fetchImpl:async()=>imageResponse()}),/選んだ形式/);
-  assert.ok(h.bitmaps.every(bitmap=>bitmap.closeCount===1));
+test('aborted native metadata inspection keeps its reservation until actual inspection settles',async()=>{
+  const inspection=deferred(),started=deferred(),controller=new AbortController();
+  const h=fixture({signal:controller.signal,inspectImpl:()=>{started.resolve();return inspection.promise;}});
+  const pending=convertImage('https://images.test/a','png',h.options);await started.promise;controller.abort();
+  await assert.rejects(pending,{name:'AbortError'});
+  assert.equal(h.leases[0].released,0,'the source Blob/copy still belongs to pending inspection');
+  inspection.resolve({width:4,height:3});await nextTurn();
+  assert.equal(h.leases[0].released,1);assert.equal(h.events.some(event=>event[0]==='decode'),false);
 });
 
-test('native fetch and encoder errors have actionable local explanations without source URLs', async t => {
-  const h=codecs(t,{encode:async()=>{throw new DOMException('encode failed','EncodingError');}});
-  await assert.rejects(convertImage('https://images.test/a?secret=value','png',{fetchImpl:async()=>{throw new TypeError('https://images.test/a?secret=value');}}),/配信元へのアクセス許可/);
-  await assert.rejects(convertImage('https://images.test/a?secret=value','png',{fetchImpl:async()=>imageResponse()}),/別の形式/);
-  assert.equal(h.bitmaps[0].closeCount,1);assert.equal(h.canvases[0].width,1);
+test('aborted codec acquisition holds source accounting and releases a late generated output',async()=>{
+  const decoding=deferred(),started=deferred(),controller=new AbortController();let outputReleases=0;
+  const h=fixture({signal:controller.signal,decodeImpl:()=>{started.resolve();return decoding.promise;}});
+  const pending=convertImage('https://images.test/a','png',h.options);await started.promise;controller.abort();
+  await assert.rejects(pending,{name:'AbortError'});assert.equal(h.leases[0].released,0);
+  decoding.resolve({blob:new Blob(['late'],{type:'image/png'}),width:4,height:3,release:async()=>outputReleases++});await nextTurn();
+  assert.equal(h.leases[0].released,1);assert.equal(outputReleases,1);
 });
 
-test('oversized encoded output is refused and the canvas is released', async t => {
-  const h=codecs(t,{encode:async()=>({type:'image/png',size:MAX_OUTPUT_BYTES+1})});
-  await assert.rejects(convertImage('https://images.test/a','png',{fetchImpl:async()=>imageResponse()}),/64MiB/);
-  assert.equal(h.canvases[0].width,1);assert.equal(h.canvases[0].height,1);
+test('absolute operation deadline covers metadata and codec work, including timer throttling',async()=>{
+  const started=deferred(),inspection=deferred();let now=Date.now();const deadline=now+120000;
+  const operation=createMediaOperation({now:()=>now,deadline});
+  const h=fixture({operation,inspectImpl:()=>{started.resolve();return inspection.promise;}});
+  const pending=convertImage('https://images.test/a','png',h.options);await started.promise;
+  now=deadline+1;inspection.resolve({width:4,height:3});
+  try{await assert.rejects(pending,{name:'TimeoutError'});assert.equal(h.events.some(event=>event[0]==='decode'),false);}finally{operation.dispose();}
 });
 
-test('SVG fallback uses inert image natural dimensions and releases its object URL and image', async t => {
-  const h=codecs(t,{decode:async(source,_options,bitmap)=>{
-    if(source instanceof Blob)throw new DOMException('SVG Blob not decoded','InvalidStateError');
-    return bitmap();
-  }});
-  const created=[],revoked=[];
-  t.mock.method(URL,'createObjectURL',blob=>{created.push(blob);return 'blob:synthetic-svg';});
-  t.mock.method(URL,'revokeObjectURL',url=>revoked.push(url));
-  const result=await convertImage('https://images.test/a.svg','png',{fetchImpl:async()=>imageResponse('<svg/>',{'content-type':'image/svg+xml'})});
-  assert.equal(result.type,'image/png');
-  const decodes=h.events.filter(([name])=>name==='decode');
-  assert.deepEqual(decodes[1][2],{imageOrientation:'from-image',resizeWidth:200,resizeHeight:150});
-  assert.equal(created.length,1);assert.deepEqual(revoked,['blob:synthetic-svg']);assert.equal(h.images[0].src,'');
+test('fetch errors have local explanations and preserve source byte accounting without signed URLs',async()=>{
+  const h=fixture({fetchImpl:async()=>{throw new TypeError('https://images.test/a?signature=synthetic');}});
+  await assert.rejects(convertImage('https://images.test/a','png',h.options),error=>!error.message.includes('signature')&&error.bytesReceived===0);
+  assert.equal(h.leases[0].released,1);
 });
 
-test('SVG without usable natural dimensions fails without inventing a render size', async t => {
-  const h=codecs(t,{svgWidth:0,svgHeight:0,decode:async()=>{throw new DOMException('no image','InvalidStateError');}});
-  await assert.rejects(convertImage('https://images.test/a.svg','png',{fetchImpl:async()=>imageResponse('<svg/>',{'content-type':'image/svg+xml'})}),/寸法/);
-  assert.equal(h.canvases.length,0);assert.equal(h.images[0].src,'');
+test('source byte callback failure prevents the chunk from reaching inspection and keeps observed bytes',async()=>{
+  const h=fixture({onBytes:async()=>{throw new Error('budget refused');}});
+  await assert.rejects(convertImage('https://images.test/a','png',h.options),error=>error.message==='budget refused'&&error.bytesReceived===3);
+  assert.equal(h.events.some(event=>event[0]==='inspect'),false);
 });
 
-test('corrupt raster decode fails with a local explanation, without a format fallback', async t => {
-  const h=codecs(t,{decode:async()=>{throw new DOMException('bad file','InvalidStateError');}});
-  await assert.rejects(convertImage('https://images.test/a','jpg',{fetchImpl:async()=>imageResponse()}),/元の形式/);
-  assert.equal(h.canvases.length,0);assert.equal(h.images.length,0);
+test('a cancelled conversion does not reserve or fetch',async()=>{
+  const controller=new AbortController();controller.abort();const h=fixture({signal:controller.signal});
+  await assert.rejects(convertImage('https://images.test/a','png',h.options),{name:'AbortError'});assert.deepEqual(h.events,[]);
 });
 
-test('Stop during a native decoder promptly rejects and closes its late bitmap result', async t => {
-  const decoding=deferred(),started=deferred();
-  const h=codecs(t,{decode:async()=>{started.resolve();return decoding.promise;}});
-  const controller=new AbortController();
-  const saving=convertImage('https://images.test/a','png',{signal:controller.signal,fetchImpl:async()=>imageResponse()});
-  await started.promise;controller.abort();
-  await assert.rejects(saving,{name:'AbortError'});
-  const late=h.bitmap();decoding.resolve(late);await nextTurn();
-  assert.equal(late.closeCount,1);assert.equal(h.canvases.length,0);
+test('a late source reservation is released when cancellation wins acquisition',async()=>{
+  const reservation=deferred(),controller=new AbortController();let releases=0;
+  const h=fixture({signal:controller.signal,coordinator:{reserve:()=>reservation.promise}});
+  const pending=convertImage('https://images.test/a','png',h.options);controller.abort();await assert.rejects(pending,{name:'AbortError'});
+  reservation.resolve({release:async()=>releases++});await nextTurn();assert.equal(releases,1);assert.equal(h.events.some(event=>event[0]==='fetch'),false);
 });
 
-test('Stop during encode discards its late result and releases canvas pixels', async t => {
-  const encoding=deferred(),started=deferred();
-  const h=codecs(t,{encode:async()=>{started.resolve();return encoding.promise;}});
-  const controller=new AbortController();
-  const saving=convertImage('https://images.test/a','png',{signal:controller.signal,fetchImpl:async()=>imageResponse()});
-  await started.promise;controller.abort();await assert.rejects(saving,{name:'AbortError'});
-  encoding.resolve(new Blob(['encoded'],{type:'image/png'}));await nextTurn();
-  assert.equal(h.bitmaps[0].closeCount,1);assert.equal(h.canvases[0].width,1);
+
+test('absolute deadline winning a fulfilled reservation releases the lease without starting fetch',async()=>{
+  const reservation=deferred();let now=Date.now(),releases=0;
+  const operation=createMediaOperation({now:()=>now,deadline:now+120000});
+  const h=fixture({operation,coordinator:{reserve:()=>reservation.promise}});
+  const converting=convertImage('https://images.test/a','png',h.options);now+=120001;
+  reservation.resolve({release:async()=>releases++});
+  try{await assert.rejects(converting,{name:'TimeoutError'});await nextTurn();assert.equal(releases,1);assert.equal(h.events.some(event=>event[0]==='fetch'),false);}
+  finally{operation.dispose();}
 });
 
-test('stalled image bytes time out and cancel their stream', async t => {
-  t.mock.timers.enable({apis:['setTimeout']});
-  const received=deferred();let cancelled=false;
-  const body=new ReadableStream({start(stream){stream.enqueue(new Uint8Array([1]));},cancel(){cancelled=true;}});
-  const saving=convertImage('https://images.test/a','png',{fetchImpl:async()=>imageResponse(body),onProgress:()=>received.resolve()});
-  await received.promise;t.mock.timers.tick(30000);
-  await assert.rejects(saving,{name:'TimeoutError'});assert.equal(cancelled,true);
+test('absolute deadline winning a fulfilled codec result releases its output and source ownership',async()=>{
+  const decoding=deferred(),started=deferred();let now=Date.now(),releases=0;
+  const operation=createMediaOperation({now:()=>now,deadline:now+120000});
+  const h=fixture({operation,decodeImpl:()=>{started.resolve();return decoding.promise;}});
+  const converting=convertImage('https://images.test/a','png',h.options);await started.promise;now+=120001;
+  decoding.resolve({blob:new Blob(['late'],{type:'image/png'}),width:4,height:3,release:async()=>releases++});
+  try{await assert.rejects(converting,{name:'TimeoutError'});await nextTurn();assert.equal(releases,1);assert.equal(h.leases[0].released,1);}
+  finally{operation.dispose();}
 });
 
-test('a cancelled conversion never fetches image bytes', async () => {
-  const controller=new AbortController();controller.abort();let requests=0;
-  await assert.rejects(convertImage('https://images.test/a','png',{signal:controller.signal,fetchImpl:async()=>{requests++;return imageResponse();}}),{name:'AbortError'});
-  assert.equal(requests,0);
+test('converted Blob carries an immutable output lease identity for Chrome ownership handoff',async()=>{
+  const identity=Object.freeze({id:'output-lease',owner:'test-owner'});let releases=0;
+  const h=fixture({decodeImpl:async()=>({blob:new Blob(['out'],{type:'image/png'}),width:4,height:3,resourceLease:identity,release:async()=>releases++})});
+  const blob=await convertImage('https://images.test/a','png',h.options);assert.equal(blob.resourceLease,identity);assert.equal(Object.getOwnPropertyDescriptor(blob,'resourceLease').writable,false);
+  await blob.releaseResources();assert.equal(releases,1);
 });
