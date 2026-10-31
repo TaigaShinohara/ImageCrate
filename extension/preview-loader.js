@@ -205,7 +205,7 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
     load(url,{kind='thumbnail',signal}={}){
       if(disposed)return Promise.reject(new DOMException('作業ページを閉じました。','AbortError'));
       let host;try{host=previewHost(url);}catch(error){return Promise.reject(error);}
-      if(!consent.has(host.key))return Promise.reject(new Error('配信元を確認し、プレビューを許可してください。'));
+      if(!consent.has(host.key))return Promise.reject(new Error('「プレビューを表示」から許可してください。'));
       if(signal?.aborted)return Promise.reject(abortError(signal));
       if(!['thumbnail','viewer'].includes(kind))return Promise.reject(new Error('プレビュー種別が不正です。'));
       const key=`${generation}:${hostEpoch(host.key)}:${kind}:${url}`;
