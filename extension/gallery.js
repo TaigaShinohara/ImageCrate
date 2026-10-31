@@ -1,4 +1,4 @@
-import {fileLabel, extensionOf, matchesImage, publicError} from './utils.js';
+import {fileLabel, extensionOf, matchesImage, publicError, isDetectedImageFormat} from './utils.js';
 import {previewHost} from './preview-loader.js';
 
 const $=id=>document.getElementById(id);
@@ -8,7 +8,11 @@ export function candidateCatalog(state) {
 }
 export function candidateMatches(item,filters) {
   const known=item.dimensionSource==='decoded' || item.dimensionSource==='measured';
-  return matchesImage(item,{...filters,width:0,height:0}) && (!known ||
+  const format=isDetectedImageFormat(item.detectedFormat)?item.detectedFormat:extensionOf(item.url,'images').toLowerCase();
+  const dimensionsValid=Number.isFinite(item.width)&&Number.isFinite(item.height)&&item.width>0&&item.height>0;
+  const short=dimensionsValid?Math.min(item.width,item.height):0;
+  const adLike=format==='gif'||dimensionsValid&&(short<200||Math.max(item.width,item.height)/short>=3);
+  return (!filters.excludeAdLike || !adLike) && matchesImage(item,{...filters,width:0,height:0}) && (!known ||
     ((!filters.width || item.width>=filters.width) && (!filters.height || item.height>=filters.height)));
 }
 export function representativeCandidates(items) {
@@ -55,11 +59,13 @@ export class Gallery {
   restore(ui={}) {
     this.mode=['all','selected','added'].includes(ui.view)?ui.view:ui.onlySelected?'selected':'all';
     for(const id of ['query','width','height','type'])if(ui[id]!==undefined)$(id).value=ui[id];
+    $('exclude-ad-like').checked=ui.excludeAdLike===true;
     if(ui.filtersOpen)$('filters').open=true;if(ui.helpOpen)$('help').open=true;
     this.lastURL=ui.focusAnchor || '';
   }
   viewPatch() {
     return {view:this.mode,onlySelected:this.mode==='selected',query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value,
+      excludeAdLike:$('exclude-ad-like').checked,
       scrollY:window.scrollY,focusAnchor:this.lastURL,filtersOpen:$('filters').open,helpOpen:$('help').open};
   }
   setMode(mode) {this.mode=mode;this.render();this.onView(this.viewPatch());$('gallery-heading').focus();}
@@ -68,13 +74,14 @@ export class Gallery {
   measure(url,image) {
     this.measureSource(url,image.naturalWidth,image.naturalHeight);
   }
-  measureSource(url,width,height) {
-    if(!width || !height)return;
-    const value={width,height};
+  measureSource(url,width,height,detectedFormat) {
+    if(!Number.isFinite(width)||!Number.isFinite(height)||width<=0||height<=0)return;
+    const previous=this.measured.get(url),format=isDetectedImageFormat(detectedFormat)?detectedFormat:previous?.detectedFormat;
+    const value={width,height,...(format?{detectedFormat:format}:{})};
     if(JSON.stringify(this.measured.get(url))===JSON.stringify(value))return;
     this.measured.set(url,value);this.onMeasure({url,...value});
     for(const meta of document.querySelectorAll('[data-dimensions]'))if(meta.dataset.dimensions===url)meta.textContent=`${value.width} × ${value.height}`;
-    if(Number($('width').value)||Number($('height').value))$('measure-refresh').hidden=false;
+    if(Number($('width').value)||Number($('height').value)||$('exclude-ad-like').checked)$('measure-refresh').hidden=false;
     const item=this.item(url);
     if(this.viewerURL===url&&item)$('preview-meta').textContent=this.description(this.effective(item));
   }
@@ -146,7 +153,7 @@ export class Gallery {
       image.src=handle.url;binding.container.replaceChildren(image);this.showPreviewConsent(binding,false);
       // The generated static image may be resized. Persist validated source
       // dimensions, never the thumbnail's naturalWidth/naturalHeight.
-      this.measureSource(binding.item.url,handle.width,handle.height);
+      this.measureSource(binding.item.url,handle.width,handle.height,handle.detectedFormat);
     },error=>{
       if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding))return;
       binding.container.replaceChildren(node('span','preview-error',publicError(error)));
@@ -195,7 +202,7 @@ export class Gallery {
     const state=this.getState(),selected=this.getSelected(),active=document.activeElement;
     const oldCard=active?.closest('#grid .card'),oldURL=oldCard?.dataset.url,oldRole=active?.dataset.galleryRole;
     const oldIndex=this.visible.findIndex(item=>item.url===oldURL);
-    const filters={query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value};
+    const filters={query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value,excludeAdLike:$('exclude-ad-like').checked};
     const all=candidateCatalog(state).map(i=>this.effective(i));
     const retained=new Set(all.map(item=>item.url));
     if(this.viewerURL&&!retained.has(this.viewerURL)){$('image-preview').close();this.clearPreviews('viewer');this.viewerURL=null;}
@@ -212,8 +219,8 @@ export class Gallery {
     $('next-page').hidden=!state.scan?.hasMore;
     $('measure-refresh').hidden=true;
     const unknown=candidates.filter(i=>!['decoded','measured'].includes(i.dimensionSource)).length;
-    $('dimension-note').hidden=!(unknown&&(filters.width||filters.height));
-    $('dimension-note').textContent=`寸法未確認${unknown}件を含みます。画像を表示すると寸法を確認します。`;
+    $('dimension-note').hidden=!(unknown&&(filters.width||filters.height||filters.excludeAdLike));
+    $('dimension-note').textContent=filters.excludeAdLike?`実寸法未確認${unknown}件を含みます。元ページの寸法で概算し、不明な候補は残します。プレビュー後に確認した情報で条件を更新できます。`:`寸法未確認${unknown}件を含みます。画像を表示すると寸法を確認します。`;
     $('search-tools').hidden=this.mode==='selected';$('active-filters').hidden=this.mode==='selected'||!$('active-filters').children.length;
     $('grid').replaceChildren();
     for(const [index,item] of this.visible.entries()) {
@@ -251,7 +258,7 @@ export class Gallery {
     if(!this.visible.length) {
       $('empty').append(node('h3','',this.mode==='selected'?'選択した画像はありません':page.length?'一致する画像がありません':'画像が見つかりませんでした'));
       const reset=node('button','secondary',this.mode!=='all'?'すべてに戻る':'条件をリセット');
-      reset.onclick=()=>{if(this.mode!=='all')this.setMode('all');else{for(const id of ['query','width','height','type'])$(id).value=['width','height'].includes(id)?0:'';this.render();this.onView(this.viewPatch());$('query').focus();}};
+      reset.onclick=()=>{if(this.mode!=='all')this.setMode('all');else $('reset-filters').click();};
       $('empty').append(node('p','',page.length?'表示条件を変えるか、すべての画像へ戻れます。':'元ページで画像を表示して、再スキャンしてください。'),reset);
     }
     this.sync();

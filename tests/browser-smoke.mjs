@@ -34,12 +34,17 @@ const server=createServer((req,res)=>{
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const origin=`http://127.0.0.1:${server.address().port}`;
 async function assertFilterGeometry(workspace,label) {
+  // The native toggle event updates aria state, then scrolls the expanded
+  // panel in requestAnimationFrame. Read layout only after that work settles.
+  await workspace.waitForFunction(()=>document.querySelector('#filters').open && document.querySelector('#filters > summary').getAttribute('aria-expanded')==='true');
+  await workspace.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   const geometry=await workspace.evaluate(()=>{
     const rect=element=>{const box=element.getBoundingClientRect();return {left:box.left,top:box.top,right:box.right,bottom:box.bottom,width:box.width,height:box.height};};
     return {
       panel:rect(document.querySelector('#filter-panel')),query:rect(document.querySelector('#query')),
       summary:rect(document.querySelector('#filters > summary')),tools:rect(document.querySelector('.search-tools')),
-      fields:['width','height','type'].map(id=>({id,...rect(document.getElementById(id))})),
+      fields:[...['width','height','type'].map(id=>({id,...rect(document.getElementById(id))})),
+        {id:'exclude-ad-like label',...rect(document.querySelector('#exclude-ad-like').closest('label'))}],
       width:innerWidth,height:innerHeight,footerTop:document.querySelector('#footer').getBoundingClientRect().top
     };
   });

@@ -8,7 +8,26 @@ test('session defaults restore legacy sessions without clearing deliberate selec
   applyJobCompletions(state);
   assert.deepEqual(state.selectedURLs,[record(1).url]);
   assert.equal(state.ui.view,'all');
+  assert.equal(state.ui.excludeAdLike,false);
   assert.equal(state.revision,0);
+});
+test('ad-like preference is session-local, accepts only booleans and preserves the selection',()=>{
+  const initial=applyUIPatch(session(),{selectedURLs:[record(1).url],query:'photo',width:300,height:200,type:'png',view:'selected'});
+  const enabled=applyUIPatch(initial,{excludeAdLike:true});
+  assert.equal(enabled.ui.excludeAdLike,true);
+  assert.deepEqual(enabled.selectedURLs,initial.selectedURLs);
+  assert.equal(enabled.ui.view,'selected');assert.equal(enabled.ui.query,'photo');
+  assert.equal(enabled.ui.width,300);assert.equal(enabled.ui.height,200);assert.equal(enabled.ui.type,'png');
+  assert.equal(initial.ui.excludeAdLike,false,'updating a session does not mutate its prior state');
+  const restored=sessionDefaults(JSON.parse(JSON.stringify(enabled)));
+  assert.equal(restored.ui.excludeAdLike,true);
+  assert.deepEqual(restored.selectedURLs,enabled.selectedURLs);
+  assert.equal(session().ui.excludeAdLike,false,'a separate workspace does not inherit the preference');
+  for(const invalid of ['true','false',1,0,null,{},[]]) {
+    assert.equal(applyUIPatch(enabled,{excludeAdLike:invalid}).ui.excludeAdLike,true,JSON.stringify(invalid));
+    assert.equal(applyUIPatch(initial,{excludeAdLike:invalid}).ui.excludeAdLike,false,JSON.stringify(invalid));
+  }
+  assert.equal(applyUIPatch(restored,{excludeAdLike:false}).ui.excludeAdLike,false);
 });
 test('a complete transition deselects exactly once and a later explicit selection survives polling',()=>{
   let state=applyUIPatch(session(),{selectedURLs:[record(1).url]});

@@ -149,6 +149,33 @@ async function browser(t, options = {}) {
   };
 }
 
+test('inspected image formats persist with dimensions for current and retained selected candidates',async t=>{
+  const h=await browser(t),current='https://source.test/image',retained='https://source.test/previous.gif';
+  h.state.items=[{url:current,width:400,height:300,dimensionSource:'source'}];
+  h.state.selectedURLs=[retained];h.state.selectedItems=[{url:retained}];h.persist();
+  await h.send({type:'ui',patch:{excludeAdLike:true}});
+  const response=await h.send({type:'dimensions',updates:[
+    {url:current,width:400,height:300,detectedFormat:'gif'},
+    {url:retained,width:800,height:600,detectedFormat:'png'},
+    {url:'https://source.test/missing',width:400,height:300,detectedFormat:'gif'}]});
+  assert.equal(response.ok,true,response.error);
+  assert.equal(response.data.items[0].detectedFormat,'gif');
+  assert.equal(response.data.items[0].dimensionSource,'decoded');
+  assert.equal(response.data.selectedItems[0].detectedFormat,'png');
+  const invalid=await h.send({type:'dimensions',updates:[
+    {url:current,width:400,height:300,detectedFormat:'toString'},
+    {url:retained,width:0,height:600,detectedFormat:'gif'}]});
+  assert.equal(invalid.data.items[0].detectedFormat,'gif','unrecognized formats cannot replace inspected metadata');
+  assert.equal(invalid.data.selectedItems[0].detectedFormat,'png','invalid dimensions are ignored');
+  await h.restartWorker();const restored=await h.send({type:'get'});
+  assert.equal(restored.data.ui.excludeAdLike,true);
+  assert.equal(restored.data.items[0].detectedFormat,'gif');
+  assert.equal(restored.data.selectedItems[0].detectedFormat,'png');
+  assert.deepEqual(restored.data.selectedURLs,[retained]);
+  assert.equal(restored.data.items.length,1,'metadata updates never add unknown URLs');
+  assert.equal(h.requested.length,0,'metadata updates do not start downloads');
+});
+
 test('a pending source injection does not block another workspace, UI persistence or download completion',async t=>{
   const h=await browser(t);const urls=imageItems(h);
   let resolveScan;

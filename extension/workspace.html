@@ -59,6 +59,10 @@
       <details id="filters" class="filter-disclosure disclosure">
         <summary aria-controls="filter-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>絞り込み</span><span id="filter-count" class="filter-count" hidden></span><span class="chevron" aria-hidden="true"></span></summary>
         <div id="filter-panel" class="filter-panel disclosure-panel">
+          <div class="ad-filter">
+            <label class="ad-filter-toggle"><input id="exclude-ad-like" type="checkbox" aria-describedby="ad-filter-help"><span>広告らしい画像を除外</span></label>
+            <p id="ad-filter-help" class="filter-hint">縦横比3:1以上・短辺200px未満・GIFを除外します。元ページの寸法で概算し、プレビュー後は実寸法を使います。不明な候補は残します。広告以外の画像も除外される場合があります。</p>
+          </div>
           <label class="field">最小幅 <span>px</span><input id="width" type="number" min="0" value="0" inputmode="numeric"></label>
           <label class="field">最小高さ <span>px</span><input id="height" type="number" min="0" value="0" inputmode="numeric"></label>
           <label class="field">形式<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">形式不明</option></select></label>
@@ -67,7 +71,7 @@
       </details>
     </div>
     <div id="active-filters" class="active-filters" aria-label="適用中の条件" hidden></div>
-    <p id="dimension-note" class="filter-hint" hidden></p><button id="measure-refresh" class="quiet" hidden>確認した寸法で条件を更新</button>
+    <p id="dimension-note" class="filter-hint" hidden></p><button id="measure-refresh" class="quiet" hidden>確認した情報で条件を更新</button>
     <div class="control-row">
       <p class="scan-status" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="message">ページを確認しています</span></p>
       <div class="selection-tools">
