@@ -111,6 +111,8 @@ export class Gallery {
     const oldIndex=this.visible.findIndex(item=>item.url===oldURL);
     const filters={query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value};
     const all=candidateCatalog(state).map(i=>this.effective(i));
+    const retained=new Set(all.map(item=>item.url));
+    for(const url of this.measured.keys())if(!retained.has(url))this.measured.delete(url);
     const page=(state.items || []).map(i=>this.effective(i));
     const candidates=this.mode==='selected'?all.filter(i=>selected.has(i.url)):
       page.filter(i=>candidateMatches(i,filters) && (this.mode!=='added'||(state.scan?.addedURLs||[]).includes(i.url)));

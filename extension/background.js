@@ -222,7 +222,9 @@ function nameDecision(item,match,suggest) {
   if (!match || match.state.batch?.destination === 'directory' || !safeDownloadPath(match.job.filename)) { suggest(); return null; }
   const original=(match.state.batch?.format || 'original') === 'original';
   const filename=(original && suggestedOriginalName(match.job,item.mime)) || match.job.filename;
-  const decision={filename,actualFilename:filename,typeKnown:Boolean(extensionForMime(item.mime)) || !original,...(item.mime ? {mime:item.mime} : {})};
+  // actualFilename belongs to Chrome search: its absolute path and conflict
+  // suffix must survive this later, relative requested-name decision.
+  const decision={filename,typeKnown:Boolean(extensionForMime(item.mime)) || !original,...(item.mime ? {mime:item.mime} : {})};
   Object.assign(match.job,decision);
   // Even known and converted files need an explicit suggestion. Chrome can
   // otherwise replace our batch path with a server-provided default basename.

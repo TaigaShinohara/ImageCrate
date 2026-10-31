@@ -1030,3 +1030,31 @@ test('onChanged for an unknown download ID wakes pending sessions after their po
   assert.deepEqual(h.requested,[]);
   assert.deepEqual(h.cancelled,[]);
 });
+
+test('a delayed filename decision preserves the completed Chrome absolute actual filename',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  const saved=await h.send({type:'save',urls:[url],settings:{folderName:'Frozen'}});
+  assert.equal(saved.ok,true,saved.error);
+  const id=saved.data.jobs[0].downloadId;
+  const actual='/Users/synthetic/Downloads/ImageCrate/Frozen/001_image (1).svg';
+  Object.assign(h.downloads.get(id),{filename:actual,mime:'image/svg+xml'});
+  let emitted=false;const calls=[];
+  h.options.beforeStorageSet=async values=>{
+    const job=values['workspace:work']?.jobs[0];
+    if (emitted || job?.status !== 'complete') return;
+    emitted=true;
+    assert.equal(job.actualFilename,actual,'Chrome search already reported its completed absolute path');
+    h.determining.emit(structuredClone(h.downloads.get(id)),(...args)=>calls.push(args));
+    assert.equal(calls[0][0].filename,'ImageCrate/Frozen/001_image.svg');
+    await nextTurn();
+  };
+  h.complete(id);
+  await eventually(()=>emitted && h.store.get('workspace:work').jobs[0].filename.endsWith('.svg'),'the late filename patch is persisted after completion');
+  const final=h.store.get('workspace:work').jobs[0];
+  assert.equal(final.status,'complete');
+  assert.equal(final.filename,'ImageCrate/Frozen/001_image.svg','requested path remains relative');
+  assert.equal(final.actualFilename,actual,'the late requested-path decision cannot replace Chrome actual path or its conflict suffix');
+  assert.deepEqual(calls,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
+});
