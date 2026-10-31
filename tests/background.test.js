@@ -118,7 +118,7 @@ async function browser(t, options = {}) {
   const persist = () => store.set('workspace:work', clone(state));
   persist();
   return {
-    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,contexts,contextCalls,tabCreates,
+    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,removed,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,contexts,contextCalls,tabCreates,
     openWorkspace:tab=>worker.openWorkspace(tab),
     async restartWorker() {
       changed.clear();created.clear();alarmEvent.clear();removed.clear();messages.clear();determining.clear();updated.clear();
@@ -131,7 +131,7 @@ async function browser(t, options = {}) {
     },
     send(message,tabId = 100) {
       return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Background did not respond')), 1000);
+        const timeout = setTimeout(() => reject(new Error('Background did not respond')), options.messageTimeoutMs || 1000);
         messages.emit({ sessionId: 'work', instance: 'current-page', ...message },
           { id: 'test', url: 'chrome-extension://test/workspace.html?id=work', tab: { id: tabId } },
           (response) => { clearTimeout(timeout); resolve(response); });
@@ -139,6 +139,122 @@ async function browser(t, options = {}) {
     },
   };
 }
+
+test('a pending source injection does not block another workspace, UI persistence or download completion',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  let resolveScan;
+  h.chrome.scripting.executeScript=request=>{
+    h.scriptCalls.push(request);
+    return new Promise(resolve=>{resolveScan=resolve;});
+  };
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{...structuredClone(h.state),id:'other',workspaceTabId:200,jobs:[{id:'other-job',url:urls[0],filename:'other.png',downloadId:90,status:'in_progress'}]});
+  h.downloads.set(90,{id:90,state:'complete',bytesReceived:12,totalBytes:12,mime:'image/png'});
+  const pending=h.send({type:'scan'});
+  await eventually(()=>Boolean(resolveScan),'source injection started');
+  const selection=await h.send({type:'ui',patch:{selectedURLs:[urls[0]],query:'kept'}});
+  assert.equal(selection.ok,true,selection.error);
+  const other=await h.send({type:'get',sessionId:'other'},200);
+  assert.equal(other.ok,true,other.error);assert.equal(other.data.jobs[0].status,'complete');
+  resolveScan([{documentId:'doc-a',result:{items:[{url:'https://source.test/new.png'}],notices:[],scanId:'scan-a',cursor:'next',hasMore:true}}]);
+  const result=await pending;
+  assert.equal(result.ok,true,result.error);
+  assert.deepEqual(result.data.selectedURLs,[urls[0]]);
+  assert.equal(result.data.ui.query,'kept');
+  assert.deepEqual(result.data.selectedItems.map(item=>item.url),[urls[0]],'latest selection survives an in-flight scan');
+  assert.equal(result.data.sourceDocumentId,'doc-a');
+});
+
+test('an empty work-limited continuation preserves candidates and selection while advancing the cursor',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  const before=h.store.get('workspace:work');before.scan={cursor:'old',scanId:'scan-a',hasMore:true};h.store.set('workspace:work',before);
+  h.scriptResults.push({items:[],workLimited:true,notices:['bounded'],cursor:'advanced',scanId:'scan-a',hasMore:true});
+  const result=await h.send({type:'scan',continuation:true});
+  assert.equal(result.ok,true,result.error);
+  assert.deepEqual(result.data.items,before.items);assert.deepEqual(result.data.selectedURLs,before.selectedURLs);
+  assert.equal(result.data.scan.cursor,'advanced');assert.equal(result.data.scan.workLimited,true);
+});
+
+test('same-URL source reload invalidates an in-flight result without clearing retained selection',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  await h.send({type:'ui',patch:{selectedURLs:[urls[0]]}});
+  let resolveScan;
+  h.chrome.scripting.executeScript=()=>new Promise(resolve=>{resolveScan=resolve;});
+  const pending=h.send({type:'scan'});
+  await eventually(()=>Boolean(resolveScan),'injection started');
+  h.updated.emit(1,{status:'loading'},h.tabs.get(1));
+  await eventually(()=>h.store.get('workspace:work').sourceEpoch===1,'same URL reload advances source epoch');
+  resolveScan([{documentId:'old-document',result:{items:[{url:'https://source.test/stale.png'}],notices:[]}}]);
+  const result=await pending;assert.equal(result.ok,false);
+  const saved=h.store.get('workspace:work');assert.deepEqual(saved.items.map(item=>item.url),urls);assert.deepEqual(saved.selectedURLs,[urls[0]]);
+});
+
+test('closing a workspace is not held by a pending disposal and cannot adopt a late source result',async t=>{
+  const h=await browser(t);imageItems(h);
+  const before=h.store.get('workspace:work');before.scan={cursor:'existing',scanId:'scan-a',hasMore:true};h.store.set('workspace:work',before);
+  let resolveScan;let disposals=0;
+  h.chrome.scripting.executeScript=request=>{
+    if(request.args[0].dispose){disposals++;return new Promise(()=>{});}
+    return new Promise(resolve=>{resolveScan=resolve;});
+  };
+  const pending=h.send({type:'scan'});
+  await eventually(()=>Boolean(resolveScan),'scan proceeds even while prior disposal is pending');
+  h.closeWorkspace();
+  await eventually(()=>!h.store.has('workspace:work'),'close removes an inactive session without waiting for dispose');
+  resolveScan([{result:{items:[{url:'https://source.test/stale.png'}],notices:[]}}]);
+  assert.equal((await pending).ok,false);assert.equal(disposals,0,'no overlapping cleanup is injected into an unsettled source');assert.equal(h.store.has('workspace:work'),false);
+});
+
+test('loading source tabs and persisted unresolved injections cannot start a second injection',async t=>{
+  const h=await browser(t);imageItems(h);
+  h.tabs.get(1).status='loading';
+  assert.equal((await h.send({type:'scan'})).ok,false);assert.equal(h.scriptCalls.length,0);
+  h.tabs.get(1).status='complete';
+  let resolveScan;
+  h.chrome.scripting.executeScript=()=>new Promise(resolve=>{resolveScan=resolve;});
+  const pending=h.send({type:'scan'});await eventually(()=>Boolean(resolveScan),'first injection started');
+  await h.restartWorker();
+  assert.equal((await h.send({type:'scan'})).ok,false,'worker restart cannot forget a pending source reservation');
+  resolveScan([{result:{items:[],notices:[]}}]);await pending;
+});
+
+test('closing source tabs releases persisted four-call reservations after a worker restart',async t=>{
+  const h=await browser(t);imageItems(h);
+  const flights={};
+  for(let index=10;index<14;index++){h.tabs.set(index,{id:index,url:'https://source.test/'});flights[`pending-${index}`]={id:`pending-${index}`,tabId:index,sessionId:`old-${index}`,workerInstance:'old-worker'};}
+  h.store.set('imagecrate.sourceFlights.v1',flights);await h.restartWorker();
+  assert.equal((await h.send({type:'scan'})).ok,false);assert.equal(h.scriptCalls.length,0);
+  for(let index=10;index<14;index++){h.tabs.delete(index);h.removed.emit(index);}
+  await eventually(()=>Object.keys(h.store.get('imagecrate.sourceFlights.v1') || {}).length===0,'source close reclaims old pending calls');
+  assert.equal((await h.send({type:'scan'})).ok,true);
+});
+
+test('fresh rescans do not accumulate disposal calls and disposal cannot hold workspace closure',async t=>{
+  const h=await browser(t);imageItems(h);let disposals=0;
+  h.chrome.scripting.executeScript=async request=>{
+    h.scriptCalls.push(request);
+    if(request.args[0].dispose){disposals++;return new Promise(()=>{});}
+    return [{result:{items:[],notices:[],scanId:'scan',retryCursor:'replay'}}];
+  };
+  for(let index=0;index<6;index++)assert.equal((await h.send({type:'scan'})).ok,true);
+  assert.equal(disposals,0);
+  h.closeWorkspace();
+  await eventually(()=>!h.store.has('workspace:work'),'workspace closure finishes');
+  await eventually(()=>disposals===1,'one bounded best-effort cleanup is admitted');
+  assert.equal(Object.keys(h.store.get('imagecrate.sourceFlights.v1')).length,1);
+  h.tabs.delete(1);h.removed.emit(1);
+  await eventually(()=>Object.keys(h.store.get('imagecrate.sourceFlights.v1')).length===0,'source close also releases pending cleanup');
+});
+
+test('a response after the absolute scan deadline cannot win before a throttled timer callback',async t=>{
+  const h=await browser(t);const urls=imageItems(h);let resolveScan;
+  h.chrome.scripting.executeScript=()=>new Promise(resolve=>{resolveScan=resolve;});
+  const pending=h.send({type:'scan'});await eventually(()=>Boolean(resolveScan),'scan started');
+  const request=h.store.get('workspace:work').scanRequest;t.mock.method(Date,'now',()=>request.deadline+1);
+  resolveScan([{result:{items:[{url:'https://source.test/too-late.png'}],notices:[]}}]);
+  assert.equal((await pending).ok,false);assert.deepEqual(h.store.get('workspace:work').items.map(item=>item.url),urls);
+});
 
 test('BG-01: closing the workspace preserves and completes the already accepted download batch', async (t) => {
   const h = await browser(t);
