@@ -38,7 +38,7 @@ const save = async state => {
 };
 const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? sessionDefaults(state) : undefined; };
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>sessionDefaults(v));
-const hasPendingSubmission = state => state.jobs.some(job=>job.submission && !job.downloadId && ['queued','in_progress'].includes(job.status));
+const hasPendingSubmission = state => state.jobs.some(job=>['queued','in_progress'].includes(job.status) && (job.submission && !job.downloadId || job.cancelRequested));
 async function syncRecoveryAlarm() {
   if (!chrome.alarms?.create) return;
   const pending=(await all()).some(hasPendingSubmission);
@@ -51,13 +51,26 @@ async function syncRecoveryAlarm() {
 const active = state => summarizeJobs(state.jobs).active > 0;
 const managed = state => requiresWorkspace(state.batch || {});
 async function liveTab(id) { try { return await chrome.tabs.get(id); } catch { return null; } }
+async function ownsWorkspaceTab(state, tab) {
+  if (!tab) return false;
+  const expected=chrome.runtime.getURL(`workspace.html?id=${state.id}`);
+  const visibleURL=tab.url || tab.pendingUrl;
+  if (visibleURL) return visibleURL === expected;
+  // Chrome 116 can omit even our own tab URL without the broad tabs permission.
+  // Extension-owned document contexts prove the exact owner without that grant.
+  if (!chrome.runtime.getContexts) return false;
+  try {
+    const contexts=await chrome.runtime.getContexts({contextTypes:['TAB'],tabIds:[state.workspaceTabId],documentUrls:[expected]});
+    return contexts.some(context=>context.tabId === state.workspaceTabId && context.frameId === 0 && context.documentUrl === expected);
+  } catch { return false; }
+}
 
 export async function openWorkspace(tab) {
   return serial(async () => {
     const existing = await all();
     for (const state of existing) {
       const manager=await liveTab(state.workspaceTabId);
-      if (manager?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { await closeWorkspace(state); continue; }
+      if (!await ownsWorkspaceTab(state,manager)) { await closeWorkspace(state); continue; }
       if (state.tabId === tab.id && state.url === tab.url) {
         await chrome.tabs.update(state.workspaceTabId, {active:true}); return state.id;
       }
@@ -171,8 +184,19 @@ async function refreshJob(job,state) {
       return;
     } else { job.status='in_progress'; job.error='Chromeで保存の開始を確認しています。30秒以内に確認できない場合は中断として表示します。'; return; }
   }
-  if (!job.downloadId || job.status !== 'in_progress') return;
+  if (!job.downloadId || !['queued','in_progress'].includes(job.status)) return;
   const [item] = await chrome.downloads.search({id:job.downloadId});
+  applyChromeDownload(job,item);
+  if (job.cancelRequested && job.status === 'in_progress') {
+    try { await chrome.downloads.cancel(job.downloadId); } catch {}
+    // Cancellation races completion and can settle asynchronously. Keep the
+    // durable intent until Chrome reports the real terminal state.
+    const [current]=await chrome.downloads.search({id:job.downloadId});
+    applyChromeDownload(job,current);
+    if (job.status === 'interrupted') job.error=job.cancelReason || '停止しました。';
+  }
+}
+function applyChromeDownload(job,item) {
   if (!item) { job.status='interrupted'; job.error='ダウンロード履歴から見つかりません。再試行できます。'; return; }
   job.bytesReceived = item.bytesReceived; job.totalBytes = item.totalBytes;
   if (item.filename) job.actualFilename = String(item.filename).slice(0,2048);
@@ -244,6 +268,7 @@ function persistNameDecision(match,item,decision) {
     if (!job.downloadId && ['queued','in_progress'].includes(job.status)) job.downloadId=item.id;
     Object.assign(job,patch);
     delete job.submission;
+    if (job.cancelRequested && job.downloadId && job.status === 'in_progress') await refreshJob(job,state);
     await save(state);
   }).catch(()=>{});
 }
@@ -277,7 +302,10 @@ chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
   return true;
 });
 async function pump(state) {
-  for (const job of state.jobs) await refreshJob(job,state);
+  for (const job of state.jobs) {
+    if (job.cancelRequested && !job.downloadId && !job.submission && ['queued','in_progress'].includes(job.status)) { job.status='interrupted'; job.error=job.cancelReason || '停止しました。'; }
+    else await refreshJob(job,state);
+  }
   // A workspace prepares converted images and owns custom-folder writes. The
   // worker only follows their accepted download IDs; it must not fetch originals.
   if (managed(state)) { await save(state); return state; }
@@ -293,23 +321,16 @@ async function pump(state) {
   await save(state); return state;
 }
 async function stopJobs(state, reason) {
-  for (const job of state.jobs) {
-    if (!['queued','in_progress'].includes(job.status)) continue;
-    if (!job.downloadId && job.submission) {
+  const unfinished=state.jobs.filter(job=>['queued','in_progress'].includes(job.status));
+  for (const job of unfinished) { job.cancelRequested=true; job.cancelReason=reason; }
+  // Persist Stop before any Chrome API call. A restart or late acceptance must
+  // observe the same request even when its download ID is not available yet.
+  if (unfinished.length) await save(state);
+  for (const job of unfinished) {
+    if (job.downloadId || job.submission) {
       await refreshJob(job,state);
-      if (job.status === 'interrupted') continue;
-      if (!job.downloadId) { job.error='Chromeで保存の開始を確認しています。30秒以内の照合が終わるまで再試行できません。'; continue; }
-    }
-    if (job.downloadId) {
-      await refreshJob(job,state);
-      if (job.status === 'in_progress') {
-        try { await chrome.downloads.cancel(job.downloadId); } catch {}
-        // Chrome may have completed before cancel, or cancel may still be
-        // settling. Keep an active ID until Chrome confirms a terminal state.
-        await refreshJob(job,state);
-      }
-      if (job.status === 'interrupted') job.error=reason;
-    } else { job.status='interrupted';job.error=reason; }
+      if (!job.downloadId && job.submission) job.error='停止を受け付けました。Chromeで保存開始を確認でき次第停止します。30秒以内の照合が終わるまで再試行できません。';
+    } else { job.status='interrupted'; job.error=reason; }
   }
 }
 async function closeWorkspace(state) {
@@ -437,7 +458,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         requireOwner(state,message);
         if (state.batch.destination !== 'downloads' || !['jpg','png','webp'].includes(state.batch.format)) throw new Error('この保存形式では変換後のダウンロードを開始できません。');
         const job=state.jobs.find(job=>job.id === message.jobId);
-        if (!job || job.status !== 'in_progress' || job.downloadId) throw new Error('この画像の保存は終了したか、停止しました。');
+        if (!job || job.status !== 'in_progress' || job.downloadId || job.cancelRequested) throw new Error('この画像の保存は終了したか、停止しました。');
         if (typeof message.blobURL !== 'string' || !message.blobURL.startsWith(`blob:${chrome.runtime.getURL('')}`) || message.blobURL.length > 2048) throw new Error('変換後の画像データが不正です。');
         if (state.jobs.some(other=>other !== job && other.downloadId && other.status === 'in_progress')) throw new Error('前の画像の保存が終わってから開始してください。');
         try {
@@ -457,7 +478,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
       case 'retry': {
         if(active(state)) throw new Error('保存処理中です。');
         if(managed(state) && state.batch.owner !== message.instance) throw new Error('この保存処理は別の作業ページに引き継がれました。');
-        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; }
+        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; delete job.cancelRequested; delete job.cancelReason; delete job.submission; }
         if(managed(state)) {await save(state);return state;}
         return pump(state);
       }
@@ -491,7 +512,7 @@ async function reconcilePendingStates(downloadId, includeKnown = false) {
     if (!hasPendingSubmission(state) && !(includeKnown && state.jobs.some(job=>job.downloadId === downloadId))) continue;
     if (!state.closed) {
       const owner=await liveTab(state.workspaceTabId);
-      if (owner?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { await closeWorkspace(state); continue; }
+      if (!await ownsWorkspaceTab(state,owner)) { await closeWorkspace(state); continue; }
     }
     await pump(state);
     if (state.closed && !active(state)) await chrome.storage.session.remove(PREFIX + state.id);
@@ -523,7 +544,7 @@ chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
   if (!changeInfo.url) return;
   serial(async()=>{
     for (const state of await all()) {
-      if (state.workspaceTabId === tabId && tab.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state);
+      if (state.workspaceTabId === tabId && (tab.url || changeInfo.url) !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state);
       else if (state.tabId === tabId && tab.url !== state.url && state.scan) {
         await disposeScan(state);
         state.scan={cursor:null,hasMore:false,invalidated:true};
