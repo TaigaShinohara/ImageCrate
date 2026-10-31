@@ -50,7 +50,11 @@ async function browser(t, options = {}) {
         if (key === null) return Object.fromEntries([...store].map(([name, value]) => [name, clone(value)]));
         return { [key]: clone(store.get(key)) };
       },
-      async set(values) { if (options.rejectStorage) throw new Error('QUOTA_BYTES exceeded'); for (const [key, value] of Object.entries(values)) store.set(key, clone(value)); },
+      async set(values) {
+        if (options.rejectStorage) throw new Error('QUOTA_BYTES exceeded');
+        if (options.beforeStorageSet) await options.beforeStorageSet(clone(values));
+        for (const [key, value] of Object.entries(values)) store.set(key, clone(value));
+      },
       async remove(key) { store.delete(key); },
     } },
     scripting: { async executeScript(request) { scriptCalls.push(request); return [{result:scriptResults.shift() || {items:[],notices:[]}}]; } },
@@ -885,4 +889,74 @@ test('a completed unique accepted submission is recovered after the deadline and
   assert.equal(retried.data.jobs[0].status,'complete');
   assert.deepEqual(h.requested,[]);
   assert.deepEqual(h.cancelled,[]);
+});
+
+test('a filename event after download() resolves retains its accepted ID while a stale storage candidate is being saved',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  const suggestions=[];let emitted=false;
+  h.options.beforeStorageSet=async values=>{
+    const job=values['workspace:work']?.jobs[0];
+    if (!job?.downloadId || emitted) return;
+    emitted=true;
+    const item=h.downloads.get(job.downloadId);
+    Object.assign(item,{filename:'original-image.svg',mime:'image/svg+xml'});
+    h.determining.emit(structuredClone(item),(...args)=>{
+      suggestions.push(args);
+      if (args[0]) item.filename=args[0].filename;
+    });
+    assert.equal(suggestions.length,1,'the ID cache answers immediately without waiting for the blocked storage queue');
+    assert.equal(suggestions[0][0].filename,'ImageCrate/Frozen/001_image.svg');
+    // The caller is about to persist the candidate captured before this event.
+    assert.equal(job.filename,'ImageCrate/Frozen/001_image.img');
+    await nextTurn();
+  };
+  const saved=await h.send({type:'save',urls:[url],settings:{folderName:'Frozen'}});
+  assert.equal(saved.ok,true,saved.error);
+  assert.equal(emitted,true);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].filename === 'ImageCrate/Frozen/001_image.svg','the immutable filename decision survives the older candidate overwriting its mutable job');
+  const persisted=h.store.get('workspace:work').jobs[0];
+  assert.equal(persisted.actualFilename,'ImageCrate/Frozen/001_image.svg');
+  assert.equal(persisted.typeKnown,true);
+  assert.equal(persisted.mime,'image/svg+xml');
+  assert.deepEqual(suggestions,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
+});
+
+test('known originals and converted downloads explicitly suggest their fixed batch paths after download() resolves',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  const original=await h.send({type:'save',urls:[urls[0]],settings:{folderName:'Known'}});
+  const first=original.data.jobs[0];
+  const originalCalls=[];
+  h.determining.emit({id:first.downloadId,url:first.url,byExtensionId:'test',filename:'server-default.png',mime:'image/png'},(...args)=>originalCalls.push(args));
+  assert.deepEqual(originalCalls,[[{filename:'ImageCrate/Known/001_first.png',conflictAction:'uniquify'}]]);
+  h.complete(first.downloadId);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status === 'complete','original batch completes');
+  const converted=await h.send({type:'save',urls:[urls[1]],settings:{folderName:'Converted',format:'jpg'}});
+  const accepted=await beginConverted(h,converted.data);
+  assert.equal(accepted.ok,true,accepted.error);
+  const second=accepted.data.jobs[0];
+  const convertedCalls=[];
+  h.determining.emit({id:second.downloadId,url:'blob:chrome-extension://test/converted-image',byExtensionId:'test',filename:'browser-default.jpg',mime:'image/jpeg'},(...args)=>convertedCalls.push(args));
+  assert.deepEqual(convertedCalls,[[{filename:'ImageCrate/Converted/001_second.jpg',conflictAction:'uniquify'}]]);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].actualFilename === 'ImageCrate/Converted/001_second.jpg','converted filenames are persisted through the same decision path');
+});
+
+test('late filename events for the same URL in two workspaces match accepted IDs before URL',async t=>{
+  const h=await browser(t);
+  const url='https://source.test/shared-image';
+  h.state.items=[{url,width:20,height:10}];h.persist();
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{...structuredClone(h.state),id:'other',workspaceTabId:200});
+  const first=await h.send({type:'save',urls:[url],settings:{folderName:'First'}});
+  const second=await h.send({sessionId:'other',type:'save',urls:[url],settings:{folderName:'Second'}},200);
+  for (const [response,folder] of [[first,'First'],[second,'Second']]) {
+    assert.equal(response.ok,true,response.error);
+    const calls=[];
+    h.determining.emit({id:response.data.jobs[0].downloadId,url,byExtensionId:'test',filename:'server.svg',mime:'image/svg+xml'},(...args)=>calls.push(args));
+    assert.deepEqual(calls,[[{filename:`ImageCrate/${folder}/001_shared-image.svg`,conflictAction:'uniquify'}]]);
+  }
+  await eventually(()=>h.store.get('workspace:work').jobs[0].filename.endsWith('.svg') && h.store.get('workspace:other').jobs[0].filename.endsWith('.svg'),'both ID-specific filename decisions are stored');
+  assert.equal(h.store.get('workspace:work').jobs[0].filename,'ImageCrate/First/001_shared-image.svg');
+  assert.equal(h.store.get('workspace:other').jobs[0].filename,'ImageCrate/Second/001_shared-image.svg');
 });

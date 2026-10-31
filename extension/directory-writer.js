@@ -1,4 +1,4 @@
-import {extensionForMime, resolveImageFilename} from './image-format.js';
+import {extensionForBytes, resolveImageFilename} from './image-format.js';
 
 const encoder = new TextEncoder();
 const LOCK = 'imagecrate-directory-write';
@@ -107,15 +107,19 @@ async function transfer(directory, filename, url, {signal, onProgress, fetchImpl
     progress();
     const pending = [chunk.value];
     let prefix = chunk.value.subarray(0, 64);
+    let prefixReceived=chunk.value.byteLength;
+    let lastReported=-1;
+    const reportReceived=(received=prefixReceived)=>{if(received<=lastReported)return;lastReported=received;try{Promise.resolve(onProgress?.({bytesReceived:received,totalBytes})).catch(()=>{});}catch{}};
+    reportReceived();
     // Untyped responses may split a signature across small network chunks.
     // Retain only a short prefix and the current chunks, never the full body.
-    while (!extensionForMime(mime) && prefix.byteLength < 64
-      && !resolveImageFilename(filename, mime, prefix).known) {
+    while (prefix.byteLength < 64 && !extensionForBytes(prefix)) {
       chunk = await waitFor(reader.read(), controller.signal);
       if (chunk.done) break;
       if (!chunk.value?.byteLength) continue;
       progress();
       pending.push(chunk.value);
+      prefixReceived+=chunk.value.byteLength;reportReceived();
       const next = new Uint8Array(Math.min(64, prefix.byteLength + chunk.value.byteLength));
       next.set(prefix); next.set(chunk.value.subarray(0, next.length - prefix.byteLength), prefix.byteLength);
       prefix = next;
@@ -131,7 +135,7 @@ async function transfer(directory, filename, url, {signal, onProgress, fetchImpl
         bytesReceived += value.byteLength;
         progress();
         // Progress reporting must not turn an otherwise valid file into a failure.
-        try { Promise.resolve(onProgress?.({bytesReceived, totalBytes})).catch(() => {}); } catch {}
+        reportReceived(bytesReceived);
       }
     };
     for (const value of pending) await write(value);

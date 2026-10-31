@@ -6,6 +6,7 @@ import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, as
 const KIND = 'images';
 const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
+const FILENAME_DECISION_TTL = 5 * 60 * 1000;
 let operations = Promise.resolve();
 // One mutation queue protects storage read/modify/write across concurrent events.
 const serial = task => { const next = operations.then(task); operations = next.catch(() => {}); return next; };
@@ -27,6 +28,11 @@ const save = async state => {
   const jobs=state.jobs;
   for (let index=0;index<jobs.length;index++) Object.assign(jobs[index],candidate.jobs[index]);
   Object.assign(state,candidate,{jobs});
+  for (const [id,entry] of submissions) {
+    if (entry.state.id !== state.id) continue;
+    const current=state.jobs.find(job=>job.id === id);
+    if (!current || ['complete','interrupted'].includes(current.status)) forgetSubmission(id);
+  }
 };
 const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? sessionDefaults(state) : undefined; };
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>sessionDefaults(v));
@@ -168,34 +174,79 @@ async function refreshJob(job,state) {
 // onDeterminingFilename can fire before download() resolves. It must never wait
 // for the mutation queue that is currently awaiting Chrome's filename decision.
 const submissions = new Map();
+function forgetSubmission(id) {
+  const entry=submissions.get(id);
+  if (entry) clearTimeout(entry.timer);
+  submissions.delete(id);
+}
 async function submitDownload(state,job,url) {
   job.status='in_progress';
   job.submission={url,filename:job.filename,startedAt:Date.now()};
   await save(state);
-  submissions.set(job.id,{state,job,url});
-  try { return await chrome.downloads.download({url,filename:job.filename,conflictAction:'uniquify',saveAs:false}); }
-  finally { submissions.delete(job.id); delete job.submission; }
+  const entry={state,job,url,downloadId:null,timer:null};
+  entry.timer=setTimeout(()=>{if (submissions.get(job.id) === entry) forgetSubmission(job.id);},FILENAME_DECISION_TTL);
+  entry.timer?.unref?.();
+  submissions.set(job.id,entry);
+  try {
+    const id=await chrome.downloads.download({url,filename:job.filename,conflictAction:'uniquify',saveAs:false});
+    // Chrome may resolve this API before dispatching its filename event. Keep
+    // the accepted ID even while the surrounding save() still has an old clone.
+    entry.downloadId=id;
+    return id;
+  } catch (error) { forgetSubmission(job.id); throw error; }
+  finally { delete job.submission; }
+}
+function safeDownloadPath(filename) {
+  return typeof filename === 'string' && filename.length <= 2048 && !/[\\\x00-\x1f<>:"|?*]/.test(filename)
+    && filename.split('/').every(part=>part && part !== '.' && part !== '..');
 }
 function suggestedOriginalName(job, mime) {
   const extension=extensionForMime(mime);
   // A generated safe path stays fixed. Only replace its neutral final suffix.
-  if (!extension || !/\.img$/i.test(job.filename || '') || /(?:^|\/)(?:\.\.?|)(?:\/|$)|[\\\x00-\x1f]/.test(job.filename || '')) return '';
+  if (!extension || !/\.img$/i.test(job.filename || '') || !safeDownloadPath(job.filename)) return '';
   return job.filename.replace(/\.img$/i,`.${extension}`);
 }
 function nameDecision(item,match,suggest) {
-  if (!match || (match.state.batch?.format || 'original') !== 'original' || match.state.batch?.destination === 'directory') { suggest(); return; }
-  const filename=suggestedOriginalName(match.job,item.mime);
-  match.job.typeKnown=Boolean(extensionForMime(item.mime));
-  if (item.mime) match.job.mime=item.mime;
-  if (filename) { match.job.filename=filename; match.job.actualFilename=filename; suggest({filename,conflictAction:'uniquify'}); }
-  else suggest();
+  if (!match || match.state.batch?.destination === 'directory' || !safeDownloadPath(match.job.filename)) { suggest(); return null; }
+  const original=(match.state.batch?.format || 'original') === 'original';
+  const filename=(original && suggestedOriginalName(match.job,item.mime)) || match.job.filename;
+  const decision={filename,actualFilename:filename,typeKnown:Boolean(extensionForMime(item.mime)) || !original,...(item.mime ? {mime:item.mime} : {})};
+  Object.assign(match.job,decision);
+  // Even known and converted files need an explicit suggestion. Chrome can
+  // otherwise replace our batch path with a server-provided default basename.
+  suggest({filename,conflictAction:'uniquify'});
+  return decision;
+}
+function persistNameDecision(match,item,decision) {
+  if (!match || !decision) return;
+  const sessionId=match.state.id,jobId=match.job.id;
+  // Capture the values, rather than a mutable job reference: an in-flight
+  // storage candidate can overwrite that reference before this task runs.
+  const patch={...decision};
+  serial(async()=>{
+    const state=await load(sessionId);
+    const job=state?.jobs.find(job=>job.id === jobId);
+    if (!job || job.downloadId && job.downloadId !== item.id) return;
+    if (!job.downloadId && ['queued','in_progress'].includes(job.status)) job.downloadId=item.id;
+    Object.assign(job,patch);
+    delete job.submission;
+    await save(state);
+  }).catch(()=>{});
 }
 chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
   let finished=false;
   const suggest=value=>{ if (finished) return; finished=true; if (value) suggestCallback(value); else suggestCallback(); };
   if (item.byExtensionId !== chrome.runtime.id) { suggest(); return false; }
-  const pending=[...submissions.values()].find(entry=>entry.url === item.url);
-  if (pending) { nameDecision(item,pending,suggest); return false; }
+  const entries=[...submissions.values()];
+  const accepted=entries.filter(entry=>entry.downloadId === item.id);
+  const unresolved=entries.filter(entry=>!entry.downloadId && entry.url === item.url);
+  const pending=accepted.length === 1 ? accepted[0] : !accepted.length && unresolved.length === 1 ? unresolved[0] : null;
+  if (pending) {
+    const decision=nameDecision(item,pending,suggest);
+    persistNameDecision(pending,item,decision);
+    forgetSubmission(pending.job.id);
+    return false;
+  }
   // Recovery uses storage independently of serial(). A restarted worker may see
   // a filename event for a submission whose accepted ID has not been saved yet.
   all().then(states=>{
@@ -206,20 +257,8 @@ chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
       const pending=states.flatMap(state=>state.jobs.filter(job=>!job.downloadId && job.submission && submissionMatches(job,item,usedDownloadIds(states,state,job))).map(job=>({state,job})));
       if (pending.length === 1) found=pending[0];
     }
-    nameDecision(item,found,suggest);
-    if (found) serial(async()=>{
-      const state=await load(found.state.id);
-      const job=state?.jobs.find(job=>job.id === found.job.id);
-      if (!job) return;
-      job.downloadId=item.id;
-      if (['queued','in_progress'].includes(job.status)) job.status='in_progress';
-      job.filename=found.job.filename;
-      job.actualFilename=found.job.actualFilename;
-      job.typeKnown=found.job.typeKnown;
-      if (item.mime) job.mime=item.mime;
-      delete job.submission;
-      await save(state);
-    }).catch(()=>{});
+    const decision=nameDecision(item,found,suggest);
+    persistNameDecision(found,item,decision);
   }).catch(()=>suggest());
   return true;
 });

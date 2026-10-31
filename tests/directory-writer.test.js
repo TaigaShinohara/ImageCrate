@@ -242,6 +242,7 @@ test('unknown MIME sniffs split prefixes and streams all original bytes before c
     onProgress:({bytesReceived}) => { if (bytesReceived === 8) written.resolve(); }
   });
   await written.promise;
+  await new Promise(resolve=>setImmediate(resolve));
   assert.ok(h.events.some(([event]) => event === 'write'), 'writes begin before the body ends');
   assert.equal(h.events.some(([event]) => event === 'close'), false);
   stream.enqueue(Uint8Array.from([2,3,4])); stream.close();
@@ -258,6 +259,14 @@ test('unrecognized content keeps a neutral suffix and reports that the format is
   });
   assert.deepEqual(result, {filename:'photo.img', bytesReceived:4, totalBytes:4, formatKnown:false, mime:''});
   assert.deepEqual([...h.entries.get('photo.img').data], [...contents]);
+});
+
+test('a split binary signature takes priority over an incorrect recognized MIME', async()=>{
+  const h=directoryFixture(),bytes=Uint8Array.from([137,80,78,71,13,10,26,10,1,2,3]);
+  const body=new ReadableStream({start(stream){stream.enqueue(bytes.slice(0,3));stream.enqueue(bytes.slice(3));stream.close();}});
+  const result=await writeImage(h.directory,'photo.jpg','https://images.test/render',{fetchImpl:async()=>new Response(body,{headers:{'content-type':'image/jpeg'}})});
+  assert.equal(result.filename,'photo.png');assert.equal(result.mime,'image/png');assert.equal(result.formatKnown,true);
+  assert.deepEqual([...h.entries.get('photo.png').data],[...bytes]);
 });
 
 test('cancel while waiting for an unknown signature creates no file', async () => {
