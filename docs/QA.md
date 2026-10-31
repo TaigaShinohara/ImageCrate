@@ -1,5 +1,15 @@
 # QA — v0.1
 
+## プレビュー表示操作の発見性 — 2026-10-31
+
+- 本人の「押したら表示されたが、そこを押せばいいとわからなかった」を起点に、空の画像枠へ「プレビューを表示」を移し、配信元・許可範囲を別行に整理した。画像の取得不具合としては扱わない。
+- `npm test`: **296 PASS / 既存対象外1 SKIP**。`npm run check` / `git diff --check`: PASS。
+- 隔離Chrome156 / localhost合成画像の `npm run test:browser`: PASS。同じ配信元の画像が1回の許可で複数表示され、許可操作で選択が変わらないこと、画像枠と情報欄の両labelで同じcheckboxを切り替えられること、既存の選択・保存・再試行・変換を確認。
+- `npm run test:security`: 12項目PASS、pageerror 0。未同意・許可拒否時の画像取得ゼロ、具体host同意、許可後focus、生成Blob表示、取消時の失効を回帰。1280/640/360pxで表示ボタンが画像枠内にありcheckboxと重ならず44px以上、配信元と範囲が縦に並び横overflowなし、説明とのaria関連を確認。長い合成配信元文字列も折返し・非クリップを確認。
+- 独立コード審査は対象範囲のmust-fixなし。同じ合成ページの変更前後画面を保存し、主担当が画像枠と表示操作の近接を目視確認した。結果と画面は `/private/tmp/imagecrate-preview-before-results/` と `/private/tmp/imagecrate-preview-after-results/`。元のユーザー画像のサイトへテスト通信していない。
+
+未確認: 修正版を通常Chromeへ再読み込みした状態、本人が案内なしで表示操作を発見できるか、実optional host許可の拒否/取消UI、実スクリーンリーダー。今回Chrome116での再試験は行っていない。既存の通信・権限境界を保ち、runtime依存や公開範囲を追加していない。
+
 ## セキュリティ補強の最終検証 — 2026-10-31
 
 現行の収集・保存・プレビューの上限と保証範囲は [SECURITY-HARDENING.md](SECURITY-HARDENING.md) を参照。この節は、以下に残す過去の検証結果より新しい。

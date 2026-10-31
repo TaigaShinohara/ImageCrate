@@ -163,9 +163,28 @@ try{
   checked('no preview request before consent or after rejected permission; selection and explicit native original saving still work');await refused.close();
 
   const scoped=await opened('/scope'),aBefore=hits('127.0.0.1','/assets/a.svg'),bBefore=hits('localhost','/assets/b.svg');
-  assert.equal(await scoped.locator('.card').nth(0).locator('.preview-permission > span').innerText(),origin+' のプレビューを許可');
-  assert.equal(await scoped.locator('.card').nth(1).locator('.preview-permission > span').innerText(),otherOrigin+' のプレビューを許可');
-  const visibleScope=scoped.locator('.card').first().locator('.preview-scope');assert.equal(await visibleScope.isVisible(),true);assert.match(await visibleScope.innerText(),/全パス.*全ポート/);assert.match(await visibleScope.innerText(),/ログイン状態/);
+  assert.equal(await scoped.locator('.card').nth(0).locator('.preview-source').innerText(),'配信元: '+origin);
+  assert.equal(await scoped.locator('.card').nth(1).locator('.preview-source').innerText(),'配信元: '+otherOrigin);
+  for(const width of [1280,640,360]) {
+    await scoped.setViewportSize({width,height:width===360?800:900});
+    const geometry=await scoped.locator('.card').first().evaluate(card=>{
+      const rect=selector=>{const r=card.querySelector(selector).getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height};};
+      return {thumb:rect('.thumb'),button:rect('.preview-permission'),checkbox:rect('.image-select'),source:rect('.preview-source'),scope:rect('.preview-scope'),labelledButton:!!card.querySelector('label .preview-permission'),described:card.querySelector('.preview-permission').getAttribute('aria-describedby')===card.querySelector('.preview-details').id,overflow:document.documentElement.scrollWidth>innerWidth};
+    });
+    assert.equal(geometry.labelledButton,false,'preview action stays outside checkbox labels');assert.equal(geometry.described,true,'the action is linked to its full source and scope explanation');
+    assert.ok(geometry.button.top>=geometry.thumb.top&&geometry.button.bottom<=geometry.thumb.bottom&&geometry.button.left>=geometry.thumb.left&&geometry.button.right<=geometry.thumb.right,'the preview action is inside the empty thumbnail');
+    assert.ok(geometry.button.top>=geometry.checkbox.bottom&&geometry.button.height>=44,'the preview action is usable without overlapping selection');
+    assert.ok(geometry.scope.top>=geometry.source.bottom,'source and scope are stacked rather than squeezed side by side');assert.equal(geometry.overflow,false);
+    await scoped.locator('.card').first().evaluate(card=>card.scrollIntoView({block:'start'}));
+    await scoped.screenshot({path:join(output,`preview-after-${width}.png`)});
+    const longSource=await scoped.locator('.preview-source').first().evaluate(element=>{
+      const original=element.textContent;element.textContent='配信元: https://images.from-a-long-subdomain.example.test:8443';
+      const result={overflow:element.scrollWidth>element.clientWidth,clipped:getComputedStyle(element).overflowY==='hidden'};element.textContent=original;return result;
+    });
+    assert.deepEqual(longSource,{overflow:false,clipped:false},'long hosts wrap without horizontal overflow or clipping');
+  }
+  await scoped.setViewportSize({width:1280,height:900});
+  const visibleScope=scoped.locator('.card').first().locator('.preview-scope');assert.equal(await visibleScope.isVisible(),true);assert.match(await visibleScope.innerText(),/全パス.*全ポート/);assert.match(await visibleScope.innerText(),/ログイン状態/);assert.match(await visibleScope.innerText(),/同じ配信元のプレビューも表示/);
   await preview(scoped,0,{keyboard:true});assert.equal(hits('127.0.0.1','/assets/a.svg'),aBefore+1);assert.equal(hits('localhost','/assets/b.svg'),bBefore);assert.equal(await scoped.locator('.card').nth(1).locator('img').count(),0);
   const [crossOriginResponse]=await Promise.all([scoped.waitForResponse(response=>response.url()===otherOrigin+'/assets/b.svg'),preview(scoped,1)]);assert.equal(hits('localhost','/assets/b.svg'),bBefore+1);
   assert.equal(crossOriginResponse.status(),200);assert.equal(crossOriginResponse.headers()['access-control-allow-origin'],undefined,'optional-host extension fetch succeeds without a permissive CORS response header');
@@ -194,7 +213,7 @@ try{
   checked('permission removal boundary invalidates displayed URL/cache and does not automatically reacquire consent');await cached.close();
 
   const embedded=await opened('/data'),networkBefore=assetHits();
-  assert.match(await embedded.locator('.preview-permission > span').innerText(),/埋め込み画像/);assert.equal(await embedded.locator('.preview-scope').count(),0);
+  assert.match(await embedded.locator('.preview-source').innerText(),/埋め込まれた画像/);assert.equal(await embedded.locator('.preview-scope').count(),0);
   await embedded.locator('.preview-open').click();assert.equal(await embedded.locator('#preview-stage img').count(),0);
   const embeddedConsent=embedded.locator('#preview-stage .preview-permission');await embeddedConsent.focus();await embeddedConsent.press('Enter');
   assert.equal(await embedded.evaluate(()=>document.activeElement?.id),'preview-select','viewer consent Enter transfers focus to its selection control');

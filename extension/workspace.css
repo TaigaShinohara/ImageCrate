@@ -100,11 +100,14 @@ body[data-loading="true"] #scan .icon { animation: spin 1.4s linear infinite; }
 .card:has(input:disabled) { cursor: default; }
 .card-select { display: flex; flex-direction: column; flex: 1; min-width: 0; cursor: pointer; }
 .preview-open { border-top: 1px solid var(--line); border-radius: 0; font-size: 12px; color: var(--accent); }
-.preview-permission { border-top: 1px solid var(--line); border-radius: 0; font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
+.preview-permission { flex-shrink: 0; max-width: 100%; font-size: 12px; color: var(--accent); white-space: normal; overflow-wrap: anywhere; }
+.thumb > .preview-permission { width: 100%; border-color: #bcb5ed; background: var(--paper); box-shadow: 0 2px 6px #6351d919; }
+.preview-details { padding: 10px 12px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.preview-source { color: var(--ink); font-weight: 600; }
+.preview-scope { margin-top: 5px; line-height: 1.6; }
+.preview-stage > .preview-details { max-width: 64ch; padding: 0 18px 12px; text-align: center; }
 .viewer-image { min-width: 0; max-width: 100%; max-height: 100%; }
 .preview-stage { flex-direction: column; gap: 12px; }
-.preview-permission { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
-.preview-scope { display: block; margin-top: 4px; font-weight: 400; line-height: 1.5; }
 .viewer-image img { max-width: 100%; max-height: min(60vh,600px); object-fit: contain; }
 .card-save-jump { position: absolute; width: 1px; height: 1px; min-height: 0; padding: 0; overflow: hidden; clip-path: inset(50%); }
 .card:focus-within .card-save-jump { position: absolute; top: 8px; right: 8px; z-index: 2; width: auto; max-width: calc(100% - 50px); height: auto; min-height: 44px; padding: 6px 8px; clip-path: none; border: 2px solid var(--accent); border-radius: 8px; background: white; color: var(--accent); }
@@ -135,8 +138,10 @@ body[data-loading="true"] #scan .icon { animation: spin 1.4s linear infinite; }
 .image-select:checked { border-color: var(--accent); background: var(--accent); }
 .image-select:checked::after { content: ""; position: absolute; left: 7px; top: 3px; width: 6px; height: 11px; border: solid white; border-width: 0 2px 2px 0; transform: rotate(45deg); }
 .image-select:disabled { cursor: default; }
-.thumb { display: flex; align-items: center; justify-content: center; aspect-ratio: 4 / 3; overflow: hidden; padding: 10px; color: var(--muted); background: #edeff4; }
+.thumb { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; aspect-ratio: 4 / 3; min-height: 140px; overflow: hidden; padding: 10px; color: var(--muted); background: #edeff4; }
+.thumbnail-image { display: flex; flex: 1; align-items: center; justify-content: center; width: 100%; min-height: 0; cursor: pointer; }
 .thumb img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.thumbnail-image .preview-error { padding: 12px 2px 0; }
 .preview-error { display: grid; justify-items: center; gap: 8px; padding: 16px; text-align: center; font-size: 11px; }
 .preview-error .icon { width: 27px; height: 27px; color: #9298a8; }
 .card-body { flex: 1; padding: 11px 12px 12px; transition: background-color 150ms; }

@@ -92,6 +92,11 @@ try {
     assert.equal(await manager.locator('.thumb img').first().evaluate(image=>image.naturalWidth<=384),true,'the thumbnail is a bounded generated static image');
     await manager.waitForFunction(()=>[...document.querySelectorAll('[data-dimensions]')].some(node=>node.textContent.includes('400 × 300')));
     assert.equal(await manager.locator('.image-select:checked').count(),0,'preview consent does not select images');
+    await manager.waitForFunction(()=>document.querySelectorAll('.thumb img').length>=2);
+    await manager.locator('.thumbnail-image').first().click();
+    await manager.waitForFunction(()=>document.querySelector('.image-select').checked);
+    await manager.locator('.card-select').first().click();
+    await manager.waitForFunction(()=>!document.querySelector('.image-select').checked);
     // Native disclosures must remain keyboard-operable and return focus on Escape.
     for(const disclosureId of ['filters','help']) {
       const summary=manager.locator(`#${disclosureId} > summary`);
