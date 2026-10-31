@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import {createTransferBudget} from '../extension/transfer-budget.js';
+import {createTransferBudget,reserveTransferAttempt} from '../extension/transfer-budget.js';
 import {MEDIA_LIMITS} from '../extension/media-limits.js';
 import {createImageResourceCoordinator} from '../extension/image-decoder.js';
 
@@ -92,7 +92,8 @@ async function browser(t, options = {}) {
         return id;
       },
       async search(query) {
-        if (Object.hasOwn(query,'id')) return downloads.has(query.id) ? [clone(downloads.get(query.id))] : [];
+        if (Object.hasOwn(query,'id')) return downloads.has(query.id) ? [clone({id:query.id,byExtensionId:'test',
+          startTime:new Date().toISOString(),...downloads.get(query.id)})] : [];
         return [...downloads.values()].filter(item=>!query.startedAfter || Date.parse(item.startTime) >= Date.parse(query.startedAfter)).map(clone);
       },
       async cancel(id) {
@@ -264,7 +265,7 @@ test('a response after the absolute scan deadline cannot win before a throttled 
   assert.equal((await pending).ok,false);assert.deepEqual(h.store.get('workspace:work').items.map(item=>item.url),urls);
 });
 
-test('BG-01: closing the workspace preserves and completes the already accepted download batch', async (t) => {
+test('legacy native migration preserves the accepted file after close and refuses unbudgeted queued starts', async (t) => {
   const h = await browser(t);
   h.state.jobs = [
     { url: 'https://source.test/first.mp4', filename: 'first.mp4', downloadId: 7, status: 'in_progress' },
@@ -278,14 +279,11 @@ test('BG-01: closing the workspace preserves and completes the already accepted 
   assert.ok(h.store.has('workspace:work'), 'pending batch must survive the workspace closing');
   assert.equal(h.requested.length, 0, 'downloads remain sequential while the first file is active');
   h.complete(7);
-  await eventually(() => h.requested.length === 1, 'second file starts after first completes, without a live workspace');
-  assert.equal(h.requested[0].url, 'https://source.test/second.mp4');
-  h.complete(h.requested[0].id);
   await eventually(() => {
     const saved = h.store.get('workspace:work');
     return !saved || saved.jobs.every((job) => ['complete', 'interrupted'].includes(job.status));
   }, 'closed workspace must not leave a queued or in-progress batch after all downloads finish');
-  assert.equal(h.requested.length, 1, 'neither completed file is downloaded a second time');
+  assert.equal(h.requested.length, 0, 'legacy queued work requires an explicit new versioned batch');
 });
 
 test('BG-02: a capture owner that navigated away cannot keep another workspace locked',
@@ -326,6 +324,421 @@ function imageItems(h) {
   h.persist();
   return h.state.items.map((item) => item.url);
 }
+
+async function nativeBatch(h,count=1) {
+  const urls=imageItems(h).slice(0,count);
+  const response=await h.send({type:'save',urls,settings:{destination:'downloads',format:'original'}});
+  assert.equal(response.ok,true,response.error);return response.data;
+}
+function nativeLimits(h,{input=10,output=input,batchInput=40,batchOutput=batchInput,timeoutMs=900000}={}) {
+  const state=h.store.get('workspace:work'),job=state.jobs[0],startedAt=job.transfer.startedAt;
+  const budget=createTransferBudget({now:startedAt,maxBytes:batchInput,maxOutputBytes:batchOutput,timeoutMs});
+  state.batch.transferBudget=reserveTransferAttempt(budget,{attemptId:job.id,logicalJobId:job.logicalJobId,
+    maxBytes:input,maxOutputBytes:output,now:startedAt});
+  job.transfer={...job.transfer,maxBytes:input,maxOutputBytes:output,deadline:Math.min(budget.deadline,startedAt+120000)};
+  job.nativeObservation.deadline=job.transfer.deadline;h.store.set('workspace:work',state);return state;
+}
+
+test('native submission is preceded by durable source/output reservation and failed storage authorizes no API call',async t=>{
+  const h=await browser(t);const urls=imageItems(h);const original=h.chrome.downloads.download;
+  let starts=0;
+  h.chrome.downloads.download=async options=>{
+    starts++;const state=h.store.get('workspace:work'),job=state.jobs[0];
+    assert.equal(state.batch.transferBudget.reservedBytes,MEDIA_LIMITS.original.maxBytes);
+    assert.equal(state.batch.transferBudget.reservedOutputBytes,MEDIA_LIMITS.original.maxBytes);
+    assert.equal(state.batch.transferBudget.logicalAttempts[job.logicalJobId],1);assert.ok(job.submission.token);
+    return original(options);
+  };
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{format:'original',destination:'downloads'}});
+  assert.equal(saved.ok,true,saved.error);assert.equal(starts,1);
+  await h.send({type:'cancel'});
+  h.options.rejectStorage=true;
+  const refused=await h.send({type:'save',urls:[urls[0]],settings:{format:'original',destination:'downloads'}});
+  assert.equal(refused.ok,false);assert.equal(starts,1);
+});
+
+test('native accepted-ID history rejection stays unknown, reserves full capacity and cannot start queued work or retry',async t=>{
+  const h=await browser(t);const search=h.chrome.downloads.search;
+  h.chrome.downloads.search=async query=>{if(Object.hasOwn(query,'id'))throw new Error('accepted history query failed');return search(query);};
+  const state=await nativeBatch(h,2),job=state.jobs[0];
+  assert.ok(Number.isSafeInteger(job.downloadId));assert.equal(job.status,'in_progress');assert.equal(job.outcomeUnknown,true);
+  assert.equal(state.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(state.batch.transferBudget.outputBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(state.jobs[1].status,'queued');assert.equal(h.requested.length,1);
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'save',urls:[job.url],settings:{destination:'downloads'}})).ok,false);
+  h.chrome.downloads.search=search;Object.assign(h.downloads.get(job.downloadId),{state:'complete',bytesReceived:3,totalBytes:3});
+  const recovered=await h.send({type:'get'});
+  assert.equal(recovered.data.jobs[0].status,'complete');assert.equal(recovered.data.jobs[0].downloadId,job.downloadId);
+  assert.equal(recovered.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(recovered.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(h.requested.length,2,'the next reserved job starts only after the real first terminal result');
+  assert.notEqual(h.requested[1].url,job.url,'the first accepted image is never submitted again');
+});
+
+test('native accepted-ID storage failure preserves the ID and conservative accounting through worker restart',async t=>{
+  const h=await browser(t,{withAlarms:true});let failed=false;
+  h.options.beforeStorageSet=values=>{
+    const candidate=values['workspace:work'],job=candidate?.jobs?.[0];
+    if(!failed&&Number.isSafeInteger(job?.downloadId)&&!job.outcomeUnknown) {failed=true;throw new Error('accepted ID acknowledgement storage failure');}
+  };
+  const state=await nativeBatch(h),id=state.jobs[0].downloadId;
+  assert.equal(failed,true);assert.ok(Number.isSafeInteger(id));assert.equal(state.jobs[0].status,'in_progress');
+  assert.equal(state.jobs[0].outcomeUnknown,true);assert.equal(h.store.get('workspace:work').jobs[0].downloadId,id);
+  assert.equal(state.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  h.chrome.downloads.cancel=async()=>{throw new Error('still in progress');};
+  await h.restartWorker();const restored=await h.send({type:'get'});
+  assert.equal(restored.data.jobs[0].downloadId,id);assert.equal(restored.data.jobs[0].status,'in_progress');
+  assert.equal(h.requested.length,1);assert.equal(restored.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  Object.assign(h.downloads.get(id),{state:'complete',bytesReceived:3,totalBytes:3});
+  const complete=await h.send({type:'get'});
+  assert.equal(complete.data.jobs[0].status,'complete');assert.equal(complete.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(complete.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes,'a later terminal result cannot refund an unknown acceptance');
+  assert.equal(h.requested.length,1);
+});
+
+test('native reservation-storage rejection before API dispatch remains a known unaccepted failure',async t=>{
+  const h=await browser(t);const urls=imageItems(h);let failed=false,starts=0;
+  const original=h.chrome.downloads.download;h.chrome.downloads.download=async options=>{starts++;return original(options);};
+  h.options.beforeStorageSet=values=>{
+    if(!failed&&values['workspace:work']?.jobs?.[0]?.submission) {failed=true;throw new Error('reservation storage rejected before dispatch');}
+  };
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  assert.equal(saved.ok,true,saved.error);assert.equal(starts,0);assert.equal(saved.data.jobs[0].status,'interrupted');
+  assert.equal(saved.data.jobs[0].submission,undefined);assert.equal(saved.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(saved.data.batch.transferBudget.consumedBytes,0);assert.equal(saved.data.batch.transferBudget.outputBytes,0);
+  assert.equal((await h.send({type:'retry'})).ok,true);assert.equal(starts,1);
+});
+
+test('native observed overshoot saves cancel intent before cancellation and charges actual bytes once',async t=>{
+  const h=await browser(t);await nativeBatch(h);const state=nativeLimits(h);const job=state.jobs[0],id=job.downloadId;
+  const cancel=h.chrome.downloads.cancel;
+  h.chrome.downloads.cancel=async downloadId=>{
+    const stored=h.store.get('workspace:work');assert.equal(stored.jobs[0].cancelRequested,true);
+    assert.match(stored.jobs[0].cancelReason,/観測容量/);assert.equal(downloadId,id);return cancel(downloadId);
+  };
+  Object.assign(h.downloads.get(id),{bytesReceived:11,totalBytes:-1});
+  const stopped=await h.send({type:'get'});
+  assert.equal(stopped.ok,true,stopped.error);assert.equal(stopped.data.jobs[0].status,'interrupted');
+  assert.deepEqual(h.cancelled,[id]);assert.equal(stopped.data.batch.transferBudget.consumedBytes,11);
+  assert.equal(stopped.data.batch.transferBudget.outputBytes,11);assert.equal(stopped.data.batch.transferBudget.reservedBytes,0);
+  const again=await h.send({type:'get'});assert.equal(again.data.batch.transferBudget.consumedBytes,11);
+});
+
+test('native known total can cancel early without counting declared bytes as received',async t=>{
+  const h=await browser(t);await nativeBatch(h);const state=nativeLimits(h);const id=state.jobs[0].downloadId;
+  Object.assign(h.downloads.get(id),{bytesReceived:1,totalBytes:100});
+  const stopped=await h.send({type:'get'});
+  assert.equal(stopped.data.jobs[0].status,'interrupted');assert.deepEqual(h.cancelled,[id]);
+  assert.equal(stopped.data.batch.transferBudget.consumedBytes,1);assert.equal(stopped.data.batch.transferBudget.outputBytes,1);
+});
+
+test('native monitoring refuses cancellation before its intent is durable when storage rejects the observation',async t=>{
+  const h=await browser(t);await nativeBatch(h);const state=nativeLimits(h),id=state.jobs[0].downloadId;
+  h.downloads.get(id).bytesReceived=11;h.options.rejectStorage=true;
+  const refused=await h.send({type:'get'});assert.equal(refused.ok,false);assert.deepEqual(h.cancelled,[]);
+  assert.equal(h.store.get('workspace:work').jobs[0].cancelRequested,undefined);
+  h.options.rejectStorage=false;
+  const stopped=await h.send({type:'get'});assert.equal(stopped.data.jobs[0].status,'interrupted');assert.deepEqual(h.cancelled,[id]);
+});
+
+test('native duplicate and regressing counters do not reduce usage or refresh the idle clock',async t=>{
+  const h=await browser(t);await nativeBatch(h);const state=nativeLimits(h);const id=state.jobs[0].downloadId;
+  let now=state.jobs[0].transfer.startedAt+1000;t.mock.method(Date,'now',()=>now);
+  Object.assign(h.downloads.get(id),{bytesReceived:5,totalBytes:-1});await h.send({type:'get'});
+  const progressAt=h.store.get('workspace:work').jobs[0].nativeObservation.lastProgressAt;
+  for(const bytes of [5,3,-1,Number.MAX_SAFE_INTEGER+1]) {
+    now+=1000;h.downloads.get(id).bytesReceived=bytes;
+    const next=await h.send({type:'get'});
+    assert.equal(next.data.jobs[0].nativeObservation.bytesReceived,5);
+    assert.equal(next.data.jobs[0].nativeObservation.lastProgressAt,progressAt);
+  }
+  Object.assign(h.downloads.get(id),{state:'complete',bytesReceived:6,totalBytes:6,fileSize:6});
+  const complete=await h.send({type:'get'});
+  assert.equal(complete.data.jobs[0].status,'complete');assert.equal(complete.data.batch.transferBudget.consumedBytes,6);
+  assert.equal(complete.data.batch.transferBudget.outputBytes,6);assert.deepEqual(h.cancelled,[]);
+});
+
+test('native idle timeout is observed at 30 seconds and positive progress cannot renew the 120 second deadline',async t=>{
+  const h=await browser(t);let state=await nativeBatch(h);let job=state.jobs[0];
+  let now=job.transfer.startedAt+29999;t.mock.method(Date,'now',()=>now);
+  assert.equal((await h.send({type:'get'})).data.jobs[0].status,'in_progress');
+  now++;assert.equal((await h.send({type:'get'})).data.jobs[0].status,'interrupted');assert.match(h.store.get('workspace:work').jobs[0].cancelReason,/30秒/);
+  const retried=await h.send({type:'retry'});assert.equal(retried.ok,true,retried.error);state=retried.data;job=state.jobs[0];
+  now=job.transfer.startedAt+90000;h.downloads.get(job.downloadId).bytesReceived=1;
+  assert.equal((await h.send({type:'get'})).data.jobs[0].status,'in_progress');
+  now=job.transfer.deadline+1;h.downloads.get(job.downloadId).bytesReceived=2;
+  const expired=await h.send({type:'get'});assert.equal(expired.data.jobs[0].status,'interrupted');assert.match(expired.data.jobs[0].cancelReason,/制限時間/);
+});
+
+test('native clock rollback is failclosed and cannot create a fresh timeout window',async t=>{
+  const h=await browser(t);const state=await nativeBatch(h);const job=state.jobs[0];
+  let now=job.transfer.startedAt+1000;t.mock.method(Date,'now',()=>now);h.downloads.get(job.downloadId).bytesReceived=1;
+  await h.send({type:'get'});now--;
+  const stopped=await h.send({type:'get'});assert.equal(stopped.data.jobs[0].status,'interrupted');assert.match(stopped.data.jobs[0].cancelReason,/時計/);
+  assert.equal(stopped.data.jobs[0].transfer.deadline,job.transfer.deadline);
+  assert.equal((await h.send({type:'retry'})).ok,false,'clock rollback cannot authorize a fresh attempt window in the same batch');
+});
+
+test('native output observations exhaust their own batch budget without double-counting source bytes',async t=>{
+  const h=await browser(t);await nativeBatch(h,2);const state=nativeLimits(h,{input:10,output:6,batchInput:40,batchOutput:7});
+  const id=state.jobs[0].downloadId;Object.assign(h.downloads.get(id),{bytesReceived:2,totalBytes:-1,fileSize:8});
+  const stopped=await h.send({type:'get'});
+  assert.equal(stopped.data.batch.transferBudget.consumedBytes,2);assert.equal(stopped.data.batch.transferBudget.outputBytes,8);
+  assert.equal(stopped.data.jobs[0].status,'interrupted');assert.equal(stopped.data.jobs[1].status,'interrupted');
+  assert.equal(h.requested.length,1,'no second native start fits the observed output budget');
+});
+
+test('native batch deadline stops the active attempt and all later starts without resetting on retry',async t=>{
+  const h=await browser(t);await nativeBatch(h,2);const state=nativeLimits(h,{timeoutMs:2000});
+  const deadline=state.batch.transferBudget.deadline;t.mock.method(Date,'now',()=>deadline+1);
+  h.downloads.get(state.jobs[0].downloadId).bytesReceived=1;
+  const stopped=await h.send({type:'get'});assert.equal(stopped.data.jobs[0].status,'interrupted');
+  assert.equal(stopped.data.jobs[1].status,'interrupted');assert.equal(h.requested.length,1);
+  const retry=await h.send({type:'retry'});assert.equal(retry.ok,false);
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.deadline,deadline);
+});
+
+test('native versioned batches continue after workspace close and wake all owned active IDs on restart and alarm',async t=>{
+  const h=await browser(t,{withAlarms:true});const state=await nativeBatch(h,2);const first=state.jobs[0].downloadId;
+  assert.ok(h.alarms.has('imagecrate-pending-downloads'),'all active native IDs have a Chrome116 recovery alarm');
+  h.closeWorkspace();await eventually(()=>h.store.get('workspace:work')?.closed,'workspace is positively closed');
+  h.complete(first);await eventually(()=>h.requested.length===2,'next reserved native attempt starts without the page');
+  const second=h.requested[1].id;const current=h.store.get('workspace:work');
+  let now=current.jobs[1].transfer.deadline+1;t.mock.method(Date,'now',()=>now);
+  await h.restartWorker();await eventually(()=>h.cancelled.includes(second),'startup observes the elapsed deadline after sleep');
+  await eventually(()=>!h.store.has('workspace:work'),'the closed native batch retires after real terminal confirmation');
+  assert.equal(h.requested.length,2);assert.equal(h.downloads.get(first).state,'complete');
+  await eventually(()=>h.alarms.size===0,'no active native job remains');
+});
+
+test('native missing history stays unknown and conservative through restart and only a real terminal result permits retry',async t=>{
+  const h=await browser(t,{withAlarms:true});const state=await nativeBatch(h);const job=state.jobs[0],id=job.downloadId;
+  const actual=structuredClone(h.downloads.get(id));h.downloads.delete(id);
+  const missing=await h.send({type:'get'});
+  assert.equal(missing.data.jobs[0].status,'in_progress');assert.equal(missing.data.jobs[0].outcomeUnknown,true);
+  assert.equal(missing.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal(missing.data.batch.transferBudget.outputBytes,MEDIA_LIMITS.original.maxBytes);
+  assert.equal((await h.send({type:'retry'})).ok,false);await h.restartWorker();
+  assert.equal((await h.send({type:'get'})).data.jobs[0].status,'in_progress');
+  h.downloads.set(id,{...actual,state:'interrupted',error:'USER_CANCELED',bytesReceived:2,totalBytes:2});
+  const terminal=await h.send({type:'get'});
+  assert.equal(terminal.data.jobs[0].status,'interrupted');assert.equal(terminal.data.jobs[0].outcomeUnknown,undefined);
+  assert.equal(terminal.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes,'unknown charges are never refunded');
+  const retry=await h.send({type:'retry'});assert.equal(retry.ok,true,retry.error);
+  assert.equal(retry.data.jobs[0].logicalJobId,job.logicalJobId);assert.notEqual(retry.data.jobs[0].id,job.id);
+  assert.equal(retry.data.batch.transferBudget.deadline,state.batch.transferBudget.deadline);
+});
+
+test('native monitoring never cancels a foreign extension ID or an unrelated event ID',async t=>{
+  const h=await browser(t,{withAlarms:true});const state=await nativeBatch(h);const id=state.jobs[0].downloadId;
+  Object.assign(h.downloads.get(id),{byExtensionId:'other-extension',bytesReceived:MEDIA_LIMITS.original.maxBytes+1});
+  h.downloads.set(999,{id:999,byExtensionId:'other-extension',state:'in_progress',bytesReceived:999999});
+  h.changed.emit({id:999,bytesReceived:{current:999999}});
+  await eventually(()=>h.store.get('workspace:work').jobs[0].ownershipMismatch===true,'foreign ownership is preserved as unknown');
+  assert.deepEqual(h.cancelled,[]);assert.equal(h.downloads.get(id).state,'in_progress');
+  assert.equal(h.downloads.get(999).state,'in_progress');assert.equal((await h.send({type:'retry'})).ok,false);
+});
+
+test('native completion immediately before cancellation remains complete and charges its actual observed overshoot',async t=>{
+  const h=await browser(t);await nativeBatch(h);const state=nativeLimits(h);const id=state.jobs[0].downloadId;
+  Object.assign(h.downloads.get(id),{bytesReceived:11,totalBytes:11});
+  h.chrome.downloads.cancel=async downloadId=>{
+    h.cancelled.push(downloadId);Object.assign(h.downloads.get(downloadId),{state:'complete',fileSize:11});
+    throw new Error('completed just before cancel');
+  };
+  const complete=await h.send({type:'get'});
+  assert.equal(complete.data.jobs[0].status,'complete');assert.equal(complete.data.batch.transferBudget.consumedBytes,11);
+  const retried=await h.send({type:'retry'});assert.equal(retried.data.jobs[0].id,state.jobs[0].id);assert.equal(h.requested.length,1);
+});
+
+test('native known API failures count actual attempts and retry cannot reset the deadline or exceed three starts',async t=>{
+  const h=await browser(t);const urls=imageItems(h);let starts=0;
+  h.chrome.downloads.download=async()=>{starts++;throw new Error('known API rejection');};
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  assert.equal(saved.ok,true,saved.error);const deadline=saved.data.batch.transferBudget.deadline,logical=saved.data.jobs[0].logicalJobId;
+  for(let index=1;index<3;index++) {
+    const retry=await h.send({type:'retry'});assert.equal(retry.ok,true,retry.error);
+    assert.equal(retry.data.batch.transferBudget.deadline,deadline);assert.equal(retry.data.jobs[0].logicalJobId,logical);
+    assert.equal(retry.data.batch.transferBudget.consumedBytes,0);assert.equal(retry.data.batch.transferBudget.outputBytes,0);
+  }
+  assert.equal(starts,3);assert.equal((await h.send({type:'retry'})).ok,false);
+});
+
+test('native API acceptance timeout frees the mutation queue and adopts a late exact ID even after the 30 second matching window',async t=>{
+  const h=await browser(t,{withAlarms:true,messageTimeoutMs:120000});const urls=imageItems(h);
+  let now=Date.now();t.mock.method(Date,'now',()=>now);t.mock.timers.enable({apis:['setTimeout']});
+  let accept,options;
+  h.chrome.downloads.download=value=>{options=value;return new Promise(resolve=>{accept=resolve;});};
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>Boolean(accept),'native API is still pending');now+=31000;t.mock.timers.tick(30000);
+  const unknown=await saving;assert.equal(unknown.ok,true,unknown.error);const job=unknown.data.jobs[0];
+  assert.equal(job.status,'in_progress');assert.equal(job.outcomeUnknown,true);assert.ok(job.submission.apiPending);
+  assert.equal(unknown.data.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{id:'other',workspaceTabId:200,items:[],jobs:[],notices:[]});
+  assert.equal((await h.send({type:'ui',sessionId:'other',patch:{query:'responsive'}},200)).ok,true,'an unresolved API no longer owns the global queue');
+  h.downloads.set(90,{id:90,url:options.url,filename:options.filename,byExtensionId:'test',
+    startTime:new Date(now).toISOString(),state:'in_progress',mime:'image/png',bytesReceived:1,totalBytes:10});
+  accept(90);
+  await eventually(()=>h.store.get('workspace:work').jobs[0].chromeOutcomeKnown===true,'the exact late API ID is adopted and its durable cancel intent is executed');
+  const terminal=h.store.get('workspace:work');
+  assert.equal(terminal.jobs[0].downloadId,90);assert.equal(terminal.jobs[0].status,'interrupted');assert.deepEqual(h.cancelled,[90]);
+  assert.equal(terminal.jobs[0].ownershipMismatch,undefined);assert.equal(terminal.batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+});
+
+test('native alarm observes idle owned IDs without UI polling and retains durable cancel intent when cancellation fails',async t=>{
+  const h=await browser(t,{withAlarms:true});const state=await nativeBatch(h),job=state.jobs[0],id=job.downloadId;
+  let now=job.transfer.startedAt+30000;t.mock.method(Date,'now',()=>now);
+  h.chrome.downloads.cancel=async downloadId=>{h.cancelled.push(downloadId);throw new Error('not stopped yet');};
+  h.alarmEvent.emit({name:'imagecrate-pending-downloads'});
+  await eventually(()=>h.store.get('workspace:work').jobs[0].cancelRequested===true,'alarm persists native idle cancellation before any page request');
+  await eventually(()=>h.cancelled.includes(id),'owned ID receives best-effort cancellation');
+  assert.equal(h.store.get('workspace:work').jobs[0].status,'in_progress');assert.ok(h.alarms.has('imagecrate-pending-downloads'));
+  await h.restartWorker();await eventually(()=>h.cancelled.length>=2,'worker restart retries its durable cancel intent');
+  Object.assign(h.downloads.get(id),{state:'complete',bytesReceived:3,totalBytes:3});
+  h.alarmEvent.emit({name:'imagecrate-pending-downloads'});
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='complete','actual complete wins even after cancellation failure');
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.consumedBytes,3);
+});
+
+test('native acceptance that never resolves stays unknown with one start and still permits unrelated workspace work',async t=>{
+  const h=await browser(t,{withAlarms:true,messageTimeoutMs:120000});const urls=imageItems(h);
+  t.mock.timers.enable({apis:['setTimeout']});let starts=0;
+  h.chrome.downloads.download=()=>{starts++;return new Promise(()=>{});};
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>starts===1,'one native API call started');t.mock.timers.tick(30000);
+  const unknown=await saving;assert.equal(unknown.data.jobs[0].status,'in_progress');assert.equal(unknown.data.jobs[0].cancelRequested,true);
+  assert.equal((await h.send({type:'retry'})).ok,false);
+  assert.equal((await h.send({type:'ui',patch:{query:'remains responsive'}})).ok,true);
+  assert.equal((await h.send({type:'get'})).data.jobs[0].outcomeUnknown,true);assert.equal(starts,1);
+  assert.ok(h.alarms.has('imagecrate-pending-downloads'));assert.deepEqual(h.cancelled,[],'no unproven ID can be cancelled');
+});
+
+test('native late API rejection permits a fresh attempt without refunding previously unknown usage',async t=>{
+  const h=await browser(t,{messageTimeoutMs:120000});const urls=imageItems(h);const original=h.chrome.downloads.download;
+  t.mock.timers.enable({apis:['setTimeout']});let reject;
+  h.chrome.downloads.download=()=>new Promise((_,no)=>{reject=no;});
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>Boolean(reject),'native API has not replied');t.mock.timers.tick(30000);
+  const unknown=await saving,deadline=unknown.data.batch.transferBudget.deadline;
+  reject(new Error('known rejection after delayed API response'));
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='interrupted','actual API rejection without acceptance evidence is known failure');
+  assert.equal(h.store.get('workspace:work').jobs[0].outcomeUnknown,undefined);
+  assert.equal(h.store.get('workspace:work').batch.transferBudget.consumedBytes,MEDIA_LIMITS.original.maxBytes);
+  h.chrome.downloads.download=original;
+  const retry=await h.send({type:'retry'});assert.equal(retry.ok,true,retry.error);
+  assert.equal(retry.data.batch.transferBudget.deadline,deadline);assert.equal(retry.data.jobs[0].status,'in_progress');
+});
+
+for(const eventKind of ['created','filename'])test(`native ${eventKind} acceptance proof takes precedence over a contradictory API rejection`,async t=>{
+  const h=await browser(t);const urls=imageItems(h);let reject,acceptedEvent=false;
+  h.chrome.downloads.download=options=>{
+    const item={id:95,url:options.url,filename:options.filename,byExtensionId:'test',startTime:new Date().toISOString(),
+      state:'in_progress',mime:'image/png',bytesReceived:2,totalBytes:10};
+    h.downloads.set(95,item);
+    if(eventKind==='created'){h.created.emit(structuredClone(item));acceptedEvent=true;}
+    else h.determining.emit(structuredClone(item),()=>{acceptedEvent=true;});
+    return new Promise((_,no)=>{reject=no;});
+  };
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>acceptedEvent&&Boolean(reject),'Chrome event reports actual owned acceptance');
+  await nextTurn();await nextTurn();reject(new Error('contradictory API rejection'));
+  const accepted=await saving;assert.equal(accepted.ok,true,accepted.error);assert.equal(accepted.data.jobs[0].downloadId,95);
+  assert.equal(accepted.data.jobs[0].downloadBinding.apiAccepted,false,'event proof is not mislabeled as an API acknowledgement');
+  assert.equal(accepted.data.jobs[0].status,'in_progress');assert.equal(accepted.data.jobs[0].submission,undefined);
+  assert.equal(accepted.data.batch.transferBudget.reservedBytes,MEDIA_LIMITS.original.maxBytes);
+  Object.assign(h.downloads.get(95),{state:'complete',bytesReceived:2,totalBytes:2});
+  const complete=await h.send({type:'get'});assert.equal(complete.data.jobs[0].status,'complete');
+  assert.equal(complete.data.batch.transferBudget.consumedBytes,2);assert.equal(complete.data.batch.transferBudget.outputBytes,2);
+});
+
+test('native delayed filename events from an older same-URL download cannot bind to a new submission',async t=>{
+  const h=await browser(t);const urls=imageItems(h);let accept,options,suggestion;
+  h.chrome.downloads.download=value=>{options=value;return new Promise(resolve=>{accept=resolve;});};
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>Boolean(accept),'new native submission is pending');
+  const old={id:70,url:options.url,filename:options.filename,byExtensionId:'test',startTime:new Date(Date.now()-60000).toISOString(),
+    state:'in_progress',bytesReceived:1,totalBytes:10,mime:'image/png'};
+  h.downloads.set(70,old);
+  h.determining.emit(structuredClone(old),value=>{suggestion={value};});
+  await eventually(()=>Boolean(suggestion),'unrelated older filename event is answered');
+  assert.equal(suggestion.value,undefined,'older event receives no new submission filename');
+  h.downloads.set(71,{...old,id:71,startTime:new Date().toISOString()});accept(71);
+  const saved=await saving;assert.equal(saved.data.jobs[0].downloadId,71);assert.equal(saved.data.jobs[0].acceptanceConflict,undefined);
+  assert.deepEqual(h.cancelled,[]);assert.equal(h.downloads.get(70).state,'in_progress');
+});
+
+test('native API/event ID disagreement remains conservatively unknown without replacing evidence or cancelling either candidate',async t=>{
+  const h=await browser(t);const urls=imageItems(h);let accept,eventAccepted=false;
+  h.chrome.downloads.download=options=>{
+    const item={id:80,url:options.url,filename:options.filename,byExtensionId:'test',startTime:new Date().toISOString(),
+      state:'in_progress',bytesReceived:1,totalBytes:10,mime:'image/png'};
+    h.downloads.set(80,item);h.downloads.set(81,{...item,id:81});
+    h.determining.emit(structuredClone(item),()=>{eventAccepted=true;});
+    return new Promise(resolve=>{accept=resolve;});
+  };
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>eventAccepted,'one candidate was proven by a filename event');accept(81);
+  const unknown=await saving;assert.equal(unknown.ok,true,unknown.error);
+  assert.equal(unknown.data.jobs[0].acceptanceConflict,true);assert.equal(unknown.data.jobs[0].outcomeUnknown,true);
+  assert.equal(unknown.data.jobs[0].status,'in_progress');assert.equal(unknown.data.jobs[0].submission.apiAcceptedId,81);
+  assert.equal(unknown.data.jobs[0].submission.eventAcceptedId,80);assert.equal(unknown.data.jobs[0].downloadId,undefined);
+  assert.deepEqual(h.cancelled,[]);assert.equal((await h.send({type:'retry'})).ok,false);
+});
+
+test('native API cannot reuse an ID already owned by another persisted job',async t=>{
+  const h=await browser(t);const urls=imageItems(h);
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{id:'other',workspaceTabId:200,items:[],notices:[],jobs:[{id:'other-job',url:urls[0],downloadId:82,status:'in_progress'}]});
+  h.chrome.downloads.download=async()=>82;
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  assert.equal(saved.data.jobs[0].acceptanceConflict,true);assert.equal(saved.data.jobs[0].downloadId,undefined);
+  assert.equal(h.store.get('workspace:other').jobs[0].downloadId,82);assert.deepEqual(h.cancelled,[]);
+});
+
+test('native late exact API acknowledgement preserves a matching already-confirmed completion even if further history searches fail',async t=>{
+  const h=await browser(t,{messageTimeoutMs:120000});const urls=imageItems(h);
+  t.mock.timers.enable({apis:['setTimeout']});let accept,options;
+  h.chrome.downloads.download=value=>{options=value;return new Promise(resolve=>{accept=resolve;});};
+  const saving=h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  await eventually(()=>Boolean(accept),'API reply is pending');t.mock.timers.tick(30000);await saving;
+  const pending=h.store.get('workspace:work').jobs[0].submission;
+  const item={id:83,url:options.url,filename:options.filename,byExtensionId:'test',startTime:new Date(pending.startedAt).toISOString(),
+    state:'complete',bytesReceived:3,totalBytes:3,mime:'image/png'};
+  h.downloads.set(83,item);h.created.emit(structuredClone(item));
+  await eventually(()=>h.store.get('workspace:work').jobs[0].status==='complete','event independently confirms the real completed file');
+  h.chrome.downloads.search=async()=>{throw new Error('history temporarily unavailable');};accept(83);
+  await nextTurn();await nextTurn();
+  assert.equal(h.store.get('workspace:work').jobs[0].status,'complete');assert.equal(h.store.get('workspace:work').jobs[0].chromeOutcomeKnown,true);
+  assert.equal(h.store.get('workspace:work').jobs[0].outcomeUnknown,undefined);assert.deepEqual(h.cancelled,[]);
+});
+
+test('native download ID zero participates in observation, alarms and Stop exactly like other valid IDs',async t=>{
+  const h=await browser(t,{withAlarms:true});const urls=imageItems(h);
+  h.chrome.downloads.download=async options=>{
+    h.downloads.set(0,{id:0,url:options.url,filename:options.filename,byExtensionId:'test',startTime:new Date().toISOString(),
+      state:'in_progress',bytesReceived:0,totalBytes:-1,mime:'image/png'});return 0;
+  };
+  const saved=await h.send({type:'save',urls:[urls[0]],settings:{destination:'downloads',format:'original'}});
+  assert.equal(saved.ok,true,saved.error);assert.equal(saved.data.jobs[0].downloadId,0);assert.ok(h.alarms.has('imagecrate-pending-downloads'));
+  const state=nativeLimits(h);h.downloads.get(0).bytesReceived=11;
+  const stopped=await h.send({type:'get'});assert.equal(stopped.data.jobs[0].status,'interrupted');assert.deepEqual(h.cancelled,[0]);
+  assert.equal(stopped.data.batch.transferBudget.consumedBytes,11);assert.equal(state.jobs[0].downloadId,0);
+});
+
+test('closed active native batches still occupy the four-workspace limit while inactive cleanup tombstones do not',async t=>{
+  const h=await browser(t);h.store.delete('workspace:work');
+  for(let index=0;index<4;index++)h.store.set(`workspace:busy-${index}`,{id:`busy-${index}`,closed:true,items:[],notices:[],
+    jobs:[{id:`native-${index}`,downloadId:100+index,status:'in_progress'}]});
+  await assert.rejects(h.openWorkspace({id:2,url:'https://source.test/new',title:'New'}),/4つ/);
+  assert.equal(h.tabCreates.length,0);
+  h.store.get('workspace:busy-0').jobs[0].status='complete';
+  for(let index=0;index<4;index++)h.store.set(`workspace:tombstone-${index}`,{id:`tombstone-${index}`,closed:true,items:[],notices:[],jobs:[],
+    retiredImageOwners:[{owner:`closed-${index}`,blocked:true}]});
+  const created=await h.openWorkspace({id:2,url:'https://source.test/new',title:'New'});
+  assert.ok(created);assert.equal(h.tabCreates.length,1);
+});
 
 test('converted Chrome output lease is handed off and retained through missing history until positive native terminal',async t=>{
   const h=await browser(t,{withAlarms:true});const urls=imageItems(h);
@@ -1431,27 +1844,24 @@ function pendingSubmission(h,age = 0) {
   return {url,filename,startedAt};
 }
 function acceptedSubmission(source,id,patch = {}) {
-  return {id,url:source.url,filename:`/Downloads/${source.filename.replace(/\.img$/,'.png')}`,byExtensionId:'test',startTime:new Date(source.startedAt+1).toISOString(),state:'in_progress',mime:'image/png',bytesReceived:1,totalBytes:10,...patch};
+  return {id,url:source.url,filename:`/Downloads/${source.filename.replace(/\.img$/,'.png')}`,byExtensionId:'test',startTime:new Date(Math.min(source.startedAt+1,Date.now())).toISOString(),state:'in_progress',mime:'image/png',bytesReceived:1,totalBytes:10,...patch};
 }
 
-test('a worker stopped before Chrome acceptance recovers an expired submission as interrupted and permits explicit retry',async t=>{
+test('legacy expired native acceptance remains unknown after restart and cannot authorize a duplicate retry',async t=>{
   const h=await browser(t);const source=pendingSubmission(h,60000);
   await h.restartWorker();
   const restored=await h.send({type:'get'});
   assert.equal(restored.ok,true,restored.error);
-  assert.equal(restored.data.jobs[0].status,'interrupted');
-  assert.match(restored.data.jobs[0].error,/保存結果を確認できませんでした/);
-  assert.equal(restored.data.jobs[0].submission,undefined);
+  assert.equal(restored.data.jobs[0].status,'in_progress');
+  assert.equal(restored.data.jobs[0].outcomeUnknown,true);
+  assert.ok(restored.data.jobs[0].submission);
   assert.deepEqual(restored.data.selectedURLs,[source.url]);
   assert.deepEqual(h.requested,[],'uncertain acceptance never starts another download automatically');
   const retry=await h.send({type:'retry'});
-  assert.equal(retry.ok,true,retry.error);
-  assert.equal(h.requested.length,1);
-  assert.equal(h.requested[0].url,source.url);
-  assert.equal(h.requested[0].conflictAction,'uniquify','a delayed old file or an existing completed file is never overwritten');
+  assert.equal(retry.ok,false);assert.equal(h.requested.length,0);
 });
 
-test('cancel waits for recent unresolved acceptance but recovers it after the bounded reconciliation period',async t=>{
+test('native cancel preserves unknown acceptance beyond the reconciliation deadline instead of claiming it absent',async t=>{
   const h=await browser(t);pendingSubmission(h);
   const waiting=await h.send({type:'cancel'});
   assert.equal(waiting.ok,true,waiting.error);
@@ -1459,8 +1869,8 @@ test('cancel waits for recent unresolved acceptance but recovers it after the bo
   assert.match(waiting.data.jobs[0].error,/30秒/);
   const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
   const expired=await h.send({type:'cancel'});
-  assert.equal(expired.data.jobs[0].status,'interrupted');
-  assert.match(expired.data.jobs[0].error,/保存結果を確認できませんでした/);
+  assert.equal(expired.data.jobs[0].status,'in_progress');assert.equal(expired.data.jobs[0].outcomeUnknown,true);
+  assert.ok(expired.data.jobs[0].submission);
   assert.deepEqual(h.cancelled,[]);
 });
 
@@ -1480,7 +1890,7 @@ test('submission recovery requires unique owned URL, start time and frozen path,
   assert.deepEqual(h.requested,[]);
 });
 
-test('ambiguous submission candidates stay unresolved until the deadline and no existing download is cancelled',async t=>{
+test('ambiguous native submission candidates stay unresolved after the deadline and no existing download is cancelled',async t=>{
   const h=await browser(t);const source=pendingSubmission(h);
   h.downloads.set(31,acceptedSubmission(source,31));
   h.downloads.set(32,acceptedSubmission(source,32,{filename:'/Downloads/ImageCrate/Frozen/001_pending (1).png'}));
@@ -1489,8 +1899,7 @@ test('ambiguous submission candidates stay unresolved until the deadline and no 
   assert.equal(unresolved.data.jobs[0].status,'in_progress');
   const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt-=31000;h.store.set('workspace:work',state);
   const expired=await h.send({type:'get'});
-  assert.equal(expired.data.jobs[0].status,'interrupted');
-  assert.match(expired.data.jobs[0].error,/保存結果を確認できませんでした/);
+  assert.equal(expired.data.jobs[0].status,'in_progress');assert.equal(expired.data.jobs[0].outcomeUnknown,true);
   assert.deepEqual(h.cancelled,[]);
   assert.equal(h.downloads.get(31).state,'in_progress');
   assert.equal(h.downloads.get(32).state,'in_progress');
@@ -1597,21 +2006,21 @@ test('an alarm reconciles a closed pending submission without UI polling and unr
   assert.equal(h.alarmCreates.length,1,'existing alarms keep their original wake-up time through all state writes');
   const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
   h.alarmEvent.emit({name:alarm.name});
-  await eventually(()=>!h.store.has('workspace:work'),'the alarm expires and removes the closed unresolved session');
-  await eventually(()=>!h.alarms.has(alarm.name),'the last pending submission clears its recovery alarm');
+  await eventually(()=>h.store.get('workspace:work').jobs[0].outcomeUnknown===true,'the alarm records unknown acceptance without discarding evidence');
+  assert.ok(h.alarms.has(alarm.name),'unconfirmed native acceptance keeps its recovery alarm');
   assert.deepEqual(h.requested,[]);
   assert.deepEqual(h.cancelled,[]);
 });
 
-test('worker startup recreates a missing pending alarm and expires a closed submission without a UI message',async t=>{
+test('worker startup keeps a closed unknown native submission and its alarm without authorizing a resend',async t=>{
   const h=await browser(t,{withAlarms:true});pendingSubmission(h);
   await h.restartWorker();
   await eventually(()=>h.alarms.size === 1,'startup schedules the pending reconciliation even without get/polling');
   const state=h.store.get('workspace:work');state.closed=true;state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
   h.tabs.delete(100);
   await h.restartWorker();
-  await eventually(()=>!h.store.has('workspace:work'),'startup reconciles the expired closed submission');
-  await eventually(()=>h.alarms.size === 0,'startup removes a no-longer-needed alarm');
+  await eventually(()=>h.store.get('workspace:work').jobs[0].outcomeUnknown===true,'startup preserves the expired closed submission as unknown');
+  assert.equal(h.alarms.size,1,'unknown acceptance remains recoverable');
   assert.deepEqual(h.requested,[]);
 });
 
@@ -1635,7 +2044,7 @@ test('onChanged for an unknown download ID wakes pending sessions after their po
   await eventually(()=>h.store.get('workspace:work')?.closed,'the original page no longer polls');
   const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
   h.changed.emit({id:999,filename:{current:'unrelated-file.png'}});
-  await eventually(()=>!h.store.has('workspace:work'),'even an unknown ID causes the persisted pending submission to be reconciled');
+  await eventually(()=>h.store.get('workspace:work').jobs[0].outcomeUnknown===true,'an unrelated event reconciles the pending submission without deleting unknown evidence');
   assert.deepEqual(h.requested,[]);
   assert.deepEqual(h.cancelled,[]);
 });
@@ -1668,7 +2077,7 @@ test('a delayed filename decision preserves the completed Chrome absolute actual
   assert.deepEqual(calls,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
 });
 
-test('Stop persists cancellation before a late accepted ID is found, cancels progress and retry clears the intent',async t=>{
+test('legacy Stop cancels a late accepted ID but unversioned retry requires a new explicit batch',async t=>{
   const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
   const stopped=await h.send({type:'cancel'});
   assert.equal(stopped.ok,true,stopped.error);
@@ -1688,10 +2097,7 @@ test('Stop persists cancellation before a late accepted ID is found, cancels pro
   assert.equal(h.downloads.get(91).state,'interrupted');
   assert.deepEqual(h.store.get('workspace:work').selectedURLs,[source.url]);
   const retried=await h.send({type:'retry'});
-  assert.equal(retried.ok,true,retried.error);
-  assert.equal(retried.data.jobs[0].cancelRequested,undefined);
-  assert.equal(retried.data.jobs[0].cancelReason,undefined);
-  assert.equal(retried.data.jobs[0].status,'in_progress');
+  assert.equal(retried.ok,false);assert.equal(h.requested.length,0);
 });
 
 test('Stop preserves a late accepted file that Chrome has already completed',async t=>{

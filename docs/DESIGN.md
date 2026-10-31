@@ -1,5 +1,13 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## Chrome自身が取得する保存の監視 — 2026-10-31
+
+「元の形式＋Chromeのダウンロード先」はChromeによる直接保存を維持する。開始前にbatch入力・出力各512MiB/15分と論理job3試行の予約を保存し、所有するdownload IDだけをUI照会・downloadイベント・worker起動・1分alarmで観測する。観測した受信量・出力量はhigh-waterで累積し、128MiB/件・120秒・30秒無進捗、batch上限に達したら取消意図を保存してChromeへ取消を要求する。既知の総容量は早期取消の根拠にするが受信済みbyteとは数えない。時計が戻れば同batchを安全側に停止する。
+
+download受付APIの応答は30秒で区切り、未応答でもworker全体の変更queueを無期限に塞がない。未確定の受付はjob/tokenとURL・開始時刻・要求path・他jobの使用IDを照合し、期限だけで未保存と決めたり再送したりしない。正のAPI応答が遅れても同じ試行へ引き継ぎ、Chromeの確定済み完了を降格させない。API/eventのID不整合では他のdownloadを取り消さず、結果不明として保持する。ID 0も所有するIDとして監視する。旧版の予算がないqueued/retryは新しい保存を案内し、受理済みIDの監視は続ける。
+
+閉鎖後も活動中のbatchは4作業枠へ数え、閉鎖による同時保存の増殖を防ぐ。後片付けだけを待つinactive tombstoneは別扱いにする。取消と完了が競合した場合は実Chrome結果を正本とし、完了済みファイルを自動削除しない。Chrome/OS停止中、alarm遅延、内部retryや圧縮などにより、native経路の書込前byte上限・厳密なwire量・120秒以内の取消完了は保証しない。
+
 ## 配信元ごとのプレビュー同意 — 2026-10-31
 
 workspaceを開いただけでは遠隔画像のfetch・Image読込を開始しない。各カード/viewerにscheme・host・portと全path/portへの許可範囲、ログイン状態を使う取得であることを表示する。実click内で具体hostだけのChrome任意許可を要求し、workspace固有の同意も記録する。既存のChrome許可だけで新workspaceのプレビューを始めない。data画像も明示的なローカル同意を必要とする。拒否・未対応・容量超過ではplaceholderを表示し、通常の選択・元形式Chrome保存は利用できる。

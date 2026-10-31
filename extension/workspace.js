@@ -12,6 +12,7 @@ const sessionId = new URL(location.href).searchParams.get('id');
 const instance = crypto.randomUUID();
 const resourceOwner=`${sessionId}:${instance}:conversion`;
 const previewOwner=`${sessionId}:${instance}:preview`;
+const hasDownloadId=job=>Number.isSafeInteger(job?.downloadId)&&job.downloadId>=0;
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
 let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
@@ -74,7 +75,7 @@ function jobLabel(job) {
   if (job.status === 'complete') return `保存完了${job.typeKnown===false?' · 形式不明':''}${job.actualFilename?' · '+job.actualFilename.split(/[\\/]/).pop():''}`;
   if (job.status === 'interrupted') return `中断 · ${job.error || '再試行できます'}`;
   if (job.status === 'queued') return '順番待ち';
-  if(state.batch?.format && state.batch.format !== 'original' && !job.downloadId) return `変換・保存中 · ${formatBytes(job.bytesReceived)}`;
+  if(state.batch?.format && state.batch.format !== 'original' && !hasDownloadId(job)) return `変換・保存中 · ${formatBytes(job.bytesReceived)}`;
   return `保存中 · ${formatBytes(job.bytesReceived)}${job.totalBytes > 0 ? ' / '+formatBytes(job.totalBytes) : ''}`;
 }
 function statusElement(item) { const span = element('span','item-status',jobLabel(jobFor(item.url))); span.dataset.url=item.url;span.dataset.state=jobFor(item.url)?.status || '';  return span; }
@@ -82,7 +83,7 @@ function applyState(next) {
   if(state && (next.revision || 0) < (state.revision || 0)) return;
   const selectionBefore=[...selected].join('\n');
   state=next;if(!pendingSelections)selected=new Set(state.selectedURLs || []);
-  for(const job of state.jobs) if(['complete','interrupted'].includes(job.status) && (!job.downloadId || job.chromeOutcomeKnown) && !job.outcomeUnknown && convertedURLs.has(job.id)) {
+  for(const job of state.jobs) if(['complete','interrupted'].includes(job.status) && (!hasDownloadId(job) || job.chromeOutcomeKnown) && !job.outcomeUnknown && convertedURLs.has(job.id)) {
     releaseConverted(job.id);
   }
   updateSummary();
@@ -325,8 +326,8 @@ async function reconnectDirectory() {
 }
 async function interruptManagedJobs(reason) {
   // Downloads already handed to Chrome must settle there before a retry.
-  if(state.jobs.some(j=>(j.downloadId || j.submission) && j.status === 'in_progress')) await managedState('cancel');
-  const updates=state.jobs.filter(j=>['queued','in_progress'].includes(j.status) && !j.downloadId && !j.submission).map(j=>({id:j.id,status:'interrupted',error:reason}));
+  if(state.jobs.some(j=>(hasDownloadId(j) || j.submission) && j.status === 'in_progress')) await managedState('cancel');
+  const updates=state.jobs.filter(j=>['queued','in_progress'].includes(j.status) && !hasDownloadId(j) && !j.submission).map(j=>({id:j.id,status:'interrupted',error:reason}));
   if(updates.length) await managedState('managed-update',{batchId:state.batch.id,updates});
 }
 async function managedState(type,extra={},operation) {
@@ -409,7 +410,7 @@ async function runManagedBatch(handle) {
               let recovered=false;
               try {await managedState('get');recovered=true;} catch {}
               const current=state.jobs.find(j=>j.id===job.id);
-              if(recovered && !current?.downloadId && !current?.submission)releaseConverted(job.id);
+              if(recovered && !hasDownloadId(current) && !current?.submission)releaseConverted(job.id);
               throw e;
             }
             while(state.jobs.find(j=>j.id === job.id)?.status === 'in_progress') {
@@ -437,10 +438,10 @@ async function runManagedBatch(handle) {
         if(reserved){
           await updates;
           const current=state.jobs.find(j=>j.id===job.id);
-          await managedState('managed-settle',{batchId,jobId:job.id,bytesReceived:sourceBytes,outcome:uncertain||(current?.downloadId||current?.submission)&&current.status==='in_progress'?'unknown':'interrupted'});
+          await managedState('managed-settle',{batchId,jobId:job.id,bytesReceived:sourceBytes,outcome:uncertain||(hasDownloadId(current)||current?.submission)&&current.status==='in_progress'?'unknown':'interrupted'});
         }
         const current=state.jobs.find(j=>j.id===job.id);
-        if(current?.status==='in_progress' && (current.downloadId || current.submission))controller.abort();
+        if(current?.status==='in_progress' && (hasDownloadId(current) || current.submission))controller.abort();
         else await report({id:job.id,status:'interrupted',error:reason});
       } finally {
         operation?.dispose();
