@@ -1,4 +1,5 @@
-import {fileLabel, extensionOf, matchesImage} from './utils.js';
+import {fileLabel, extensionOf, matchesImage, publicError} from './utils.js';
+import {previewHost} from './preview-loader.js';
 
 const $=id=>document.getElementById(id);
 const node=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;};
@@ -20,21 +21,27 @@ export function representativeCandidates(items) {
 }
 
 export class Gallery {
-  constructor({getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status}) {
-    Object.assign(this,{getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status});
+  constructor({getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status,previews}) {
+    Object.assign(this,{getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status,previews});
     this.visible=[];this.measured=new Map();this.mode='all';this.lastURL='';this.viewerURLs=[];this.viewerIndex=0;
+    this.previewBindings=new Set();
+    this.previewObserver=typeof IntersectionObserver==='function'?new IntersectionObserver(entries=>{
+      for(const entry of entries){const binding=[...this.previewBindings].find(value=>value.container===entry.target);if(!binding)continue;
+        binding.visible=entry.isIntersecting;if(binding.visible)this.loadPreview(binding);else this.cancelPreview(binding);
+      }
+    },{rootMargin:'160px'}):null;
     $('view-all').addEventListener('click',()=>this.setMode('all'));
     $('view-selected').addEventListener('click',()=>this.setMode('selected'));
     $('view-added').addEventListener('click',()=>this.setMode('added'));
     $('selection').addEventListener('click',()=>this.setMode('selected'));
     $('measure-refresh').addEventListener('click',()=>this.render());
     $('preview-close').addEventListener('click',()=>$('image-preview').close());
-    $('image-preview').addEventListener('close',()=>this.restoreViewerFocus());
+    $('image-preview').addEventListener('close',()=>{this.clearPreviews('viewer');$('preview-stage').replaceChildren();this.restoreViewerFocus();});
     $('preview-prev').addEventListener('click',()=>this.showViewer(this.viewerURLs[this.viewerIndex-1]));
     $('preview-next').addEventListener('click',()=>this.showViewer(this.viewerURLs[this.viewerIndex+1]));
     $('preview-zoom').addEventListener('click',()=>{
       const actual=$('preview-stage').classList.toggle('actual-size');
-      $('preview-zoom').textContent=actual?'全体を表示':'100%で表示';$('preview-zoom').setAttribute('aria-pressed',String(actual));
+      $('preview-zoom').textContent=actual?'全体を表示':'プレビューを等倍で表示';$('preview-zoom').setAttribute('aria-pressed',String(actual));
     });
     $('preview-select').addEventListener('change',()=>this.select(this.viewerURL,$('preview-select').checked));
     $('image-preview').addEventListener('keydown',event=>{
@@ -59,14 +66,80 @@ export class Gallery {
   effective(item) {return this.measured.has(item.url)?{...item,...this.measured.get(item.url),dimensionSource:'decoded'}:item;}
   dimensions(item) {return item.dimensionSource==='decoded'||item.dimensionSource==='measured'?`${item.width} × ${item.height}`:'寸法未確認';}
   measure(url,image) {
-    if(!image.naturalWidth || !image.naturalHeight)return;
-    const value={width:image.naturalWidth,height:image.naturalHeight};
+    this.measureSource(url,image.naturalWidth,image.naturalHeight);
+  }
+  measureSource(url,width,height) {
+    if(!width || !height)return;
+    const value={width,height};
     if(JSON.stringify(this.measured.get(url))===JSON.stringify(value))return;
     this.measured.set(url,value);this.onMeasure({url,...value});
     for(const meta of document.querySelectorAll('[data-dimensions]'))if(meta.dataset.dimensions===url)meta.textContent=`${value.width} × ${value.height}`;
     if(Number($('width').value)||Number($('height').value))$('measure-refresh').hidden=false;
     const item=this.item(url);
     if(this.viewerURL===url&&item)$('preview-meta').textContent=this.description(this.effective(item));
+  }
+  cancelPreview(binding){
+    binding.generation++;binding.controller?.abort();binding.controller=null;binding.pending=false;
+    binding.handle?.release();binding.handle=null;
+    binding.container.replaceChildren(node('span','preview-error','プレビューは読み込まれていません'));
+    if(binding.button)binding.button.hidden=false;
+  }
+  clearPreviews(kind){
+    for(const binding of [...this.previewBindings])if(!kind || binding.kind===kind){
+      this.cancelPreview(binding);this.previewObserver?.unobserve(binding.container);this.previewBindings.delete(binding);
+    }
+  }
+  refreshPreviews(){
+    for(const binding of this.previewBindings){this.cancelPreview(binding);if(binding.visible)this.loadPreview(binding);}
+  }
+  suspendPreviews(){this.clearPreviews();this.previews?.invalidate();}
+  bindPreview(item,container,kind,button){
+    let host;try{host=previewHost(item.url);}catch{}
+    const binding={item,container,kind,button,host,visible:kind==='viewer'||!this.previewObserver,generation:0,pending:false,handle:null,controller:null};
+    this.previewBindings.add(binding);container.replaceChildren(node('span','preview-error','配信元を確認してプレビューを読み込めます'));
+    if(button){
+      button.replaceChildren(node('span','',host?.isEmbedded?'埋め込み画像のプレビューを読み込む':host?`${host.label} のプレビューを許可`:'この画像はプレビューできません'));
+      if(host&&!host.isEmbedded)button.append(node('small','preview-scope','この配信元の全パス・全ポートが対象です。サイトのログイン状態を使って画像を取得します。'));
+      button.title=host?.isEmbedded?'ページに埋め込まれた画像を読み込みます。':host?`${host.label} の画像を取得します。サイトの許可は同じホストの全パス・ポートに適用されます。`:'この画像は安全にプレビューできません';
+      button.disabled=!host || !this.previews;
+      button.onclick=event=>{
+        event.preventDefault();event.stopPropagation();
+        // permissions.request must run in this real click, before any await.
+        const permission=this.previews?.grantHost(item.url);
+        if(document.activeElement===button){
+          const target=kind==='viewer'?(!$('preview-select').disabled?$('preview-select'):$('preview-close'))
+            :button.closest('.card')?.querySelector('.image-select:not(:disabled), .preview-open:not(:disabled)')||$('gallery-heading');
+          target.focus({preventScroll:true});
+        }
+        button.disabled=true;
+        Promise.resolve(permission).then(allowed=>{
+          if(!allowed){container.replaceChildren(node('span','preview-error','プレビューは許可されませんでした。選択と元形式の保存はできます。'));return;}
+          for(const candidate of this.previewBindings)if(candidate.host?.key===host?.key && candidate.visible){this.cancelPreview(candidate);this.loadPreview(candidate);}
+        },()=>{container.replaceChildren(node('span','preview-error','プレビューを許可できませんでした。選択と元形式の保存はできます。'));})
+          .finally(()=>{button.disabled=false;});
+      };
+    }
+    if(this.previewObserver && kind==='thumbnail')this.previewObserver.observe(container);
+    else this.loadPreview(binding);
+  }
+  loadPreview(binding){
+    if(!this.previews || !binding.host || !binding.visible || binding.pending || binding.handle)return;
+    const generation=++binding.generation,controller=new AbortController();binding.controller=controller;binding.pending=true;
+    this.previews.load(binding.item.url,{kind:binding.kind,signal:controller.signal}).then(handle=>{
+      if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding) || binding.container.isConnected===false){handle.release();return;}
+      binding.handle=handle;
+      const image=new Image();image.alt=binding.kind==='viewer'?((binding.item.alt||'').trim()||fileLabel(binding.item.url)):'';
+      image.referrerPolicy='no-referrer';
+      image.onerror=()=>{if(binding.handle===handle){handle.release();binding.handle=null;binding.container.replaceChildren(node('span','preview-error','プレビューを表示できません。元形式の保存はできます。'));if(binding.button)binding.button.hidden=false;}};
+      image.src=handle.url;binding.container.replaceChildren(image);if(binding.button)binding.button.hidden=true;
+      // The generated static image may be resized. Persist validated source
+      // dimensions, never the thumbnail's naturalWidth/naturalHeight.
+      this.measureSource(binding.item.url,handle.width,handle.height);
+    },error=>{
+      if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding))return;
+      binding.container.replaceChildren(node('span','preview-error',publicError(error)));
+      if(binding.button)binding.button.hidden=false;
+    }).finally(()=>{if(generation===binding.generation)binding.pending=false;});
   }
   item(url) {return candidateCatalog(this.getState()).find(i=>i.url===url);}
   description(item) {
@@ -106,12 +179,14 @@ export class Gallery {
     } else this.restoreFocus(this.returnURL,'preview',this.returnIndex);
   }
   render() {
+    this.clearPreviews('thumbnail');
     const state=this.getState(),selected=this.getSelected(),active=document.activeElement;
     const oldCard=active?.closest('#grid .card'),oldURL=oldCard?.dataset.url,oldRole=active?.dataset.galleryRole;
     const oldIndex=this.visible.findIndex(item=>item.url===oldURL);
     const filters={query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value};
     const all=candidateCatalog(state).map(i=>this.effective(i));
     const retained=new Set(all.map(item=>item.url));
+    if(this.viewerURL&&!retained.has(this.viewerURL)){$('image-preview').close();this.clearPreviews('viewer');this.viewerURL=null;}
     for(const url of this.measured.keys())if(!retained.has(url))this.measured.delete(url);
     const page=(state.items || []).map(i=>this.effective(i));
     const candidates=this.mode==='selected'?all.filter(i=>selected.has(i.url)):
@@ -139,9 +214,6 @@ export class Gallery {
       input.setAttribute('aria-describedby',`image-meta-${index} image-status-${index}`);
       input.addEventListener('focus',()=>{this.lastURL=item.url;});
       input.addEventListener('change',()=>this.select(item.url,input.checked));
-      const image=new Image();image.loading='lazy';image.alt='';image.referrerPolicy='no-referrer';
-      image.onload=()=>this.measure(item.url,image);
-      image.onerror=()=>{thumb.replaceChildren(node('span','preview-error','プレビューなし'));};image.src=item.url;thumb.append(image);
       const body=node('div','card-body'),name=node('strong','file-name',fileLabel(item.url));name.title=name.textContent;
       const meta=node('span','meta');meta.id=`image-meta-${index}`;
       const dims=node('span','',this.dimensions(item));dims.dataset.dimensions=item.url;
@@ -157,7 +229,10 @@ export class Gallery {
       const preview=node('button','preview-open',variants.length>1?`確認・他${variants.length-1}候補`:'大きく確認');preview.type='button';
       preview.dataset.galleryRole='preview';preview.addEventListener('focus',()=>{this.lastURL=item.url;});
       preview.onclick=()=>this.openViewer(item.url,preview);
-      card.append(label,jump,preview);$('grid').append(card);
+      const permission=node('button','preview-permission');permission.type='button';permission.dataset.galleryRole='permission';
+      permission.addEventListener('focus',()=>{this.lastURL=item.url;});
+      card.append(label,permission,jump,preview);$('grid').append(card);
+      this.bindPreview(item,thumb,'thumbnail',permission);
     }
     $('empty').hidden=!!this.visible.length;$('empty').replaceChildren();
     if(!this.visible.length) {
@@ -176,7 +251,7 @@ export class Gallery {
     this.returnIndex=this.viewerURLs.indexOf(url);
     this.returnTarget=origin?.matches('.preview-open')?origin:null;
     if(!this.viewerURLs.includes(url))this.viewerURLs.push(url);
-    $('preview-stage').classList.remove('actual-size');$('preview-zoom').textContent='100%で表示';$('preview-zoom').setAttribute('aria-pressed','false');
+    $('preview-stage').classList.remove('actual-size');$('preview-zoom').textContent='プレビューを等倍で表示';$('preview-zoom').setAttribute('aria-pressed','false');
     this.showViewer(url);$('image-preview').showModal();
   }
   showViewer(url) {
@@ -188,10 +263,9 @@ export class Gallery {
     $('preview-meta').textContent=this.description(item);
     $('preview-select').checked=this.getSelected().has(url);
     $('preview-prev').disabled=this.viewerIndex<=0;$('preview-next').disabled=this.viewerIndex>=this.viewerURLs.length-1;
-    const image=new Image();image.alt=(item.alt||'').trim()||fileLabel(url);image.referrerPolicy='no-referrer';
-    image.onload=()=>{if(this.viewerURL===url)this.measure(url,image);};
-    image.onerror=()=>{if(this.viewerURL===url)$('preview-stage').replaceChildren(node('p','preview-error','画像を表示できません。選択と保存は引き続き試せます。'));};
-    image.src=url;$('preview-stage').replaceChildren(image);
+    this.clearPreviews('viewer');
+    const stage=node('div','viewer-image'),permission=node('button','secondary preview-permission');permission.type='button';
+    $('preview-stage').replaceChildren(stage,permission);this.bindPreview(item,stage,'viewer',permission);
     $('preview-variants').replaceChildren();
     const alternatives=candidateCatalog(this.getState()).filter(i=>item.groupId&&i.groupId===item.groupId);
     if(alternatives.length>1)for(const variant of alternatives) {

@@ -4,12 +4,14 @@ import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
 import { createMediaOperation } from './media-reader.js';
+import { createPreviewController } from './preview-loader.js';
 
 const KIND = 'images';
 const $ = id => document.getElementById(id);
 const sessionId = new URL(location.href).searchParams.get('id');
 const instance = crypto.randomUUID();
 const resourceOwner=`${sessionId}:${instance}:conversion`;
+const previewOwner=`${sessionId}:${instance}:preview`;
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
 let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
@@ -98,13 +100,18 @@ function persistUI(patch) {
   });
   uiWrites=task;return task;
 }
-const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,
+const previews=createPreviewController({ownerId:previewOwner,onInvalidate:()=>gallery.refreshPreviews()});
+const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,previews,
   onSelect:urls=>persistUI({selectedURLs:urls}),onView:patch=>persistUI(patch).catch(error),onError:error,
   onRender:items=>{visible=items;updateSummary();},
   onMeasure:update=>{measureUpdates.set(update.url,update);clearTimeout(measureTimer);measureTimer=setTimeout(()=> {
     const updates=[...measureUpdates.values()];measureUpdates.clear();
     send('dimensions',{updates}).then(next=>{applyState(next);}).catch(error);
   },250);},status:url=>jobLabel(jobFor(url))});
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)gallery.suspendPreviews();else if(state){gallery.render();if($('image-preview').open&&gallery.viewerURL)gallery.showViewer(gallery.viewerURL);}
+});
+window.addEventListener('pagehide',()=>{gallery.suspendPreviews();void previews.dispose().catch(()=>{});});
 function updateSummary() {
   if(!state) return;
   const batch=summarizeJobs(state.jobs), busy=isBusy();

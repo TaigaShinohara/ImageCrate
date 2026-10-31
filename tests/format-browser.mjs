@@ -23,6 +23,26 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
   const original=await readState();
   const originalLocal=await manager.evaluate(()=>chrome.storage.local.get(null));
   const originalViewport=manager.viewportSize();
+  const noTransientResources=async()=>{
+    await manager.waitForFunction(async id=>{
+      const key='imagecrate.imageResources.v1',ledger=(await chrome.storage.session.get(key))[key]||{};
+      return Object.values(ledger).filter(entry=>entry.owner.startsWith(id+':')).every(entry=>!(entry.encodedBytes||entry.pixels||entry.fetches));
+    },original.id);
+  };
+  const convert=async(url,format)=>manager.evaluate(async({url,format})=>{
+    const {convertImage}=await import('./image-converter.js'),{imageResourceCoordinator}=await import('./image-decoder.js');
+    const coordinator=imageResourceCoordinator(),ownerId='qa-format-direct:'+crypto.randomUUID();
+    const blob=await convertImage(url,format,{ownerId});
+    try{
+      if(typeof blob.releaseResources!=='function')throw new Error('Converted Blob has no owned-output release hook.');
+      const held=Object.values(await coordinator.snapshot()).filter(entry=>entry.owner===ownerId);
+      if(held.reduce((sum,entry)=>sum+(entry.encodedBytes||0),0)!==blob.size||held.some(entry=>entry.pixels||entry.fetches))throw new Error('Converted output is not the sole retained direct-converter resource.');
+      return {type:blob.type,bytes:[...new Uint8Array(await blob.arrayBuffer())]};
+    }finally{
+      await blob.releaseResources?.();
+      if(Object.values(await coordinator.snapshot()).some(entry=>entry.owner===ownerId))throw new Error('Direct conversion retained a resource reservation after output release.');
+    }
+  },{url,format});
   const backupPrefix=`qa:format:${original.id}:`;
   const directoryName='ImageCrate形式検証';
   // Startup prunes stale batch handles. Keep backups under non-session keys so
@@ -66,6 +86,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     const state=await poll(state=>state.batch?.id!==previous && state.jobs.length===1 && state.jobs[0].status===status);
     if(status==='complete')await manager.waitForFunction(()=>document.querySelector('#selection').textContent==='選択0件');
     else assert.equal(await manager.locator('.image-select:checked').count(),1,'a failed conversion keeps its image selected');
+    await noTransientResources();
     return state;
   };
   const directoryFiles=folder=>manager.evaluate(async({name,folder})=>{
@@ -89,12 +110,31 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     const fixtures=await manager.evaluate(()=>{
       const canvas=document.createElement('canvas');canvas.width=16;canvas.height=12;
       const context=canvas.getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,6,12);
-      // PNG permits trailing data after IEND. A same-format conversion must
-      // actually re-encode, rather than silently copying these source bytes.
+      // Put the sentinel inside a valid metadata segment/chunk. Trailing
+      // container bytes are deliberately rejected by the source preflight.
+      const marker=new TextEncoder().encode('SOURCE_METADATA_SENTINEL');
+      const join=(...parts)=>Uint8Array.from(parts.flatMap(part=>[...part]));
+      const be32=value=>[value>>>24,value>>>16,value>>>8,value];
+      const le32=value=>[value,value>>>8,value>>>16,value>>>24];
+      const text=value=>new TextEncoder().encode(value);
+      const pngChunk=(type,data)=>{
+        const body=join(text(type),data);let crc=0xffffffff;
+        for(const byte of body){crc^=byte;for(let bit=0;bit<8;bit++)crc=crc&1?(crc>>>1)^0xedb88320:crc>>>1;}
+        return join(be32(data.length),body,be32((crc^0xffffffff)>>>0));
+      };
       const taggedURL=type=>{
-        const source=Uint8Array.from(atob(canvas.toDataURL(type).split(',')[1]),character=>character.charCodeAt(0));
-        const marker=new TextEncoder().encode('SOURCE_METADATA_SENTINEL');
-        const tagged=new Uint8Array(source.length+marker.length);tagged.set(source);tagged.set(marker,source.length);
+        const source=Uint8Array.from(atob(canvas.toDataURL(type).split(',')[1]),character=>character.charCodeAt(0));let tagged;
+        if(type==='image/png'){
+          const metadata=pngChunk('tEXt',join(text('Comment\0'),marker));tagged=join(source.slice(0,-12),metadata,source.slice(-12));
+        }else if(type==='image/jpeg'){
+          const length=marker.length+2;tagged=join(source.slice(0,2),[255,239,length>>>8,length&255],marker,source.slice(2));
+        }else{
+          const xmp=text('<x:xmpmeta xmlns:x="adobe:ns:meta/">SOURCE_METADATA_SENTINEL</x:xmpmeta>');
+          const chunk=join(text('XMP '),le32(xmp.length),xmp,xmp.length&1?[0]:[]);let body=source.slice(12);
+          if(String.fromCharCode(...body.slice(0,4))==='VP8X'){body=body.slice();body[8]|=4;}
+          else body=join(text('VP8X'),le32(10),[0x14,0,0,0,15,0,0,11,0,0],body);
+          body=join(text('WEBP'),body,chunk);tagged=join(text('RIFF'),le32(body.length),body);
+        }
         return `data:${type};base64,${btoa(String.fromCharCode(...tagged))}`;
       };
       const png=taggedURL('image/png'),jpg=taggedURL('image/jpeg'),webp=taggedURL('image/webp');
@@ -104,14 +144,21 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
         33,255,11,...new TextEncoder().encode('NETSCAPE2.0'),3,1,0,0,0,
         33,249,4,0,10,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,68,1,0,
         33,249,4,0,10,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,76,1,0,59];
-      return {png,jpg,webp,svg,gif:`data:image/gif;base64,${btoa(String.fromCharCode(...gifBytes))}`,gifBytes,broken:'data:image/png;base64,bm90LWFuLWltYWdl'};
+      // A bounded AVIF-signature container is intentionally unsupported by
+      // the allocation preflight; original-mode preservation is byte based.
+      const avifBytes=[0,0,0,24,...text('ftypavif'),0,0,0,0,...text('mif1avif')];
+      const generalSVGText='<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12"><g><rect width="6" height="12" fill="red"/></g></svg>';
+      const generalSVG='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(generalSVGText);
+      return {png,jpg,webp,svg,generalSVG,generalSVGText,avif:`data:image/avif;base64,${btoa(String.fromCharCode(...avifBytes))}`,avifBytes,gif:`data:image/gif;base64,${btoa(String.fromCharCode(...gifBytes))}`,gifBytes,broken:'data:image/png;base64,bm90LWFuLWltYWdl'};
     });
     const items=[
       {url:fixtures.png,width:16,height:12,type:'image',alt:'format-png'},
       {url:fixtures.svg,width:16,height:12,type:'image',alt:'format-svg'},
       {url:fixtures.gif,width:1,height:1,type:'image',alt:'format-animated-gif'},
       {url:fixtures.broken,width:0,height:0,type:'image',alt:'format-broken'},
-      {url:origin+'/red.svg',width:400,height:300,type:'image',alt:'format-permission'}
+      {url:origin+'/red.svg',width:400,height:300,type:'image',alt:'format-permission'},
+      {url:fixtures.avif,width:0,height:0,type:'image',alt:'format-unsupported-avif-container'},
+      {url:fixtures.generalSVG,width:0,height:0,type:'image',alt:'format-unsupported-general-svg'}
     ];
     await worker.evaluate(async({key,state,items})=>chrome.storage.session.set({[key]:{
       ...state,items,jobs:[],history:[],batch:null,notices:[],scanned:true,
@@ -119,6 +166,17 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     }}),{key,state:original,items});
     await reload();
     assert.equal(await manager.locator('.image-select:checked').count(),0,'format fixtures start unselected');
+    assert.equal(await manager.locator('.thumb img').count(),0,'reloaded format workspace requires fresh app preview consent');
+    await manager.locator('.card .preview-permission:visible').first().click();
+    await manager.waitForFunction(()=>{const image=document.querySelector('.card .thumb img');return image?.complete&&image.naturalWidth===16&&image.src.startsWith('blob:');});
+    const unsupported=manager.locator('.card').nth(5);await unsupported.scrollIntoViewIfNeeded();
+    await manager.waitForFunction(()=>{const card=document.querySelectorAll('.card')[5];return /未知|未対応/.test(card?.querySelector('.preview-error')?.textContent||'');});
+    assert.equal(await unsupported.locator('img').count(),0,'unsupported AVIF container stays a placeholder after explicit preview consent');
+    const generalSVGCard=manager.locator('.card').nth(6);await generalSVGCard.scrollIntoViewIfNeeded();
+    await manager.waitForFunction(()=>{const card=document.querySelectorAll('.card')[6];return /未対応/.test(card?.querySelector('.preview-error')?.textContent||'');});
+    assert.equal(await generalSVGCard.locator('img').count(),0,'general SVG outside the bounded rectangle language is never sent to an image element');
+    assert.equal(await manager.locator('.image-select:checked').count(),0,'preview consent keeps original-save selection independent');
+    await noTransientResources();
     await manager.locator('#destination-change').click();
     assert.deepEqual(await manager.locator('#output-format option').evaluateAll(options=>options.map(option=>option.value)),['original','jpg','png','webp'],'only supported original/JPEG/PNG/WebP output choices are exposed');
     await manager.evaluate(async name=>{
@@ -133,11 +191,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     // Direct converter checks inspect the actual Blob MIME, encoded signature,
     // dimensions and pixels. The UI saves below inspect the resulting files too.
     for(const format of ['jpg','png','webp']) {
-      const converted=await manager.evaluate(async({url,format})=>{
-        const {convertImage}=await import('./image-converter.js');
-        const blob=await convertImage(url,format,{});
-        return {type:blob.type,bytes:[...new Uint8Array(await blob.arrayBuffer())]};
-      },{url:fixtures.png,format});
+      const converted=await convert(fixtures.png,format);
       assert.equal(converted.type,MIME[format],`${format}: actual Blob MIME`);assertMagic(converted.bytes,format,format);
       const image=await decode(converted.bytes);assert.deepEqual([image.width,image.height],[16,12],`${format}: dimensions preserved`);
       near(image.red,[255,0,0,255],format==='jpg'?25:3,`${format}: red content retained`);
@@ -145,10 +199,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       else assert.equal(image.transparent[3],0,`${format}: transparency retained`);
       if(format==='png')assert.equal(Buffer.from(converted.bytes).includes(Buffer.from('SOURCE_METADATA_SENTINEL')),false,'PNG→PNG re-encodes instead of copying metadata');
       if(format!=='png') {
-        const sameFormat=await manager.evaluate(async({url,format})=>{
-          const {convertImage}=await import('./image-converter.js');const blob=await convertImage(url,format,{});
-          return {type:blob.type,bytes:[...new Uint8Array(await blob.arrayBuffer())]};
-        },{url:fixtures[format],format});
+        const sameFormat=await convert(fixtures[format],format);
         assert.equal(sameFormat.type,MIME[format]);assertMagic(sameFormat.bytes,format,`${format}→${format}`);
         assert.equal(Buffer.from(sameFormat.bytes).includes(Buffer.from('SOURCE_METADATA_SENTINEL')),false,`${format}→${format} re-encodes source metadata`);
         const image=await decode(sameFormat.bytes);assert.deepEqual([image.width,image.height],[16,12]);
@@ -161,7 +212,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       if(format==='jpg')near(actual.transparent,[255,255,255,255],10,'saved JPEG has a white background');
       else assert.equal(actual.transparent[3],0,`saved ${format} preserves alpha`);
     }
-    await reload();await manager.locator('#destination-change').click();
+    await reload();assert.equal(await manager.locator('.thumb img').count(),0,'reload clears embedded preview consent before later conversion URL ownership checks');await manager.locator('#destination-change').click();
     assert.equal(await manager.locator('#output-format').inputValue(),'webp','the selected output format survives workspace reload');
     await manager.locator('#settings-done').click();await manager.waitForFunction(()=>!document.querySelector('#save-settings').open);
     await settings({format:'png',folderName:'SVGラスタ'});await save(1);
@@ -177,11 +228,16 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       try{await decoder.tracks.ready;return decoder.tracks.selectedTrack.frameCount;}finally{decoder.close();}
     },originalGif.bytes);
     assert.equal(frameCount,2,'the original GIF fixture contains two animation frames');
+    await settings({format:'original',folderName:'AVIF元形式'});await save(5);
+    const [originalAvif]=await directoryFiles('AVIF元形式');assert.match(originalAvif.name,/\.avif$/);assert.deepEqual(originalAvif.bytes,fixtures.avifBytes,'a refused preview does not prevent original AVIF-container byte preservation');
+    await settings({format:'png',folderName:'AVIF変換拒否'});await save(5,'interrupted');
+    assert.equal((await directoryFiles('AVIF変換拒否')).length,0,'unsupported AVIF conversion writes no fallback original');
+    await settings({format:'original',folderName:'SVG未対応元形式'});await save(6);
+    const [originalGeneralSVG]=await directoryFiles('SVG未対応元形式');assert.match(originalGeneralSVG.name,/\.svg$/);assert.equal(Buffer.from(originalGeneralSVG.bytes).toString('utf8'),fixtures.generalSVGText,'general SVG stays available through explicitly chosen original-byte saving');
+    await settings({format:'png',folderName:'SVG未対応変換拒否'});await save(6,'interrupted');
+    assert.equal((await directoryFiles('SVG未対応変換拒否')).length,0,'general SVG conversion refusal never writes an automatic original fallback');
     for(let attempt=0;attempt<3;attempt++) {
-      const converted=await manager.evaluate(async url=>{
-        const {convertImage}=await import('./image-converter.js');const blob=await convertImage(url,'png',{});
-        return [...new Uint8Array(await blob.arrayBuffer())];
-      },fixtures.gif);
+      const {bytes:converted}=await convert(fixtures.gif,'png');
       assertMagic(converted,'png','GIF first-frame conversion');const image=await decode(converted);
       assert.deepEqual([image.width,image.height],[1,1]);near(image.first,[255,0,0,255],0,'animated GIF conversion consistently selects its first frame');
       await manager.waitForTimeout(130);
@@ -235,7 +291,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       assert.equal(download.mime,MIME[format],`${format}: Chrome sees the actual encoded MIME`);
       await manager.waitForFunction(url=>window.__qaFormatBlobURLs.some(entry=>entry.url===url && entry.revoked),download.url);
       const blobURLs=await manager.evaluate(()=>window.__qaFormatBlobURLs);
-      assert.equal(blobURLs.length,1,`${format}: a converted PNG source creates only its download Blob URL`);
+      assert.equal(blobURLs.length,1,`${format}: with preview consent unset, conversion creates only its owned download Blob URL`);
       assert.equal(blobURLs[0].type,MIME[format]);assert.equal(blobURLs[0].url,download.url);
       assert.equal(blobURLs[0].revoked,true,`${format}: the completed download releases its Blob URL`);
       const bytes=[...await readFile(download.filename)];assertMagic(bytes,format,`${format} actual Chrome download`);

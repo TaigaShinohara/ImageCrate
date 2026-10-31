@@ -94,8 +94,11 @@ try {
     const tab = await tabFor(page);
     const [manager] = await Promise.all([context.waitForEvent('page'), worker.evaluate(tab => globalThis.__qaOpenWorkspace(tab), tab)]);
     manager.on('pageerror', error => errors.push(error.message));
+    manager.__previewRequests=[];manager.on('request',request=>{if(request.url().startsWith(origin))manager.__previewRequests.push(request.url());});
     await manager.waitForLoadState('domcontentloaded');
     await manager.waitForFunction(() => document.querySelector('#message')?.textContent.includes('候補を取得'));
+    assert.equal(await manager.locator('.thumb img').count(),0,'each new workspace requires its own app preview consent');
+    assert.deepEqual(manager.__previewRequests,[],'existing Chrome host permission does not permit a new workspace to fetch previews automatically');
     return manager;
   };
   const stateFor = manager => worker.evaluate(async url => {
@@ -186,12 +189,15 @@ try {
   await manager.locator('#width').fill('1000');
   assert.equal(await manager.locator(`.card[data-url="${origin}/held-high.svg"]`).count(), 1, 'unknown dimensions remain visible under a minimum width');
   assert.equal(await manager.locator('#dimension-note').isVisible(), true);
+  await manager.locator(`.card[data-url="${origin}/held-high.svg"] .preview-permission`).click();
   releaseHigh = true;
   for (const response of held) response.end(svg(1800, 1200));
   held.clear();
   await manager.waitForFunction(origin => [...document.querySelectorAll('[data-dimensions]')].some(node => node.dataset.dimensions === `${origin}/held-high.svg` && node.textContent.includes('1800')), origin);
   await manager.waitForFunction(origin => [...document.querySelectorAll('[data-dimensions]')].some(node => node.dataset.dimensions === `${origin}/density-high.svg` && node.textContent.includes('1800')), origin);
   assert.equal(await manager.locator(`.card[data-url="${origin}/held-high.svg"]`).count(), 1);
+  const thumbnail=manager.locator(`.card[data-url="${origin}/held-high.svg"] .thumb img`);
+  await thumbnail.waitFor();await thumbnail.evaluate(image=>image.decode());assert.equal(await thumbnail.evaluate(image=>image.src.startsWith('blob:')&&image.naturalWidth>0&&image.naturalWidth<=384),true,'1800px source metadata is independent of the resized generated thumbnail');
   checked('minimum dimensions keep unknown candidates, then report decoded file pixels for high-resolution images');
   await manager.locator('#reset-filters').click();
 
@@ -205,6 +211,8 @@ try {
   await manager.waitForFunction(() => { const image = document.querySelector('#preview-stage img'); return image?.complete && image.naturalWidth === 1800; });
   const fitted = await manager.locator('#preview-stage img').evaluate(image => ({ width: image.getBoundingClientRect().width, available: image.parentElement.clientWidth }));
   assert.ok(fitted.width <= fitted.available + 1);
+  assert.equal(await manager.locator('#preview-zoom').textContent(),'プレビューを等倍で表示');
+  assert.equal(await manager.locator('#preview-stage img').evaluate(image=>image.src.startsWith('blob:')),true);
   await manager.locator('#preview-zoom').click();
   assert.equal(await manager.locator('#preview-zoom').getAttribute('aria-pressed'), 'true');
   assert.equal(await manager.locator('#preview-stage img').evaluate(image => Math.round(image.getBoundingClientRect().width)), 1800);
@@ -403,6 +411,10 @@ try {
   assert.equal(await manager.locator('#grid').getAttribute('aria-busy'), 'false');
   checked('native selection controls retain names, dimensions/status descriptions and labeled dialogs');
 
+  assert.equal(await manager.locator('.thumb img').count(),0,'workspace reload does not restore app preview consent');
+  await manager.locator('.card .preview-permission:visible').first().click();
+  await manager.waitForFunction(()=>{const image=document.querySelector('.thumb img');return image?.complete&&image.src.startsWith('blob:');});
+
   // Geometry is objective coverage. Screenshots are retained for separate visual review.
   for (const width of [360, 640, 1280]) {
     await manager.setViewportSize({ width, height: 900 });
@@ -437,7 +449,7 @@ try {
     assert.ok(dialog.scroll <= dialog.width + 1 && dialog.left >= 0 && dialog.right <= width + 1, `${width}px settings contain long text`);
     await closeSettings(manager);
     await manager.locator('.preview-open').first().click();
-    await manager.waitForFunction(() => document.querySelector('#image-preview').open);
+    await manager.waitForFunction(() => {const image=document.querySelector('#preview-stage img');return document.querySelector('#image-preview').open&&image?.complete&&image.src.startsWith('blob:');});
     await screenshot(manager, `preview-${width}`);
     await manager.keyboard.press('Escape');
     checked(`${width}px geometry, filter controls, long settings draft and preview screenshots`);
