@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {candidateCatalog, candidateMatches, representativeCandidates} from '../extension/gallery.js';
+import {Gallery, candidateCatalog, candidateMatches, representativeCandidates} from '../extension/gallery.js';
 
 const item=(name,extra={})=>({url:`https://images.test/${name}.png`,width:0,height:0,dimensionSource:'unknown',...extra});
 
@@ -40,4 +40,87 @@ test('grouped views prefer the current picture candidate and retain independent 
   assert.deepEqual(representativeCandidates([current,small]),[current]);
   assert.deepEqual(representativeCandidates([small,other]),[small,other]);
   assert.deepEqual(representativeCandidates([]),[]);
+});
+
+test('adding a preview alternative rebuilds the selected view after optimistic selection persistence', async () => {
+  const original=item('small',{groupId:'picture'}),alternative=item('large',{groupId:'picture'});
+  const state={items:[original,alternative]};
+  let selected=new Set([original.url]),resolveSave;
+  const saved=new Promise(resolve=>{resolveSave=resolve;});
+  const origin={role:'preview',url:original.url};
+  const gallery=Object.assign(Object.create(Gallery.prototype),{
+    mode:'selected',visible:[original],viewerURL:alternative.url,viewerURLs:[original.url],returnURL:original.url,returnTarget:origin,
+    getSelected:()=>selected,
+    // workspace.persistUI updates selection before its asynchronous write.
+    onSelect:urls=>{selected=new Set(urls);return saved;},
+    sync(){},
+    render(){this.visible=candidateCatalog(state).filter(candidate=>selected.has(candidate.url));},
+    onError(error){throw error;},
+  });
+  const pending=gallery.select(alternative.url,true);
+  assert.equal(selected.has(alternative.url),true,'optimistic state already contains the new alternative');
+  assert.deepEqual(gallery.visible,[original],'the pending save has not rebuilt the list yet');
+  resolveSave();await pending;
+  assert.deepEqual(gallery.visible,[original,alternative],'selected view includes the newly selected URL');
+  assert.equal(gallery.viewerURL,alternative.url,'the current preview is kept');
+  assert.equal(gallery.returnTarget,origin,'the preview origin remains available for focus restoration');
+  assert.equal(gallery.returnURL,original.url);
+});
+
+test('selected view still rebuilds on removal while other views only synchronize controls', async () => {
+  for(const mode of ['selected','all','added']) {
+    let selected=new Set(['https://images.test/one.png']),renders=0,syncs=0;
+    const gallery=Object.assign(Object.create(Gallery.prototype),{
+      mode,getSelected:()=>selected,onSelect:async urls=>{selected=new Set(urls);},
+      sync(){syncs++;},render(){renders++;},onError(error){throw error;},
+    });
+    await gallery.select('https://images.test/one.png',false);
+    assert.equal(selected.size,0);
+    assert.equal(syncs,1);
+    assert.equal(renders,mode==='selected'?1:0,mode);
+  }
+});
+
+test('render publishes the rebuilt selected list after cards and preview controls are synchronized', () => {
+  const previousDocument=globalThis.document,previousImage=globalThis.Image;
+  const elements=new Map();
+  const makeNode=tag=>({
+    tagName:tag.toUpperCase(),children:[],dataset:{},attributes:{},className:'',hidden:false,disabled:false,value:'',
+    append(...children){this.children.push(...children);},replaceChildren(...children){this.children=[...children];},
+    setAttribute(name,value){this.attributes[name]=String(value);},addEventListener(){},closest(){return null;},
+    focus(){globalThis.document.activeElement=this;},scrollIntoView(){},
+  });
+  const descendants=function*(node){for(const child of node.children){yield child;yield* descendants(child);}};
+  globalThis.document={
+    activeElement:null,createElement:makeNode,
+    getElementById(id){if(!elements.has(id))elements.set(id,makeNode('div'));return elements.get(id);},
+    querySelectorAll(selector){return [...descendants(this.getElementById('grid'))].filter(node=>selector==='.image-select'&&node.className==='image-select');},
+  };
+  globalThis.Image=function(){return makeNode('img');};
+  try {
+    const original=item('small',{groupId:'picture'}),alternative=item('large',{groupId:'picture'});
+    const selected=new Set([original.url,alternative.url]);
+    const state={items:[original,alternative],jobs:[],selectedItems:[]};
+    let calls=0,hidden=1;
+    const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,status:()=>'',onRender:items=>{
+      calls++;
+      assert.equal(items,gallery.visible);
+      assert.equal(document.getElementById('grid').children.length,2,'the callback sees the completed card rebuild');
+      assert.equal(document.getElementById('preview-select').checked,true,'preview state is already synchronized');
+      hidden=[...selected].filter(url=>!items.some(candidate=>candidate.url===url)).length;
+      gallery.setBusy(false); // workspace.updateSummary does this without another render.
+    }});
+    gallery.mode='selected';gallery.viewerURL=alternative.url;
+    const previewSelection=document.getElementById('preview-select');document.activeElement=previewSelection;
+    gallery.render();
+    assert.equal(calls,1,'summary notification does not recurse through setBusy');
+    assert.equal(hidden,0,'the published list clears the obsolete hidden-selection count');
+    assert.equal(document.activeElement,previewSelection,'the open preview keeps focus');
+    assert.equal(gallery.viewerURL,alternative.url);
+    const withoutCallback=new Gallery({getState:()=>state,getSelected:()=>selected,status:()=>''});
+    assert.doesNotThrow(()=>withoutCallback.render(),'onRender remains optional');
+  } finally {
+    if(previousDocument===undefined)delete globalThis.document;else globalThis.document=previousDocument;
+    if(previousImage===undefined)delete globalThis.Image;else globalThis.Image=previousImage;
+  }
 });

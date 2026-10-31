@@ -217,6 +217,21 @@ try {
   assert.equal(await manager.evaluate(() => document.activeElement?.closest('.card')?.dataset.url), returnURL, 'Escape returns focus to the originating card control');
   checked('group alternatives, explicit variant selection, fit/100%, next and Escape focus');
 
+  await manager.locator('#view-selected').click();
+  await manager.locator('.card .preview-open').click();
+  await manager.locator('#preview-variants button').filter({ hasText: 'variant-small.svg' }).click();
+  await manager.locator('#preview-select').check(); await selectedCount(manager, 2);
+  await manager.waitForFunction(() => document.querySelectorAll('.card').length === 2);
+  assert.equal(await manager.evaluate(() => document.activeElement?.id), 'preview-select', 'updating the selected gallery keeps dialog focus');
+  await manager.keyboard.press('Escape');
+  await manager.waitForFunction(url => document.activeElement?.closest('.card')?.dataset.url === url, `${origin}/variant-large.svg`);
+  assert.equal(await manager.locator('.card').count(), 2, 'a newly selected alternative appears immediately in the selected gallery');
+  assert.equal(await manager.locator(`.card[data-url="${origin}/variant-small.svg"] .image-select`).isChecked(), true);
+  assert.equal(await manager.locator('#selection').textContent(), '選択2件', 'the summary counts both newly rendered selections as visible');
+  assert.equal(await manager.evaluate(() => document.activeElement?.closest('.card')?.dataset.url), `${origin}/variant-large.svg`);
+  await manager.locator('#view-all').click();
+  checked('selecting an alternative from selected-only preview immediately updates the gallery and restores focus');
+
   await manager.locator('#clear').click(); await selectedCount(manager, 0);
   const firstCheckbox = manager.locator('.image-select').first();
   const firstURL = await firstCheckbox.getAttribute('data-url');
@@ -312,6 +327,11 @@ try {
   const appliedA = await appliedSnapshot();
   assert.equal(appliedA.saveSettings.destination, 'directory'); assert.equal(appliedA.saveSettings.format, 'png');
   assert.deepEqual(appliedA.last, { destination: 'directory', name: 'UX 保存先 A' });
+  const inheritedSource = await context.newPage(); await inheritedSource.goto(`${origin}/?snapshot=A`);
+  const inheritedManager = await openWorkspace(inheritedSource);
+  const inheritedA = (await stateFor(inheritedManager)).saveSettings;
+  assert.equal(inheritedA.destination, 'directory'); assert.equal(inheritedA.format, 'original');
+  assert.ok(inheritedA.directoryKey, 'the inherited destination owns a session-specific handle before opening settings');
   await manager.locator('#destination-change').click();
   await manager.evaluate(() => { window.__qaPickerChoice = 'B'; });
   await manager.locator('#choose-directory').click();
@@ -345,6 +365,23 @@ try {
   assert.match(await manager.locator('#chosen-directory').textContent(), /UX 保存先 B/);
   await closeSettings(manager);
   checked('Apply commits settings and a cloneable OPFS handle; picker cancel and reload retain the applied destination');
+  const assertInheritedA = async () => {
+    await inheritedManager.reload();
+    await inheritedManager.waitForFunction(() => document.querySelector('#message').textContent.includes('前回'));
+    assert.deepEqual((await stateFor(inheritedManager)).saveSettings, inheritedA);
+    assert.equal(await inheritedManager.evaluate(async key => {
+      const { getDirectory } = await import('./directory-store.js'); return (await getDirectory(key)).name;
+    }, inheritedA.directoryKey), 'UX 保存先 A');
+    assert.match(await inheritedManager.locator('#destination-summary').textContent(), /UX 保存先 A/);
+  };
+  await assertInheritedA();
+  const changerSource = await context.newPage(); await changerSource.goto(`${origin}/?snapshot=chrome`);
+  const changer = await openWorkspace(changerSource);
+  await changer.locator('#destination-change').click(); await changer.locator('#destination-downloads').check();
+  await closeSettings(changer, '#settings-done');
+  await assertInheritedA();
+  await inheritedManager.close(); await inheritedSource.close(); await changer.close(); await changerSource.close();
+  checked('new workspaces snapshot inherited folders; other tabs changing folder or Chrome destination cannot redirect them');
   await manager.evaluate(()=>{
     const send=chrome.runtime.sendMessage.bind(chrome.runtime);let drop=true;
     chrome.runtime.sendMessage=async message=>{const response=await send(message);if(drop&&message.type==='settings'&&response?.ok){drop=false;throw new Error('Synthetic acknowledgement loss after commit');}return response;};
