@@ -231,7 +231,7 @@ export class Gallery {
       preview.onclick=()=>this.openViewer(item.url,preview);
       const permission=node('button','preview-permission');permission.type='button';permission.dataset.galleryRole='permission';
       permission.addEventListener('focus',()=>{this.lastURL=item.url;});
-      card.append(label,permission,jump,preview);$('grid').append(card);
+      card.append(label,jump,permission,preview);$('grid').append(card);
       this.bindPreview(item,thumb,'thumbnail',permission);
     }
     $('empty').hidden=!!this.visible.length;$('empty').replaceChildren();

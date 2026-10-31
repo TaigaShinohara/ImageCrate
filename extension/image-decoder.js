@@ -5,6 +5,15 @@ const LEDGER_KEY='imagecrate.imageResources.v1';
 export const IMAGE_RESOURCE_LIMITS=Object.freeze({encodedBytes:128*1024*1024,pixels:64_000_000,encodedCache:32*1024*1024,displayBytes:64*1024*1024,fetches:4});
 const WORKSPACE_LIMITS=Object.freeze({encodedCache:16*1024*1024,displayBytes:32*1024*1024,fetches:2});
 const FIELDS=Object.keys(IMAGE_RESOURCE_LIMITS);
+const OWNER_UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const PRODUCTION_OWNER=new RegExp(`^(${OWNER_UUID}):${OWNER_UUID}:(?:preview|conversion)$`,'i');
+function workspaceScope(owner){
+  // Production cleanup owners stay distinct per document/role. Only the known
+  // session UUID : document UUID : preview|conversion shape shares a workspace
+  // budget, including live reservations from an older document instance.
+  const production=PRODUCTION_OWNER.exec(owner);
+  return production?'workspace:'+production[1].toLowerCase():'owner:'+owner;
+}
 const abortError=signal=>signal?.reason instanceof Error?signal.reason:new DOMException('画像処理を停止しました。','AbortError');
 function waitAbort(promise,signal){
   const pending=Promise.resolve(promise);pending.catch(()=>{});
@@ -32,9 +41,9 @@ export function createImageResourceCoordinator({storage=globalThis.chrome?.stora
     async reserve(owner,amounts={}){
       if(typeof owner!=='string'||!owner||owner.length>256)throw new Error('画像処理の所有者が不明です。');
       for(const key of Object.keys(amounts))if(!FIELDS.includes(key)||!Number.isSafeInteger(amounts[key])||amounts[key]<0)throw new Error('画像リソース要求が不正です。');
-      const id=unique();await transact(ledger=>{
+      const id=unique(),scope=workspaceScope(owner);await transact(ledger=>{
         if(Object.hasOwn(ledger,id)||Object.keys(ledger).length>=2048)throw new Error('画像の処理数が上限に達しました。');
-        for(const key of FIELDS){const global=Object.values(ledger).reduce((n,r)=>n+(r[key]??0),0),own=Object.values(ledger).reduce((n,r)=>n+(r.owner===owner?(r[key]??0):0),0),value=amounts[key]??0;
+        for(const key of FIELDS){const global=Object.values(ledger).reduce((n,r)=>n+(r[key]??0),0),own=Object.values(ledger).reduce((n,r)=>n+(workspaceScope(r.owner)===scope?(r[key]??0):0),0),value=amounts[key]??0;
           if(global+value>IMAGE_RESOURCE_LIMITS[key]||WORKSPACE_LIMITS[key]!=null&&own+value>WORKSPACE_LIMITS[key])throw new Error('画像の共有リソース上限に達しました。ほかの画像を閉じてください。');
         }
         ledger[id]={owner,...amounts};

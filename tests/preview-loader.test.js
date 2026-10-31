@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createPreviewController,PREVIEW_LIMITS} from '../extension/preview-loader.js';
+import {acquireMediaFetchLease,createPreviewController,PREVIEW_LIMITS} from '../extension/preview-loader.js';
 import {createImageResourceCoordinator,decodeStaticImage,IMAGE_RESOURCE_LIMITS} from '../extension/image-decoder.js';
 import {inspectImage} from '../extension/image-metadata.js';
+import {createMediaOperation} from '../extension/media-reader.js';
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return{promise,resolve,reject};};
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
 const svg='<svg width="40" height="30"><rect width="40" height="30" fill="red"/></svg>';
@@ -268,4 +269,71 @@ test('preview source accounting and disposal await actual codec settlement after
   let disposed=false;const disposing=h.controller.dispose().then(()=>{disposed=true;});await turn();assert.equal(disposed,false);
   decoding.resolve({blob:new Blob(['late'],{type:'image/png'}),width:40,height:30,displayWidth:40,displayHeight:30,release:async()=>releases++});
   await disposing;assert.equal(releases,1);assert.equal(h.urls.length,0);assert.deepEqual(await h.resources.coordinator.snapshot(),{});
+});
+
+test('wildcard and credentialed host input never reaches a permission request or fetch',async()=>{
+  const h=harness();
+  for(const url of ['https://*.example.test/a.png','https://*/a.png','https://foo*bar.example.test/a.png','https://user:synthetic-password@images.test/a','http://user@images.test/a']){
+    await assert.rejects(h.controller.grantHost(url),/対応していません/);await assert.rejects(h.controller.load(url),/対応していません/);
+  }
+  assert.equal(h.requests,0);assert.equal(h.fetches,0);assert.equal(h.decodes,0);
+  await h.controller.grantHost('https://images.test/a*pattern');assert.equal(h.requests,1,'wildcard path characters do not widen the concrete host permission');await h.controller.dispose();
+});
+
+test('managed fetch lease fulfilled before a failed wait is still released and cannot authorize fetch',async()=>{
+  const resources=resource();let requests=0;
+  const timeout=new DOMException('deadline elapsed after fulfillment','TimeoutError');
+  const operation={signal:new AbortController().signal,check(){},wait:promise=>Promise.resolve(promise).then(()=>{throw timeout;})};
+  await assert.rejects(acquireMediaFetchLease(operation,'managed-fulfilled',{coordinator:resources.coordinator}).then(()=>{requests++;}),{name:'TimeoutError'});
+  await turn();assert.equal(requests,0);assert.deepEqual(await resources.coordinator.snapshot(),{});
+});
+
+test('abort during delayed shared fetch reservation returns promptly and releases its late acquisition',async()=>{
+  const reservation=deferred(),started=deferred(),resources=resource(),controller=new AbortController();let requests=0;
+  const operation=createMediaOperation({signal:controller.signal,timeoutMs:20000});
+  const coordinator={reserve(owner,amounts){started.resolve();return reservation.promise.then(()=>resources.coordinator.reserve(owner,amounts));}};
+  const pending=acquireMediaFetchLease(operation,'managed-late',{coordinator}).then(()=>{requests++;});pending.catch(()=>{});await started.promise;controller.abort();await assert.rejects(pending,{name:'AbortError'});
+  reservation.resolve();await turn();assert.equal(requests,0);assert.deepEqual(await resources.coordinator.snapshot(),{});operation.dispose();
+});
+
+test('managed input and preview fetches share four global slots and recover after source release',async()=>{
+  const resources=resource(),fetching=deferred(),owner=role=>`${crypto.randomUUID()}:${crypto.randomUUID()}:${role}`,h=harness({resources,owner:owner('preview'),fetch:async()=>fetching.promise});
+  await h.controller.grantHost('https://images.test/a');const first=h.controller.load('https://images.test/a').catch(error=>error),second=h.controller.load('https://images.test/b').catch(error=>error);await turn();assert.equal(h.fetches,2);
+  const operations=Array.from({length:3},()=>createMediaOperation({timeoutMs:20000}));
+  const managedA=await acquireMediaFetchLease(operations[0],owner('conversion'),{coordinator:resources.coordinator}),managedB=await acquireMediaFetchLease(operations[1],owner('conversion'),{coordinator:resources.coordinator});
+  assert.equal(Object.values(await resources.coordinator.snapshot()).reduce((sum,entry)=>sum+(entry.fetches||0),0),4);
+  let rejectedRequests=0;await assert.rejects(acquireMediaFetchLease(operations[2],owner('conversion'),{coordinator:resources.coordinator}).then(()=>{rejectedRequests++;}),/上限/);assert.equal(rejectedRequests,0);
+  const extra=harness({resources,owner:owner('preview')});await extra.controller.grantHost('https://images.test/a');await assert.rejects(extra.controller.load('https://images.test/a'),/上限/);assert.equal(extra.fetches,0);
+  await managedA.release();await extra.controller.grantHost('https://images.test/a');const recovered=await extra.controller.load('https://images.test/a');assert.equal(extra.fetches,1);recovered.release();
+  h.controller.invalidate();await Promise.all([first,second]);fetching.resolve(response());await managedB.release();for(const operation of operations)operation.dispose();await h.controller.dispose();await extra.controller.dispose();assert.deepEqual(await resources.coordinator.snapshot(),{});
+});
+
+test('original writer UI failure keeps its shared fetch slot until actual native ownership settles',async()=>{
+  const resources=resource(),operation=createMediaOperation({timeoutMs:20000}),nativeOwnership=deferred();
+  const lease=await acquireMediaFetchLease(operation,'managed-original',{coordinator:resources.coordinator});
+  const releasing=lease.release(nativeOwnership.promise);const duplicate=lease.release();assert.equal(releasing,duplicate,'a second cleanup cannot bypass outstanding native ownership');
+  await turn();assert.equal(Object.values(await resources.coordinator.snapshot()).reduce((sum,entry)=>sum+(entry.fetches||0),0),1);
+  nativeOwnership.resolve();await releasing;assert.deepEqual(await resources.coordinator.snapshot(),{});operation.dispose();
+});
+
+test('production workspace shares two fetch slots across preview, managed input and old document instances',async()=>{
+  const {coordinator}=resource(),session=crypto.randomUUID(),oldInstance=crypto.randomUUID(),newInstance=crypto.randomUUID();
+  const previewOwner=`${session}:${oldInstance}:preview`,oldManagedOwner=`${session}:${oldInstance}:conversion`,newManagedOwner=`${session}:${newInstance}:conversion`;
+  const previewA=await coordinator.reserve(previewOwner,{fetches:1}),previewB=await coordinator.reserve(previewOwner,{fetches:1});
+  const operation=createMediaOperation({timeoutMs:20000});let fetches=0;
+  for(const owner of [oldManagedOwner,newManagedOwner])await assert.rejects(acquireMediaFetchLease(operation,owner,{coordinator}).then(()=>{fetches++;}),/上限/);
+  assert.equal(fetches,0);await previewA.release();const managed=await acquireMediaFetchLease(operation,newManagedOwner,{coordinator});
+  assert.equal(Object.values(await coordinator.snapshot()).reduce((sum,entry)=>sum+(entry.fetches||0),0),2);
+  await coordinator.releaseOwner(previewOwner);let records=Object.values(await coordinator.snapshot());assert.equal(records.length,1);assert.equal(records[0].owner,newManagedOwner,'cleanup is still tied to the exact role/document owner');
+  await managed.release();await previewB.release();assert.deepEqual(await coordinator.snapshot(),{});operation.dispose();
+});
+
+test('production cache/display budgets include old document instances while injected owners remain exact',async()=>{
+  const {coordinator}=resource(),session=crypto.randomUUID(),owner=role=>`${session}:${crypto.randomUUID()}:${role}`;
+  const first=await coordinator.reserve(owner('preview'),{encodedCache:16*1024*1024,displayBytes:32*1024*1024});
+  await assert.rejects(coordinator.reserve(owner('preview'),{encodedCache:1}),/上限/);await assert.rejects(coordinator.reserve(owner('conversion'),{displayBytes:1}),/上限/);
+  await first.release();
+  const injectedA=await coordinator.reserve('synthetic:old:preview',{fetches:2}),injectedB=await coordinator.reserve('synthetic:new:conversion',{fetches:2});
+  assert.equal(Object.values(await coordinator.snapshot()).reduce((sum,entry)=>sum+(entry.fetches||0),0),4,'unknown injected owner shapes retain exact-owner budgeting');
+  await injectedA.release();await injectedB.release();assert.deepEqual(await coordinator.snapshot(),{});
 });

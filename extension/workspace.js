@@ -4,7 +4,7 @@ import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
 import { createMediaOperation } from './media-reader.js';
-import { createPreviewController } from './preview-loader.js';
+import { acquireMediaFetchLease, createPreviewController } from './preview-loader.js';
 
 const KIND = 'images';
 const $ = id => document.getElementById(id);
@@ -366,7 +366,7 @@ async function runManagedBatch(handle) {
     }
     for(const job of [...state.jobs].filter(j=>j.status === 'queued')) {
       if(controller.signal.aborted) break;
-      let lastProgress=0,sourceBytes=0,operation,blob,reserved=false,reservationKnown=false,fileCommitted=false,resourcesSettled;
+      let lastProgress=0,sourceBytes=0,operation,blob,reserved=false,reservationKnown=false,fileCommitted=false,resourcesSettled,fetchLease;
       try {
         // The worker persists a conservative reservation before any fetch.
         operation=createMediaOperation({signal:controller.signal,deadline:Math.min(batch.transferBudget?.deadline??Infinity,Date.now()+120000)});
@@ -380,6 +380,7 @@ async function runManagedBatch(handle) {
           if(Date.now()-lastProgress < 300) return;lastProgress=Date.now();
           reportProgress({id:job.id,status:'in_progress',...progress});
         };
+        fetchLease=await acquireMediaFetchLease(operation,resourceOwner);operation.check();
         const options={signal:operation.signal,operation,maxBytes:transfer.maxBytes,deadline:transfer.deadline,
           onBytes:progress=>{sourceBytes=progress.bytesReceived;},onProgress:progress=>{sourceBytes=Math.max(sourceBytes,progress.bytesReceived||0);progressUpdate(progress);}};
         const settle=async(outcome,outputBytes=0)=>{
@@ -389,6 +390,10 @@ async function runManagedBatch(handle) {
         if(batch.format && batch.format !== 'original') {
           const item=candidateCatalog(state).find(item=>item.url===job.url);
           blob=await convertImage(job.url,batch.format,{...options,maxInputBytes:transfer.maxBytes,maxOutputBytes:transfer.maxOutputBytes,ownerId:resourceOwner,knownWidth:item?.width,knownHeight:item?.height});
+          // Conversion has finished receiving its source. Local encoding output
+          // and file writing retain their own byte/pixel ownership, not a fetch slot.
+          const completedFetch=fetchLease;fetchLease=null;
+          await operation.wait(completedFetch.release());operation.check();
           sourceBytes=Math.max(sourceBytes,blob.sourceBytes||0);
           if(controller.signal.aborted) throw new DOMException('停止しました。','AbortError');
           if(folder) {
@@ -445,6 +450,12 @@ async function runManagedBatch(handle) {
         else await report({id:job.id,status:'interrupted',error:reason});
       } finally {
         operation?.dispose();
+        if(fetchLease){
+          const ownedFetch=fetchLease;fetchLease=null;
+          // On failure the writer may still own a native write/abort. Its
+          // resourcesSettled promise, rather than UI rejection, ends this lease.
+          void ownedFetch.release(resourcesSettled).catch(()=>{});
+        }
         if(blob&&!convertedURLs.has(job.id)){
           const output=blob;
           Promise.resolve(resourcesSettled).then(()=>output.releaseResources?.()).catch(()=>{});

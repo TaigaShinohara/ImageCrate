@@ -2,6 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {openMediaReader, readMediaBlob, createMediaOperation, mediaContentLength} from '../extension/media-reader.js';
 
+test('throttled idle timers cannot accept a late chunk or renew its idle deadline',async()=>{
+  let now=1000,resolve;
+  const operation=createMediaOperation({now:()=>now,timeoutMs:120000,idleTimeoutMs:30000});operation.touch();
+  const pending=operation.wait(new Promise(done=>{resolve=done;}));now+=30001;resolve('late');
+  try{await assert.rejects(pending,{name:'TimeoutError'});assert.throws(()=>operation.touch(),{name:'TimeoutError'});}finally{operation.dispose();}
+});
+
+test('a reversed wall clock cannot extend a managed operation deadline',()=>{
+  let now=1000;const operation=createMediaOperation({now:()=>now});operation.check();now--;
+  try{assert.throws(()=>operation.check(),{name:'TimeoutError'});}finally{operation.dispose();}
+});
+
 function response(chunks, headers = {}, callbacks = {}) {
   return new Response(new ReadableStream({
     start(stream) { for (const chunk of chunks) stream.enqueue(Uint8Array.from(chunk)); stream.close(); },

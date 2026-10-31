@@ -11,8 +11,39 @@ export function previewHost(value){
   if(typeof value!=='string'||value.length>131072)throw new Error('画像の取得先を確認できません。');
   if(/^data:/i.test(value)){if(!allowedURL(value,'images'))throw new Error('この埋め込み画像のプレビューには対応していません。');return {key:'data:embedded',label:'ページに埋め込まれた画像',pattern:null,isEmbedded:true};}
   let url;try{url=new URL(value);}catch{throw new Error('画像の取得先を確認できません。');}
-  if(!['http:','https:'].includes(url.protocol)||url.username||url.password)throw new Error('この取得先のプレビューには対応していません。');
+  if(!['http:','https:'].includes(url.protocol)||url.username||url.password||!url.hostname||url.hostname.includes('*'))throw new Error('この取得先のプレビューには対応していません。');
   return {key:`${url.protocol}//${url.hostname}`,label:`${url.protocol}//${url.hostname}${url.port?`:${url.port}`:''}`,pattern:`${url.protocol}//${url.hostname}/*`,isEmbedded:false};
+}
+// Shared by managed source transfers and previews. Fulfillment establishes
+// ownership before the cancellable wait checks its deadline; a late ledger
+// result can therefore never orphan a fetch slot or authorize a late request.
+export async function acquireMediaFetchLease(operation,ownerId,{coordinator=imageResourceCoordinator()}={}){
+  let owned,claimed=false,finished=false;
+  const releaseOwned=()=>{
+    if(!owned)return Promise.resolve();const lease=owned;owned=null;
+    try{return Promise.resolve(lease.release());}catch(error){return Promise.reject(error);}
+  };
+  try{
+    operation.check();
+    const acquiring=Promise.resolve().then(()=>{operation.check();return coordinator.reserve(ownerId,{fetches:1});}).then(lease=>{
+      owned=lease;
+      try{operation.check();if(finished)throw new DOMException('画像の取得を停止しました。','AbortError');}
+      catch(error){void releaseOwned().catch(()=>{});throw error;}
+      return lease;
+    });
+    await operation.wait(acquiring);operation.check();
+    const lease=owned;let releasing;
+    const result=Object.freeze({id:lease.id,owner:lease.owner,
+      release(resourcesSettled){
+        // An original writer can reject its UI result while native write/abort
+        // still owns source chunks. Every release call shares that first tail.
+        return releasing??=Promise.resolve(resourcesSettled).catch(()=>{}).then(()=>lease.release());
+      }
+    });
+    claimed=true;return result;
+  }finally{
+    finished=true;if(!claimed)void releaseOwned().catch(()=>{});
+  }
 }
 export function createPreviewController({ownerId=`preview-${unique()}`,permissions=globalThis.chrome?.permissions,
   fetchImpl=globalThis.fetch,decodeImpl=decodeStaticImage,inspectImpl=inspectImage,readerImpl=readMediaBlob,

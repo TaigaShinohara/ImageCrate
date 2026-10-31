@@ -48,7 +48,7 @@ await writeFile(workspacePath,instrumentation+await readFile(workspacePath,'utf8
 const svg=(width=600,height=400)=>`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="#336699"/></svg>`;
 const dataURL='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg(3000,2000));
 const pngHeader=()=>{const bytes=Buffer.alloc(57);bytes.set([137,80,78,71,13,10,26,10]);bytes.writeUInt32BE(13,8);bytes.write('IHDR',12);bytes.writeUInt32BE(6000,16);bytes.writeUInt32BE(5000,20);bytes.set([8,6,0,0,0],24);bytes.writeUInt32BE(0,33);bytes.write('IDAT',37);bytes.writeUInt32BE(0,45);bytes.write('IEND',49);return bytes;};
-const counters=new Map(),held=[],streams=[];
+const counters=new Map(),held=[],streams=[],requestObservations=[];
 let origin,otherOrigin;
 const assetKey=(hostname,path)=>hostname+path;
 const hits=(hostname,path)=>counters.get(assetKey(hostname,path))||0;
@@ -59,6 +59,8 @@ const server=createServer((request,response)=>{
   const hostname=(request.headers.host||'').split(':')[0];
   if(path.startsWith('/assets/')){
     counters.set(assetKey(hostname,path),hits(hostname,path)+1);
+    const expectedCookie=hostname==='127.0.0.1'?'imagecrate_qa_scope_a=synthetic-a-only':'imagecrate_qa_scope_b=synthetic-b-only';
+    requestObservations.push({host:hostname,path,syntheticCookieReceived:Boolean(request.headers.cookie?.split(';').some(part=>part.trim()===expectedCookie)),refererPresent:Boolean(request.headers.referer)});
     if(path==='/assets/redirect'){
       response.writeHead(302,{Location:otherOrigin+'/assets/redirect-target.svg'});return response.end();
     }
@@ -86,9 +88,10 @@ const server=createServer((request,response)=>{
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 origin=`http://127.0.0.1:${server.address().port}`;otherOrigin=`http://localhost:${server.address().port}`;
-const report={browser:'',checks:[],permissionRemoval:null,streams:[],limits:[
+const report={browser:'',chromiumSandbox:true,checks:[],permissionRemoval:null,cookieObservation:null,streams:[],limits:[
   'Only synthetic localhost media, a temporary extension copy/profile, and a temporary download folder are used.',
   'The test copy pregrants its two local fixture hosts. Workspace app consent is exercised through actual UI clicks.',
+  'Only two synthetic HttpOnly SameSite=Lax cookies are seeded in the temporary profile. The server retains cookie-match and Referer-presence booleans only; values and Cookie headers are not logged. Cookie delivery is reported as observed, not guaranteed across browser policies.',
   'Permission rejection is simulated at chrome.permissions.request. A required-host removal that Chrome refuses is explicitly simulated at the contains/onRemoved boundary; native optional permission allow/deny/revoke remains manual acceptance.',
   'Stream counters are bytes produced by this HTTP fixture, not observed network wire bytes. No exact wire-byte cap, immediate cancellation time, browser RSS cap, or native decoder internal allocation cap is claimed.',
   'Noncancellable decoder late results and duplicate-consumer races are covered by deterministic unit tests; this browser suite checks real UI cancellation, real HTTP abort, workers and generated Object URL lifetimes.',
@@ -99,10 +102,14 @@ async function until(predicate,label,timeout=20000){const deadline=Date.now()+ti
 let context,worker,source;
 const errors=[];
 try{
-  context=await chromium.launchPersistentContext(profile,{channel:process.env.CHROME_CHANNEL||'chrome',headless:true,acceptDownloads:true,viewport:{width:1280,height:1000},ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging','--no-first-run']});
+  context=await chromium.launchPersistentContext(profile,{channel:process.env.CHROME_CHANNEL||'chrome',headless:true,chromiumSandbox:true,acceptDownloads:true,viewport:{width:1280,height:1000},ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging','--no-first-run']});
   report.browser=context.browser().version();const cdp=await context.browser().newBrowserCDPSession();
   const {id}=await cdp.send('Extensions.loadUnpacked',{path:extension});
   worker=context.serviceWorkers().find(value=>value.url().includes(id));if(!worker)worker=await context.waitForEvent('serviceworker',{predicate:value=>value.url().includes(id)});
+  await context.addCookies([
+    {url:origin+'/',name:'imagecrate_qa_scope_a',value:'synthetic-a-only',httpOnly:true,sameSite:'Lax',secure:false},
+    {url:otherOrigin+'/',name:'imagecrate_qa_scope_b',value:'synthetic-b-only',httpOnly:true,sameSite:'Lax',secure:false}
+  ]);
   source=await context.newPage();
   const stateFor=manager=>worker.evaluate(async url=>{const key='workspace:'+new URL(url).searchParams.get('id');return(await chrome.storage.session.get(key))[key];},manager.url());
   const ledgerFor=id=>worker.evaluate(async id=>Object.values((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).filter(entry=>entry.owner.startsWith(id+':')),id);
@@ -125,7 +132,25 @@ try{
     else await button.click();
     await manager.waitForFunction(index=>{const image=document.querySelectorAll('.card')[index]?.querySelector('.thumb img');return image?.complete&&image.naturalWidth>0&&image.src.startsWith('blob:');},index);
   };
-  const refused=await opened('/refused');const noConsentBefore=assetHits();await pause(80);
+  const refused=await opened('/refused');const noConsentBefore=assetHits();
+  for(const url of [origin+'/assets/csp-probe.svg',dataURL]){
+    const blocked=await refused.evaluate(async url=>{
+      const image=document.createElement('img');image.hidden=true;let policy;
+      const result=await new Promise(resolve=>{
+        let failed=false;const finish=()=>{if(failed&&policy){clearTimeout(timer);document.removeEventListener('securitypolicyviolation',violation);resolve({failed,policy,width:image.naturalWidth});}};
+        const violation=event=>{if(event.effectiveDirective==='img-src'){policy={directive:event.effectiveDirective,blocked:event.blockedURI.startsWith('data')?'data':new URL(event.blockedURI).protocol};finish();}};
+        document.addEventListener('securitypolicyviolation',violation);
+        const timer=setTimeout(()=>{document.removeEventListener('securitypolicyviolation',violation);resolve({failed,policy,timedOut:true});},3000);
+        image.onerror=()=>{failed=true;finish();};image.onload=()=>{clearTimeout(timer);document.removeEventListener('securitypolicyviolation',violation);resolve({loaded:true,width:image.naturalWidth});};
+        // Exercise the HTML attribute path as well as application Image.src.
+        image.setAttribute('src',url);document.body.append(image);
+      });image.remove();return result;
+    },url);
+    assert.equal(blocked.failed,true);assert.equal(blocked.timedOut,undefined);assert.equal(blocked.width,0);assert.equal(blocked.policy.directive,'img-src');
+  }
+  assert.equal(assetHits(),noConsentBefore,'CSP refuses remote attribute images before sending a request');
+  checked('extension CSP blocks remote and data image attributes with a real img-src violation and no remote request');
+  await pause(80);
   assert.equal(assetHits(),noConsentBefore);assert.equal((await qa(refused)).workersCreated,0);
   await refused.evaluate(()=>{__securityQA.denyRequest=true;});await refused.locator('.preview-permission').focus();await refused.locator('.preview-permission').press('Enter');
   assert.equal(await refused.evaluate(()=>document.activeElement===document.querySelector('.image-select')),true,'permission refusal preserves keyboard focus at the image selection control');
@@ -142,7 +167,14 @@ try{
   assert.equal(await scoped.locator('.card').nth(1).locator('.preview-permission > span').innerText(),otherOrigin+' のプレビューを許可');
   const visibleScope=scoped.locator('.card').first().locator('.preview-scope');assert.equal(await visibleScope.isVisible(),true);assert.match(await visibleScope.innerText(),/全パス.*全ポート/);assert.match(await visibleScope.innerText(),/ログイン状態/);
   await preview(scoped,0,{keyboard:true});assert.equal(hits('127.0.0.1','/assets/a.svg'),aBefore+1);assert.equal(hits('localhost','/assets/b.svg'),bBefore);assert.equal(await scoped.locator('.card').nth(1).locator('img').count(),0);
-  await preview(scoped,1);assert.equal(hits('localhost','/assets/b.svg'),bBefore+1);
+  const [crossOriginResponse]=await Promise.all([scoped.waitForResponse(response=>response.url()===otherOrigin+'/assets/b.svg'),preview(scoped,1)]);assert.equal(hits('localhost','/assets/b.svg'),bBefore+1);
+  assert.equal(crossOriginResponse.status(),200);assert.equal(crossOriginResponse.headers()['access-control-allow-origin'],undefined,'optional-host extension fetch succeeds without a permissive CORS response header');
+  assert.equal(await source.evaluate(()=>document.cookie.includes('imagecrate_qa_scope_a')),false,'the synthetic authentication cookie is HttpOnly');
+  const aRequest=requestObservations.find(record=>record.host==='127.0.0.1'&&record.path==='/assets/a.svg'),bRequest=requestObservations.find(record=>record.host==='localhost'&&record.path==='/assets/b.svg');
+  assert.ok(aRequest&&bRequest);assert.equal(aRequest.refererPresent,false);assert.equal(bRequest.refererPresent,false);
+  report.cookieObservation={httpOnly:true,sameSite:'Lax',hostAReceived:aRequest.syntheticCookieReceived,hostBReceived:bRequest.syntheticCookieReceived,hostAReferer:aRequest.refererPresent,hostBReferer:bRequest.refererPresent,crossHostResponseCORSPermission:false};
+  if(!aRequest.syntheticCookieReceived||!bRequest.syntheticCookieReceived)report.limits.push('At least one synthetic SameSite=Lax cookie was not sent by this browser configuration; authenticated preview availability is not established for that host.');
+  checked(`cross-host extension fetch succeeds without ACAO; synthetic HttpOnly Lax cookies observed A=${aRequest.syntheticCookieReceived}, B=${bRequest.syntheticCookieReceived}; Referer absent`);
   assert.deepEqual((await qa(scoped)).requests,[['http://127.0.0.1/*'],['http://localhost/*']]);
   assert.equal(await scoped.locator('.thumb img').evaluateAll(images=>images.every(image=>image.src.startsWith('blob:')&&image.naturalWidth<=384)),true);
   checked('visible host/scope explanation, Enter focus transfer, separate host consent and generated-only bounded thumbnails');await scoped.close();
