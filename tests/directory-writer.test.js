@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {writeImage} from '../extension/directory-writer.js';
+import {writeImage,writeBlob} from '../extension/directory-writer.js';
 
 const deferred = () => {
   let resolve; let reject;
@@ -45,6 +45,16 @@ function directoryFixture({existing = {}, onWrite, onClose, onAbort} = {}) {
 }
 const image = (body = Uint8Array.from([1, 2, 3]), extra = {}) => new Response(body, {
   headers:{'content-type':'image/png', 'content-length':'3'}, ...extra
+});
+
+test('converted blobs use the same nonoverwriting writer without a network request', async t => {
+  const h=directoryFixture({existing:{'photo.webp':[9]}});
+  let requests=0;t.mock.method(globalThis,'fetch',async()=>{requests++;throw new Error('unexpected fetch');});
+  const result=await writeBlob(h.directory,'photo.webp',new Blob([new Uint8Array([3,2,1])],{type:'image/webp'}));
+  assert.equal(requests,0);assert.equal(result.filename,'photo (1).webp');
+  assert.deepEqual([...h.entries.get('photo.webp').data],[9]);
+  assert.deepEqual([...h.entries.get('photo (1).webp').data],[3,2,1]);
+  assert.throws(()=>writeBlob(h.directory,'empty.png',new Blob()),/データがありません/);
 });
 
 test('directory writes choose a new name and never open existing files writable', async () => {

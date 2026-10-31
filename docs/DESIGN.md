@@ -2,7 +2,9 @@
 
 ## ImageCrate — 保存先とフォルダ名、2026-10-31
 
-保存先の指定・まとめるフォルダ名・batch固定・権限と状態の契約は [SAVE-DESTINATION.md](SAVE-DESTINATION.md) を優先する。従来のChromeダウンロード先を初期値にし、任意フォルダへの直接保存を選べる。保存先はfooterで確認、編集はdialog。通常保存のタブ閉鎖後継続を維持し、直接保存方式だけタブ保持を開始前に表示する。
+追加の保存形式（元の形式/JPEG/PNG/WebP）、変換時の静止画・透過・batch・Blobの契約は [SAVE-DESTINATION.md](SAVE-DESTINATION.md) の「保存形式の追加」を優先する。保存先と名前に続けて形式を指定し、画面下で現在の形式を確認できる。
+
+保存先の指定・まとめるフォルダ名・batch固定・権限と状態の契約は同資料を優先する。従来のChromeダウンロード先を初期値にし、任意フォルダへの直接保存を選べる。保存先はfooterで確認、編集はdialog。元の形式＋Chrome先のタブ閉鎖後継続を維持し、任意フォルダまたは形式変換のときはタブ保持を開始前に表示する。
 
 ## ImageCrate v3 — gallery refinement, 2026-10-31
 

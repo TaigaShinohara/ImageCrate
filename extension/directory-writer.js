@@ -151,3 +151,13 @@ export async function writeImage(directory, filename, url, {signal, onProgress, 
   writes = next.catch(() => {});
   return next;
 }
+
+export function writeBlob(directory, filename, blob, {signal, onProgress} = {}) {
+  if (!(blob instanceof Blob) || !blob.size) throw new Error('保存する画像データがありません。');
+  // Reuse the same stream/close, collision and cancellation contract without
+  // fetching the image again after a successful local conversion.
+  return writeImage(directory, filename, '', {signal, onProgress,
+    fetchImpl:async () => new Response(blob, {headers:{
+      'content-type':blob.type || 'application/octet-stream', 'content-length':String(blob.size)
+    }})});
+}

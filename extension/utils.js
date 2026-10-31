@@ -17,7 +17,15 @@ export function sanitizePart(value, fallback = 'untitled') {
 export function saveSettings(input = {}, title = 'ページ') {
   return {destination: input.destination === 'directory' ? 'directory' : 'downloads',
     folderName: sanitizePart(String(input.folderName || '').trim() || title, 'ページ'),
-    directoryName: String(input.directoryName || '').slice(0, 512)};
+    directoryName: String(input.directoryName || '').slice(0, 512),
+    format: ['jpg','png','webp'].includes(input.format) ? input.format : 'original'};
+}
+export function requiresWorkspace(settings = {}) {
+  return settings.destination === 'directory' || ['jpg','png','webp'].includes(settings.format);
+}
+export function formatLabel(format) {
+  const labels={jpg:'JPEG (.jpg)',png:'PNG (.png)',webp:'WebP (.webp)'};
+  return Object.hasOwn(labels,format) ? labels[format] : '元の形式';
 }
 export function destinationLabel(settings) {
   return settings.destination === 'directory'
@@ -65,8 +73,8 @@ export function fileLabel(url) {
     return decodeURIComponent(u.pathname.split('/').pop() || u.hostname).slice(0, 120);
   } catch { return 'メディア'; }
 }
-export function downloadName(item, title, index, kind) {
-  const ext = extensionOf(item.url, kind);
+export function downloadName(item, title, index, kind, format = 'original') {
+  const ext = kind === 'images' && ['jpg','png','webp'].includes(format) ? format : extensionOf(item.url, kind);
   const raw = fileLabel(item.url).replace(/\.[a-z0-9]{2,5}$/i, '');
   return `${kind === 'images' ? 'ImageCrate' : 'VideoHarbor'}/${sanitizePart(title)}/${String(index + 1).padStart(3,'0')}_${sanitizePart(raw, 'media')}.${ext}`;
 }

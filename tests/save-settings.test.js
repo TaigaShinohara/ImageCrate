@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {sanitizePart, saveSettings, destinationLabel, downloadName, permissionOrigins} from '../extension/utils.js';
+import {sanitizePart, saveSettings, destinationLabel, downloadName, permissionOrigins, requiresWorkspace, formatLabel} from '../extension/utils.js';
 
 test('the displayed folder name is exactly the folder used by Chrome, including reserved long names', () => {
   for(const input of ['', '  ', ' .hidden', '../../旅行:*', 'con.'+'x'.repeat(86), '旅行😀'.repeat(100), 'ＡＢＣ. ']) {
@@ -25,4 +25,19 @@ test('custom folders are labeled by the selected handle name without inventing a
 test('optional access includes only concrete image hosts, with no query, path, wildcard host, or port', () => {
   assert.deepEqual(permissionOrigins(['https://cdn.test:444/a?token=secret','https://cdn.test/b','http://localhost:1234/x','data:image/png;base64,AA==','bad','https://*/*','https://*.example.test/a.png']),
     ['https://cdn.test/*','http://localhost/*']);
+});
+
+test('format settings, filename suffixes and workspace ownership agree', () => {
+  for(const format of ['jpg','png','webp']) {
+    const settings=saveSettings({format});
+    assert.equal(settings.format,format);assert.equal(requiresWorkspace(settings),true);
+    assert.ok(downloadName({url:'https://images.test/source.gif'},'Images',0,'images',format).endsWith(`.${format}`));
+    assert.ok(formatLabel(format).includes(`.${format}`));
+  }
+  for(const format of [undefined,'gif','constructor','__proto__']) {
+    assert.equal(saveSettings({format}).format,'original');
+    assert.equal(formatLabel(format),'元の形式');
+  }
+  assert.equal(requiresWorkspace(saveSettings()),false);
+  assert.equal(requiresWorkspace(saveSettings({destination:'directory'})),true);
 });
