@@ -4,11 +4,12 @@ import { pruneDirectories } from './directory-store.js';
 import { extensionForMime } from './image-format.js';
 import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
 import {MEDIA_LIMITS, MEDIA_POLICY_VERSION} from './media-limits.js';
-import {createTransferBudget, reserveTransferAttempt, settleTransferAttempt, transferBudgetRemaining, transferOutputBudgetRemaining} from './transfer-budget.js';
+import {createTransferBudget, reserveTransferAttempt, recordTransferBytes, settleTransferAttempt, transferBudgetRemaining, transferOutputBudgetRemaining} from './transfer-budget.js';
 import {createImageResourceCoordinator} from './image-decoder.js';
 const KIND = 'images';
 const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
+const ACCEPTANCE_TIMEOUT = 30000;
 const FILENAME_DECISION_TTL = 5 * 60 * 1000;
 const RECOVERY_ALARM = 'imagecrate-pending-downloads';
 const SCAN_TIMEOUT = 5000;
@@ -17,6 +18,8 @@ const scanFlights = new Map();
 const SOURCE_FLIGHTS_KEY = 'imagecrate.sourceFlights.v1';
 let operations = Promise.resolve();
 const resourceCleanups=new Map();
+const validDownloadId=value=>Number.isSafeInteger(value)&&value>=0;
+const hasDownloadId=job=>validDownloadId(job?.downloadId);
 const hasImageCleanup=state=>Boolean(state.retiredImageOwners?.length||state.jobs.some(job=>job.resourceLease));
 const recoverableImageCleanup=state=>Boolean(state.retiredImageOwners?.some(item=>!item.blocked)||state.jobs.some(job=>job.resourceLease));
 function scheduleImageCleanup(state) {
@@ -67,7 +70,7 @@ function retireImageOwner(state,instance) {
   if(records.length>62)throw new Error('未確定の画像処理が多すぎます。保存結果を確認してブラウザを再起動してください。');
   add({owner:prefix+'preview'});
   add({owner:prefix+'conversion',blocked:state.batch?.destination==='directory'&&state.jobs.some(job=>job.outcomeUnknown),
-    jobs:state.jobs.filter(job=>job.resourceLease?.owner===prefix+'conversion'&&!job.chromeOutcomeKnown&&(job.downloadId||job.submission)).map(job=>job.id)});
+    jobs:state.jobs.filter(job=>job.resourceLease?.owner===prefix+'conversion'&&!job.chromeOutcomeKnown&&(hasDownloadId(job)||job.submission)).map(job=>job.id)});
   state.retiredImageOwners=records;
 }
 // One mutation queue protects storage read/modify/write across concurrent events.
@@ -100,7 +103,8 @@ const save = async (state, extra = {}) => {
 };
 const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? normalizeManagedChromeOwnership(sessionDefaults(state)) : undefined; };
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>normalizeManagedChromeOwnership(sessionDefaults(v)));
-const hasPendingSubmission = state => state.jobs.some(job=>['queued','in_progress'].includes(job.status) && (job.submission && !job.downloadId || job.cancelRequested));
+const hasPendingSubmission = state => state.jobs.some(job=>['queued','in_progress'].includes(job.status)
+  && (job.submission && !hasDownloadId(job) || job.cancelRequested || !managed(state)&&hasDownloadId(job)));
 async function syncRecoveryAlarm() {
   if (!chrome.alarms?.create) return;
   const pending=(await all()).some(state=>hasPendingSubmission(state)||recoverableImageCleanup(state));
@@ -138,7 +142,7 @@ export async function openWorkspace(tab) {
         await chrome.tabs.update(state.workspaceTabId, {active:true}); return state.id;
       }
     }
-    if ((await all()).filter(state=>!state.closed).length >= 4) throw new Error('作業タブは4つまでです。使い終わった作業タブを閉じてください。');
+    if ((await all()).filter(state=>!state.closed||active(state)).length >= 4) throw new Error('作業タブは4つまでです。使い終わった作業タブを閉じてください。');
     const id = crypto.randomUUID();
     const state = {id, tabId:tab.id, url:tab.url || '', title:(tab.title || 'ページ').slice(0,160), items:[], jobs:[], notices:[], scanned:false};
     // Open inactive first so messages cannot arrive before the session is persisted.
@@ -307,15 +311,123 @@ function matchesSubmissionPath(job,item) {
 function submissionMatches(job,item,usedIds = new Set()) {
   const start=job.submission?.startedAt;
   const when=Date.parse(item.startTime);
-  return Number.isFinite(start) && item.byExtensionId === chrome.runtime.id && item.url === job.submission.url
+  return Number.isFinite(start) && validDownloadId(item.id) && item.byExtensionId === chrome.runtime.id && item.url === job.submission.url
     && when >= start && when <= start+SUBMISSION_TIMEOUT && !usedIds.has(item.id) && matchesSubmissionPath(job,item);
 }
 function usedDownloadIds(states,owner,job) {
   return new Set(states.flatMap(state=>[...(state.jobs || []),...(state.history || [])]
-    .filter(other=>other.downloadId && !(state.id === owner.id && other.id === job.id)).map(other=>other.downloadId)));
+    .filter(other=>hasDownloadId(other) && !(state.id === owner.id && other.id === job.id)).map(other=>other.downloadId)));
+}
+const byteCount=value=>Number.isSafeInteger(value)&&value>=0;
+function nativeBudget(state) {
+  const budget=state.batch?.transferBudget;
+  try {if(budget?.version===MEDIA_POLICY_VERSION){transferBudgetRemaining(budget);return budget;}} catch {}
+  return null;
+}
+function reserveNativeTransfer(state,job) {
+  const budget=requireTransferBudget(state);
+  if(state.batch.nativeLegacy)throw new Error('以前の保存の受信量を確認できません。新しい保存として準備してください。');
+  if(state.batch.nativeClockInvalid)throw new Error('時計の変更により今回の保存期限を確認できません。新しい保存として準備してください。');
+  const maxBytes=Math.min(MEDIA_LIMITS.original.maxBytes,transferBudgetRemaining(budget),transferOutputBudgetRemaining(budget));
+  if(!maxBytes)throw new Error('今回の保存の容量予算を使い切りました。新しい保存として準備してください。');
+  const startedAt=Date.now();
+  state.batch.transferBudget=reserveTransferAttempt(budget,{attemptId:job.id,logicalJobId:job.logicalJobId,maxBytes,maxOutputBytes:maxBytes,now:startedAt});
+  job.transfer={maxBytes,maxOutputBytes:maxBytes,startedAt,deadline:Math.min(budget.deadline,startedAt+MEDIA_LIMITS.original.timeoutMs)};
+  job.nativeObservation={startedAt,deadline:job.transfer.deadline,lastObservedAt:startedAt,lastProgressAt:startedAt,
+    bytesReceived:0,outputBytes:0,knownTotalBytes:0,bytesKnown:false,outputKnown:false};
+}
+function nativeUnknown(state,job,reason) {
+  if(managed(state))return;
+  const attempt=transferAttempt(state,job);
+  if(nativeBudget(state)&&attempt?.status==='reserved') {
+    state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,outcome:'unknown'});
+  }
+  job.transfer={...job.transfer,usageUnknown:true,outputUnknown:true};
+  job.status='in_progress';job.outcomeUnknown=true;delete job.chromeOutcomeKnown;
+  job.error=reason;
+}
+function nativeTotals(state) {
+  const budget=nativeBudget(state);
+  let input=budget?.consumedBytes||0,output=budget?.outputBytes||0;
+  for(const job of state.jobs)if(!transferAttempt(state,job)||transferAttempt(state,job).status==='reserved') {
+    input+=job.nativeObservation?.bytesReceived||0;output+=job.nativeObservation?.outputBytes||0;
+  }
+  return {input,output};
+}
+function accountNativeObservation(state,job) {
+  const budget=nativeBudget(state),attempt=transferAttempt(state,job),observation=job.nativeObservation;
+  if(!budget||!attempt)return;
+  if(attempt.status==='reserved') {
+    state.batch.transferBudget=recordTransferBytes(budget,{attemptId:job.id,bytesReceived:observation.bytesReceived});return;
+  }
+  // Unknown acceptance is already charged at the full allowance. Later
+  // observations can add overshoot; they can never refund that charge.
+  const chargedBytes=Math.max(attempt.chargedBytes||0,observation.bytesReceived);
+  const chargedOutputBytes=Math.max(attempt.chargedOutputBytes||0,observation.outputBytes);
+  state.batch.transferBudget={...budget,consumedBytes:budget.consumedBytes+chargedBytes-(attempt.chargedBytes||0),
+    outputBytes:budget.outputBytes+chargedOutputBytes-(attempt.chargedOutputBytes||0),attempts:{...budget.attempts,[job.id]:{
+      ...attempt,bytesReceived:Math.max(attempt.bytesReceived,observation.bytesReceived),
+      outputBytes:Math.max(attempt.outputBytes||0,observation.outputBytes),chargedBytes,chargedOutputBytes}}};
+}
+function observeNativeDownload(state,job,item) {
+  const now=Date.now();
+  if(!job.nativeObservation) {
+    const when=Number.isFinite(job.transfer?.startedAt)?job.transfer.startedAt:Date.parse(item.startTime);
+    const startedAt=Number.isFinite(when)&&when>=0?when:null;
+    job.nativeObservation={startedAt,deadline:job.transfer?.deadline??(startedAt===null?now:startedAt+MEDIA_LIMITS.original.timeoutMs),
+      lastObservedAt:now,lastProgressAt:startedAt??now,bytesReceived:0,outputBytes:0,knownTotalBytes:0,bytesKnown:false,outputKnown:false};
+    if(!transferAttempt(state,job)&&state.batch)state.batch.nativeLegacy=true;
+  }
+  const observation=job.nativeObservation;
+  const clockReversed=now<observation.lastObservedAt||observation.startedAt!==null&&now<observation.startedAt;
+  observation.lastObservedAt=Math.max(observation.lastObservedAt,now);
+  if(byteCount(item.bytesReceived)) {
+    if(item.bytesReceived>observation.bytesReceived&&!clockReversed)observation.lastProgressAt=now;
+    observation.bytesReceived=Math.max(observation.bytesReceived,item.bytesReceived);observation.bytesKnown=true;
+    observation.outputBytes=Math.max(observation.outputBytes,item.bytesReceived);observation.outputKnown=true;
+  }
+  if(byteCount(item.fileSize)){observation.outputBytes=Math.max(observation.outputBytes,item.fileSize);observation.outputKnown=true;}
+  if(byteCount(item.totalBytes))observation.knownTotalBytes=Math.max(observation.knownTotalBytes,item.totalBytes);
+  accountNativeObservation(state,job);
+  const budget=nativeBudget(state),totals=nativeTotals(state);
+  const maxBytes=job.transfer?.maxBytes??MEDIA_LIMITS.original.maxBytes;
+  const maxOutput=job.transfer?.maxOutputBytes??MEDIA_LIMITS.original.maxBytes;
+  if(clockReversed){if(state.batch)state.batch.nativeClockInvalid=true;return '時計が戻ったため保存の期限を確認できません。安全のため停止します。';}
+  if(observation.startedAt===null)return '保存の開始時刻を確認できません。安全のため停止します。';
+  if(now>=observation.deadline||budget&&now>=budget.deadline)return '保存の制限時間を超えたため停止します。';
+  if(observation.bytesReceived>maxBytes||observation.knownTotalBytes>maxBytes||observation.outputBytes>maxOutput)return '画像の観測容量が保存の上限を超えたため停止します。';
+  if(totals.input>(budget?.maxBytes??MEDIA_LIMITS.batch.maxBytes)||totals.output>(budget?.maxOutputBytes??MEDIA_LIMITS.batch.maxOutputBytes))return '今回の保存の観測容量が上限を超えたため停止します。';
+  if(now-observation.lastProgressAt>=MEDIA_LIMITS.idleTimeoutMs)return '30秒間受信が進まなかったため保存を停止します。';
+  return '';
+}
+function settleNativeTransfer(state,job) {
+  if(managed(state)||!job.chromeOutcomeKnown||!['complete','interrupted'].includes(job.status))return;
+  const attempt=transferAttempt(state,job),observation=job.nativeObservation;
+  if(nativeBudget(state)&&attempt?.status==='reserved') {
+    const usageUnknown=!observation?.bytesKnown;
+    const outputUnknown=!observation?.outputKnown;
+    state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,
+      bytesReceived:usageUnknown?undefined:observation.bytesReceived,outcome:job.status,
+      outputBytes:observation?.outputBytes||0,outputUnknown});
+    job.transfer={...job.transfer,settledAt:Date.now(),usageUnknown,outputUnknown};
+  }
+  knownTransferOutcome(state,job,job.status);delete job.outcomeUnknown;
+}
+function settleNativeFailure(state,job) {
+  if(managed(state))return;
+  const attempt=transferAttempt(state,job);
+  if(nativeBudget(state)&&attempt?.status==='reserved') {
+    state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,
+      bytesReceived:job.nativeObservation?.bytesReceived||0,outcome:'interrupted',outputBytes:job.nativeObservation?.outputBytes||0});
+  }
+  knownTransferOutcome(state,job,'interrupted');
 }
 async function refreshJob(job,state) {
-  if (!job.downloadId && job.submission) {
+  if(job.acceptanceConflict) {
+    nativeUnknown(state,job,'保存受付のIDが一致しません。Chromeの履歴を確認してください。自動再送と取消は行いません。');
+    job.status='in_progress';job.outcomeUnknown=true;return;
+  }
+  if (!hasDownloadId(job) && job.submission) {
     const startedAt=job.submission.startedAt;
     let recent=[];
     if (Number.isFinite(startedAt)) {
@@ -323,45 +435,68 @@ async function refreshJob(job,state) {
     }
     const usedIds=usedDownloadIds(await all(),state,job);
     const matches=recent.filter(item=>submissionMatches(job,item,usedIds));
-    if (matches.length === 1) { job.downloadId=matches[0].id; delete job.submission; delete job.error; }
+    if (matches.length === 1) {
+      job.downloadId=matches[0].id;job.downloadBinding={id:job.downloadId,...job.submission};
+      delete job.submission;delete job.error;
+    }
     else if (!Number.isFinite(startedAt) || Date.now()-startedAt >= SUBMISSION_TIMEOUT) {
-      if (managed(state)) {
-        // A missing/ambiguous acceptance result does not prove that Chrome
-        // stopped consuming the Blob. Retain the bounded matching evidence and
-        // durable cancel intent until an actual owned terminal item is found.
-        job.status='in_progress';job.outcomeUnknown=true;delete job.chromeOutcomeKnown;
-        job.error='Chromeの保存受付と結果を確認できません。照合が終わるまで再試行できません。';
-        return;
-      }
-      job.status='interrupted';
-      job.error='保存結果を確認できませんでした。Chromeのダウンロード履歴を確認してから再試行してください。同名ファイルは上書きしません。';
-      delete job.submission;
+      // Missing acceptance is never proof that Chrome stopped. Retain matching
+      // evidence and cancel only after an owned ID has actually been found.
+      job.status='in_progress';job.outcomeUnknown=true;delete job.chromeOutcomeKnown;
+      job.error='Chromeの保存受付と結果を確認できません。照合が終わるまで再試行できません。';
+      nativeUnknown(state,job,job.error);
+      if(!job.cancelRequested){job.cancelRequested=true;job.cancelReason='保存受付を確認できないため、確認でき次第停止します。';await save(state);}
       return;
     } else { job.status='in_progress'; job.error='Chromeで保存の開始を確認しています。30秒以内に確認できない場合は中断として表示します。'; return; }
   }
-  if (!job.downloadId || !['queued','in_progress'].includes(job.status)) return;
+  if (!hasDownloadId(job) || !['queued','in_progress'].includes(job.status)) return;
   const [item] = await chrome.downloads.search({id:job.downloadId});
+  if(!item) {
+    nativeUnknown(state,job,'Chromeのダウンロード履歴から保存結果を照合しています。確定するまで再試行できません。');
+    applyChromeDownload(job,item,state);return;
+  }
+  const owned=value=>value&&(value.id===undefined||value.id===job.downloadId)
+    &&(!value.byExtensionId||value.byExtensionId===chrome.runtime.id)
+    &&(!(job.downloadBinding?.url||job.url)||!value.url||value.url===(job.downloadBinding?.url||job.url));
+  if(!owned(item)||job.acceptanceConflict) {
+    nativeUnknown(state,job,'保存IDの所有者を確認できません。他のダウンロードを変更せず照合を待っています。');
+    job.status='in_progress';job.outcomeUnknown=true;job.ownershipMismatch=true;delete job.chromeOutcomeKnown;return;
+  }
+  delete job.ownershipMismatch;
+  const limitReason=managed(state)?'':observeNativeDownload(state,job,item);
   applyChromeDownload(job,item,state);
+  settleNativeTransfer(state,job);
+  if(limitReason) {
+    job.nativeLimitExceeded=limitReason;
+    if(job.status==='in_progress'&&!job.cancelRequested) {
+      job.cancelRequested=true;job.cancelReason=limitReason;
+      await save(state); // Persist the exact owned cancellation intent first.
+    }
+  }
   if (job.cancelRequested && job.status === 'in_progress') {
     try { await chrome.downloads.cancel(job.downloadId); } catch {}
     // Cancellation races completion and can settle asynchronously. Keep the
     // durable intent until Chrome reports the real terminal state.
     const [current]=await chrome.downloads.search({id:job.downloadId});
+    if(!owned(current)) {
+      nativeUnknown(state,job,'保存結果を確認できません。Chromeの照合が終わるまで再試行できません。');
+      job.status='in_progress';job.outcomeUnknown=true;delete job.chromeOutcomeKnown;return;
+    }
+    if(!managed(state))observeNativeDownload(state,job,current);
     applyChromeDownload(job,current,state);
+    settleNativeTransfer(state,job);
     if (job.status === 'interrupted') job.error=job.cancelReason || '停止しました。';
   }
 }
 function applyChromeDownload(job,item,state) {
   if (!item) {
-    job.status='interrupted';job.error='ダウンロード履歴から見つかりません。再試行できます。';
-    if (managed(state)) {
-      job.status='in_progress';job.outcomeUnknown=true;
-      job.error='Chromeのダウンロード履歴から保存結果を照合しています。確定するまで再試行できません。';
-    }
+    job.status='in_progress';job.outcomeUnknown=true;
+    job.error='Chromeのダウンロード履歴から保存結果を照合しています。確定するまで再試行できません。';
     delete job.chromeOutcomeKnown;
     return;
   }
-  job.bytesReceived = item.bytesReceived; job.totalBytes = item.totalBytes;
+  job.bytesReceived = !managed(state)&&job.nativeObservation ? job.nativeObservation.bytesReceived : item.bytesReceived;
+  job.totalBytes = !managed(state)&&job.nativeObservation ? job.nativeObservation.knownTotalBytes||item.totalBytes : item.totalBytes;
   if (item.filename) job.actualFilename = String(item.filename).slice(0,2048);
   if (item.mime) { job.mime=item.mime; job.typeKnown=Boolean(extensionForMime(item.mime)); }
   job.status = item.state;
@@ -382,20 +517,92 @@ function forgetSubmission(id) {
 }
 async function submitDownload(state,job,url) {
   job.status='in_progress';
-  job.submission={url,filename:job.filename,startedAt:Date.now()};
-  await save(state);
-  const entry={state,job,url,downloadId:null,timer:null};
+  job.submission={token:crypto.randomUUID(),url,filename:job.filename,startedAt:Date.now()};
+  try {await save(state);} catch(error) {
+    // The API has not been called yet, regardless of whether a storage
+    // acknowledgement itself was uncertain. This local failure is not proof
+    // of an accepted Chrome download.
+    delete job.submission;throw error;
+  }
+  const submission={...job.submission};
+  const entry={state,job,url,downloadId:null,apiAcceptedId:null,acceptedEventId:null,timer:null,timedOut:false};
   entry.timer=setTimeout(()=>{if (submissions.get(job.id) === entry) forgetSubmission(job.id);},FILENAME_DECISION_TTL);
   entry.timer?.unref?.();
   submissions.set(job.id,entry);
+  const bind=(current,id,apiAccepted=true)=>{
+    current.downloadId=id;current.downloadBinding={id,...submission,apiAccepted};
+    delete current.submission;
+  };
+  const conflict=(current,owner,apiId,eventId)=>{
+    current.submission={...submission,apiAcceptedId:apiId,eventAcceptedId:eventId};
+    current.acceptanceConflict=true;current.status='in_progress';current.outcomeUnknown=true;
+    nativeUnknown(owner,current,'保存受付のIDが一致しません。Chromeの履歴を確認してください。自動再送と取消は行いません。');
+    forgetSubmission(current.id);
+  };
+  const late=({id,error})=>serial(async()=>{
+    const current=await load(state.id),owned=current?.jobs.find(item=>item.id===job.id);
+    if(!owned||(owned.submission?.token!==submission.token&&owned.downloadBinding?.token!==submission.token))return;
+    const accepted=id??entry.acceptedEventId??owned.downloadId;
+    if(accepted!==null&&accepted!==undefined) {
+      if(hasDownloadId(owned)&&owned.downloadId!==accepted||usedDownloadIds(await all(),current,owned).has(accepted)) {
+        conflict(owned,current,accepted,owned.downloadId??entry.acceptedEventId);
+        await save(current);return;
+      }
+      if(owned.downloadId===accepted&&owned.chromeOutcomeKnown&&['complete','interrupted'].includes(owned.status)) {
+        // A late API acknowledgement cannot undo an independently confirmed
+        // terminal result, even if a subsequent history lookup would fail.
+        bind(owned,accepted,id!==undefined||owned.downloadBinding?.apiAccepted===true);await save(current);return;
+      }
+      bind(owned,accepted,id!==undefined||owned.downloadBinding?.apiAccepted===true);
+      if(!owned.chromeOutcomeKnown)owned.status='in_progress';
+      if(entry.timedOut) {
+        owned.cancelRequested=true;owned.cancelReason='保存受付の応答を確認できなかったため停止します。';
+        nativeUnknown(current,owned,owned.cancelReason);
+      }
+      await save(current);await pump(current);
+    } else {
+      // An actual API rejection without any acceptance evidence is retryable.
+      // A previously unknown reservation remains conservatively charged.
+      delete owned.submission;owned.status='interrupted';delete owned.outcomeUnknown;
+      owned.error=publicError(error);settleNativeFailure(current,owned);
+      await pump(current);
+    }
+  }).catch(()=>{});
+  const accepting=Promise.resolve().then(()=>chrome.downloads.download({url,filename:job.filename,conflictAction:'uniquify',saveAs:false}))
+    .then(id=>{entry.downloadId=id;entry.apiAcceptedId=id;if(entry.timedOut)void late({id});return id;},error=>{
+      if(entry.timedOut)void late({error});throw error;
+    });
+  accepting.catch(()=>{});
+  let timer;
   try {
-    const id=await chrome.downloads.download({url,filename:job.filename,conflictAction:'uniquify',saveAs:false});
+    const result=await Promise.race([accepting.then(id=>({id})),new Promise(resolve=>{
+      timer=setTimeout(()=>resolve({unknown:true}),ACCEPTANCE_TIMEOUT);timer.unref?.();
+    })]);
+    if(result.unknown||!Number.isSafeInteger(result.id)||result.id<0) {
+      entry.timedOut=true;
+      if(entry.acceptedEventId!==null&&entry.downloadId!==null&&entry.acceptedEventId!==entry.downloadId) {
+        conflict(job,state,entry.downloadId,entry.acceptedEventId);await save(state);return undefined;
+      }
+      if(validDownloadId(entry.downloadId))bind(job,entry.downloadId,entry.apiAcceptedId===entry.downloadId);
+      else if(entry.acceptedEventId!==null)bind(job,entry.acceptedEventId,false);
+      else job.submission={...submission,apiPending:true};
+      job.status='in_progress';job.outcomeUnknown=true;
+      job.cancelRequested=true;job.cancelReason='保存受付の応答を確認できなかったため、確認でき次第停止します。';
+      nativeUnknown(state,job,job.cancelReason);await save(state);return job.downloadId;
+    }
     // Chrome may resolve this API before dispatching its filename event. Keep
     // the accepted ID even while the surrounding save() still has an old clone.
-    entry.downloadId=id;
-    return id;
-  } catch (error) { forgetSubmission(job.id); throw error; }
-  finally { delete job.submission; }
+    if(entry.acceptedEventId!==null&&entry.acceptedEventId!==result.id) {
+      conflict(job,state,result.id,entry.acceptedEventId);await save(state);return undefined;
+    }
+    if(usedDownloadIds(await all(),state,job).has(result.id)) {
+      conflict(job,state,result.id,'already-owned');await save(state);return undefined;
+    }
+    bind(job,result.id);return result.id;
+  } catch (error) {
+    if(entry.acceptedEventId!==null) {bind(job,entry.acceptedEventId,false);return entry.acceptedEventId;}
+    forgetSubmission(job.id);delete job.submission;throw error;
+  } finally {clearTimeout(timer);}
 }
 function safeDownloadPath(filename) {
   return typeof filename === 'string' && filename.length <= 2048 && !/[\\\x00-\x1f<>:"|?*]/.test(filename)
@@ -429,23 +636,23 @@ function persistNameDecision(match,item,decision) {
   serial(async()=>{
     const state=await load(sessionId);
     const job=state?.jobs.find(job=>job.id === jobId);
-    if (!job || job.downloadId && job.downloadId !== item.id) return;
-    if (!job.downloadId && ['queued','in_progress'].includes(job.status)) job.downloadId=item.id;
+    if (!job || job.acceptanceConflict || hasDownloadId(job) && job.downloadId !== item.id) return;
+    if (!hasDownloadId(job) && ['queued','in_progress'].includes(job.status)) job.downloadId=item.id;
     Object.assign(job,patch);
     delete job.submission;
-    if (job.cancelRequested && job.downloadId && job.status === 'in_progress') await refreshJob(job,state);
+    if (job.cancelRequested && hasDownloadId(job) && job.status === 'in_progress') await refreshJob(job,state);
     await save(state);
   }).catch(()=>{});
 }
 chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
   let finished=false;
   const suggest=value=>{ if (finished) return; finished=true; if (value) suggestCallback(value); else suggestCallback(); };
-  if (item.byExtensionId !== chrome.runtime.id) { suggest(); return false; }
+  if (item.byExtensionId !== chrome.runtime.id || !validDownloadId(item.id)) { suggest(); return false; }
   const entries=[...submissions.values()];
   const accepted=entries.filter(entry=>entry.downloadId === item.id);
-  const unresolved=entries.filter(entry=>!entry.downloadId && entry.url === item.url);
-  const pending=accepted.length === 1 ? accepted[0] : !accepted.length && unresolved.length === 1 ? unresolved[0] : null;
+  const pending=accepted.length === 1 ? accepted[0] : null;
   if (pending) {
+    pending.acceptedEventId=item.id;pending.downloadId=item.id;
     const decision=nameDecision(item,pending,suggest);
     persistNameDecision(pending,item,decision);
     forgetSubmission(pending.job.id);
@@ -458,17 +665,21 @@ chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
     const known=states.flatMap(state=>state.jobs.filter(job=>job.downloadId === item.id).map(job=>({state,job})));
     if (known.length === 1) found=known[0];
     else if (!known.length) {
-      const pending=states.flatMap(state=>state.jobs.filter(job=>!job.downloadId && job.submission && submissionMatches(job,item,usedDownloadIds(states,state,job))).map(job=>({state,job})));
+      const pending=states.flatMap(state=>state.jobs.filter(job=>!hasDownloadId(job) && job.submission && !job.acceptanceConflict && submissionMatches(job,item,usedDownloadIds(states,state,job))).map(job=>({state,job})));
       if (pending.length === 1) found=pending[0];
     }
-    const decision=nameDecision(item,found,suggest);
-    persistNameDecision(found,item,decision);
+    const runtime=found&&submissions.get(found.job.id);
+    const match=runtime?.state.id===found?.state.id?runtime:found;
+    if(runtime&&match===runtime){runtime.acceptedEventId=item.id;runtime.downloadId=item.id;}
+    const decision=nameDecision(item,match,suggest);
+    persistNameDecision(match,item,decision);
+    if(runtime&&match===runtime)forgetSubmission(runtime.job.id);
   }).catch(()=>suggest());
   return true;
 });
 async function pump(state) {
   for (const job of state.jobs) {
-    if (job.cancelRequested && !job.downloadId && !job.submission && ['queued','in_progress'].includes(job.status)) { job.status='interrupted'; job.error=job.cancelReason || '停止しました。'; }
+    if (job.cancelRequested && !hasDownloadId(job) && !job.submission && ['queued','in_progress'].includes(job.status)) { job.status='interrupted'; job.error=job.cancelReason || '停止しました。'; }
     else await refreshJob(job,state);
   }
   // A workspace prepares converted images and owns custom-folder writes. The
@@ -477,10 +688,23 @@ async function pump(state) {
   if (!state.jobs.some(j=>j.status === 'in_progress')) {
     for (const job of state.jobs.filter(j=>j.status === 'queued')) {
       try {
+        reserveNativeTransfer(state,job);
         job.downloadId = await submitDownload(state,job,job.url);
         job.status='in_progress'; await save(state); await refreshJob(job,state);
         if (job.status === 'in_progress') break;
-      } catch (error) { job.status='interrupted'; job.error=publicError(error); }
+      } catch (error) {
+        if(hasDownloadId(job)||job.submission||job.acceptanceConflict) {
+          if(job.chromeOutcomeKnown&&['complete','interrupted'].includes(job.status))settleNativeTransfer(state,job);
+          else {
+            nativeUnknown(state,job,'保存受付後の結果を確認できません。Chromeの照合が終わるまで再試行できません。');
+            job.cancelRequested=true;job.cancelReason='保存受付後の結果を確認できないため、確認でき次第停止します。';
+          }
+          // A query/storage failure after acceptance is never an API rejection
+          // and cannot authorize another native start in this pump.
+          break;
+        }
+        job.status='interrupted';job.error=publicError(error);settleNativeFailure(state,job);
+      }
     }
   }
   await save(state); return state;
@@ -492,9 +716,9 @@ async function stopJobs(state, reason) {
   // observe the same request even when its download ID is not available yet.
   if (unfinished.length) await save(state);
   for (const job of unfinished) {
-    if (job.downloadId || job.submission) {
+    if (hasDownloadId(job) || job.submission) {
       await refreshJob(job,state);
-      if (!job.downloadId && job.submission) job.error='停止を受け付けました。Chromeで保存開始を確認でき次第停止します。30秒以内の照合が終わるまで再試行できません。';
+      if (!hasDownloadId(job) && job.submission) job.error='停止を受け付けました。Chromeで保存開始を確認でき次第停止します。30秒以内の照合が終わるまで再試行できません。';
     } else { job.status='interrupted'; job.error=reason; }
   }
 }
@@ -515,8 +739,8 @@ function requireOwner(state, message) {
   }
 }
 function normalizeManagedChromeOwnership(state) {
-  if (managed(state) && state.batch.destination === 'downloads') for (const job of state.jobs) {
-    if (job.status === 'interrupted' && (job.downloadId || job.submission) && !job.chromeOutcomeKnown) {
+  if (!managed(state)||state.batch.destination === 'downloads') for (const job of state.jobs) {
+    if (job.status === 'interrupted' && (hasDownloadId(job) || job.submission) && !job.chromeOutcomeKnown) {
       // Earlier versions could mark a missing lookup as interrupted. That is
       // not proof that an accepted Blob has stopped being consumed by Chrome.
       job.status='in_progress';job.outcomeUnknown=true;
@@ -552,7 +776,7 @@ function recoverKnownChromeTransfer(state,job) {
 }
 function markManagedOutcomeUnknown(state,job) {
   job.outcomeUnknown=true;
-  if (state.batch.destination === 'downloads' && (job.downloadId || job.submission)) {
+  if (state.batch.destination === 'downloads' && (hasDownloadId(job) || job.submission)) {
     // Only an actual Chrome terminal result can resolve a Blob ownership doubt.
     recoverKnownChromeTransfer(state,job);
   } else if (job.status !== 'complete') {
@@ -574,7 +798,7 @@ function abandonManagedTransfers(state) {
   for (const job of state.jobs) {
     if (transferAttempt(state,job)?.status !== 'reserved') continue;
     const outputKnown=job.status==='complete' && (state.batch.destination === 'directory' || job.chromeOutcomeKnown);
-    const noFileAccepted=state.batch.destination === 'downloads' && !job.downloadId && !job.submission;
+    const noFileAccepted=state.batch.destination === 'downloads' && !hasDownloadId(job) && !job.submission;
     const outputUnknown=!(outputKnown || noFileAccepted);
     const outputBytes=outputKnown && Number.isSafeInteger(job.bytesReceived) && job.bytesReceived>=0 ? job.bytesReceived : 0;
     state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,outcome:'unknown',outputBytes,outputUnknown});
@@ -585,7 +809,7 @@ function abandonManagedTransfers(state) {
         job.status='interrupted';job.outcomeUnknown=true;
         job.error='書き込みの結果を確認できません。保存先のファイルを確認してから新しい保存として準備してください。';
       }
-    } else if (!job.downloadId && !job.submission) {
+    } else if (!hasDownloadId(job) && !job.submission) {
       // No Blob was accepted by Chrome. There is no OS file operation to retry
       // concurrently; source usage alone remains conservatively unknown.
       knownTransferOutcome(state,job,'interrupted');
@@ -749,7 +973,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         for (const update of (message.updates || []).slice(0,500)) {
           const job = state.jobs.find(job=>job.id === update.id);
           if (!job || !['queued','in_progress'].includes(job.status) || !['in_progress','complete','interrupted'].includes(update.status)) continue;
-          if (job.downloadId) { await refreshJob(job,state); continue; }
+          if (hasDownloadId(job)) { await refreshJob(job,state); continue; }
           // Converted Chrome downloads are saved only after Chrome confirms
           // completion. The page can report preparation or a conversion error.
           if (state.batch.destination === 'downloads' && update.status === 'complete') continue;
@@ -773,7 +997,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         requireOwner(state,message);
         if (state.batch.destination !== 'downloads' || !['jpg','png','webp'].includes(state.batch.format)) throw new Error('この保存形式では変換後のダウンロードを開始できません。');
         const job=state.jobs.find(job=>job.id === message.jobId);
-        if (!job || job.status !== 'in_progress' || job.downloadId || job.cancelRequested) throw new Error('この画像の保存は終了したか、停止しました。');
+        if (!job || job.status !== 'in_progress' || hasDownloadId(job) || job.cancelRequested) throw new Error('この画像の保存は終了したか、停止しました。');
         if (typeof message.blobURL !== 'string' || !message.blobURL.startsWith(`blob:${chrome.runtime.getURL('')}`) || message.blobURL.length > 2048) throw new Error('変換後の画像データが不正です。');
         const lease=message.resourceLease;
         if(state.imageInstance===message.instance&&!lease)throw new Error('変換画像の資源予約を確認できません。');
@@ -787,7 +1011,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
           if(snapshot[lease.id]?.owner!==expected)throw new Error('変換画像の資源予約が失効しました。');
           job.resourceLease={id:lease.id,owner:expected};
         }
-        if (state.jobs.some(other=>other !== job && other.downloadId && other.status === 'in_progress')) throw new Error('前の画像の保存が終わってから開始してください。');
+        if (state.jobs.some(other=>other !== job && hasDownloadId(other) && other.status === 'in_progress')) throw new Error('前の画像の保存が終わってから開始してください。');
         try {
           job.downloadId=await submitDownload(state,job,message.blobURL);
         } catch (error) { job.status='interrupted';job.error=publicError(error);await save(state);return state; }
@@ -805,8 +1029,10 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
       case 'retry': {
         if(active(state)) throw new Error('保存処理中です。');
         if(managed(state) && state.batch.owner !== message.instance) throw new Error('この保存処理は別の作業ページに引き継がれました。');
-        if (managed(state)) {
+        if (managed(state)||state.jobs.some(job=>job.status==='interrupted')) {
           const budget=requireTransferBudget(state);
+          if(!managed(state)&&state.batch.nativeLegacy)throw new Error('以前の保存の受信量を確認できません。新しい保存として準備してください。');
+          if(!managed(state)&&state.batch.nativeClockInvalid)throw new Error('時計の変更により今回の保存期限を確認できません。新しい保存として準備してください。');
           if (Date.now() >= budget.deadline) throw new Error('今回の保存の制限時間を超えました。新しい保存として準備してください。');
           if (!transferBudgetRemaining(budget)) throw new Error('今回の保存の容量予算を使い切りました。新しい保存として準備してください。');
           if (!transferOutputBudgetRemaining(budget)) throw new Error('今回の保存の出力容量予算を使い切りました。新しい保存として準備してください。');
@@ -815,7 +1041,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
             if ((Object.hasOwn(budget.logicalAttempts,job.logicalJobId) ? budget.logicalAttempts[job.logicalJobId] : 0) >= budget.maxAttempts) throw new Error('この画像の再試行回数の上限に達しました。新しい保存として準備してください。');
           }
         }
-        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.transfer;delete job.chromeOutcomeKnown;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; delete job.cancelRequested; delete job.cancelReason; delete job.submission; }
+        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.transfer;delete job.nativeObservation;delete job.downloadBinding;delete job.nativeLimitExceeded;delete job.acceptanceConflict;delete job.ownershipMismatch;delete job.chromeOutcomeKnown;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; delete job.cancelRequested; delete job.cancelReason; delete job.submission; }
         if(managed(state)) {await save(state);return state;}
         return pump(state);
       }
@@ -868,6 +1094,17 @@ chrome.downloads.onChanged.addListener(delta => {
   serial(()=>reconcilePendingStates(delta.id,true)).catch(()=>{});
 });
 chrome.downloads.onCreated?.addListener(item=>{
+  if(item.byExtensionId===chrome.runtime.id) {
+    // Event evidence is global, not just unique among this worker's runtime
+    // entries. A persisted old attempt may own the same URL/path after restart.
+    all().then(states=>{
+      const matches=states.flatMap(state=>state.jobs.filter(job=>!hasDownloadId(job)&&job.submission&&!job.acceptanceConflict
+        &&submissionMatches(job,item,usedDownloadIds(states,state,job))).map(job=>({state,job})));
+      if(matches.length!==1)return;
+      const match=matches[0],entry=submissions.get(match.job.id);
+      if(entry?.state.id===match.state.id){entry.acceptedEventId=item.id;entry.downloadId=item.id;}
+    }).catch(()=>{});
+  }
   serial(()=>reconcilePendingStates(item.id,true)).catch(()=>{});
 });
 chrome.alarms?.onAlarm.addListener(alarm=>{
