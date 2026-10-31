@@ -58,7 +58,7 @@ async function assertFilterGeometry(workspace,label) {
 }
 let context;
 try {
-  context=await chromium.launchPersistentContext(join(scratch,'profile'),{channel:process.env.CHROME_CHANNEL || 'chrome',headless:true,acceptDownloads:true,viewport:{width:1280,height:900},ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging','--autoplay-policy=no-user-gesture-required','--no-first-run']});
+  context=await chromium.launchPersistentContext(join(scratch,'profile'),{channel:process.env.CHROME_CHANNEL || 'chrome',headless:true,chromiumSandbox:true,acceptDownloads:true,viewport:{width:1280,height:900},ignoreDefaultArgs:['--disable-extensions'],args:['--enable-unsafe-extension-debugging','--autoplay-policy=no-user-gesture-required','--no-first-run']});
   const browserSession=await context.browser().newBrowserCDPSession();
   const {id}=await browserSession.send('Extensions.loadUnpacked',{path:extension});
   let worker=context.serviceWorkers().find(w=>w.url().includes(id));

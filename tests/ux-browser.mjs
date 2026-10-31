@@ -22,7 +22,7 @@ const workerPath = join(extension, 'background.js');
 await writeFile(workerPath, (await readFile(workerPath, 'utf8'))
   .replace('let finished=false;', 'globalThis.__qaFilenameEvents ||= [];globalThis.__qaFilenameEvents.push(item);let finished=false;')
   .replace('if (alarm.name !== RECOVERY_ALARM)', 'globalThis.__qaAlarmEvents ||= [];globalThis.__qaAlarmEvents.push(alarm.name);if (alarm.name !== RECOVERY_ALARM)')
-  + '\nglobalThis.__qaOpenWorkspace=openWorkspace;globalThis.__qaCollect=collect;globalThis.__qaSerial=serial;\n');
+  + '\nglobalThis.__qaOpenWorkspace=openWorkspace;globalThis.__qaCollect=collect;globalThis.__qaSerial=serial;globalThis.__qaBudget={createTransferBudget,reserveTransferAttempt};\n');
 const manifestPath = join(extension, 'manifest.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 manifest.host_permissions = ['http://127.0.0.1/*'];
@@ -76,6 +76,7 @@ let context, worker;
 const errors = [];
 try {
   context = await chromium.launchPersistentContext(join(scratch, 'profile'), {
+    chromiumSandbox:true,
     channel: process.env.CHROME_CHANNEL || 'chrome', headless: true, acceptDownloads: false,
     viewport: { width: 1280, height: 900 }, ignoreDefaultArgs: ['--disable-extensions'],
     args: ['--enable-unsafe-extension-debugging', '--no-first-run'],
@@ -565,31 +566,47 @@ try {
   // smoke test covers an explicit worker stop/restart. DevTools stopAllWorkers
   // is not a reliable way to model natural alarm wake in this test harness.
   await manager.close();
-  const alarmStateId='ux-alarm-orphan';
+  const alarmStateId='ux-alarm-owned';
   await source.waitForTimeout(500);
-  await worker.evaluate(async({origin,id})=>globalThis.__qaSerial(async()=>{
-    const now=Date.now();
+  const alarmAcceptedId=await worker.evaluate(origin=>chrome.downloads.download({url:origin+'/red.svg',filename:'ImageCrate/Alarm recovery/001_owned.svg',conflictAction:'uniquify',saveAs:false}),origin);
+  // Drain the setup download's real events before creating the closed fixture;
+  // only the scheduled alarm should trigger its first reconciliation.
+  for(let attempt=0;attempt<100;attempt++){
+    if(await worker.evaluate(async id=>(await chrome.downloads.search({id}))[0]?.state==='complete',alarmAcceptedId))break;
+    await source.waitForTimeout(20);
+  }
+  await worker.evaluate(()=>globalThis.__qaSerial(async()=>{}));
+  await worker.evaluate(async({origin,id,downloadId})=>globalThis.__qaSerial(async()=>{
+    const {createTransferBudget,reserveTransferAttempt}=globalThis.__qaBudget;
+    const now=Date.now(),url=origin+'/red.svg',filename='ImageCrate/Alarm recovery/001_owned.svg';
+    // A positive API return supplies the owned ID. Expired unknown acceptance
+    // is deliberately retained by current policy, never invented as failed to
+    // unblock a queue. That failure boundary is covered by background tests.
+    let transferBudget=createTransferBudget({now});
+    transferBudget=reserveTransferAttempt(transferBudget,{attemptId:'owned-accepted',logicalJobId:'owned-accepted',maxBytes:128*1024*1024,maxOutputBytes:128*1024*1024,now});
     await chrome.storage.session.set({[`workspace:${id}`]:{
       id,tabId:-2,workspaceTabId:-1,url:origin,title:'Alarm recovery',closed:true,items:[],selectedItems:[],selectedURLs:[],history:[],notices:[],ui:{},revision:1,
-      batch:{id:'alarm-batch',destination:'downloads',format:'original',folderName:'Alarm recovery'},
-      jobs:[{id:'not-accepted',url:origin+'/not-accepted',filename:'ImageCrate/Alarm recovery/001_not-accepted.img',status:'in_progress',submission:{url:origin+'/not-accepted',filename:'ImageCrate/Alarm recovery/001_not-accepted.img',startedAt:now-60000}},
-        {id:'queued-after-orphan',url:origin+'/red.svg',filename:'ImageCrate/Alarm recovery/002_red.svg',status:'queued'}]
+      batch:{id:'alarm-batch',destination:'downloads',format:'original',folderName:'Alarm recovery',transferBudget},
+      jobs:[{id:'owned-accepted',logicalJobId:'owned-accepted',url,filename,status:'in_progress',downloadId,transfer:{maxBytes:128*1024*1024,maxOutputBytes:128*1024*1024,startedAt:now,deadline:now+120000}},
+        {id:'queued-after-owned',logicalJobId:'queued-after-owned',url:origin+'/red.svg',filename:'ImageCrate/Alarm recovery/002_red.svg',status:'queued'}]
     }});
     await chrome.alarms.create('imagecrate-pending-downloads',{when:now+3000,periodInMinutes:1});
-  }),{origin,id:alarmStateId});
+  }),{origin,id:alarmStateId,downloadId:alarmAcceptedId});
   const awakened=worker;
   const wakeDeadline=Date.now()+90000;let recovered=false;
   while(Date.now()<wakeDeadline){
     recovered=await awakened.evaluate(async id=>!(await chrome.storage.session.get(`workspace:${id}`))[`workspace:${id}`] && globalThis.__qaAlarmEvents?.includes('imagecrate-pending-downloads'),alarmStateId);
     if(recovered)break;await source.waitForTimeout(50);
   }
-  assert.equal(recovered,true,'the real alarm event reconciles the orphan and completes queued files without a workspace');
+  assert.equal(recovered,true,'the real alarm event confirms the owned native download and completes budgeted queued files without a workspace');
   const recoveredDownloads=await awakened.evaluate(()=>chrome.downloads.search({filenameRegex:'Alarm recovery'}));
-  assert.equal(recoveredDownloads.length,1);assert.equal(recoveredDownloads[0].state,'complete');
+  assert.equal(recoveredDownloads.length,1);assert.ok(recoveredDownloads.every(download=>download.state==='complete'));
+  const [confirmedSetup]=await awakened.evaluate(id=>chrome.downloads.search({id}),alarmAcceptedId);
+  assert.equal(confirmedSetup.state,'complete');assert.match(await readFile(confirmedSetup.filename,'utf8'),/<svg/);
   assert.match(await readFile(recoveredDownloads[0].filename,'utf8'),/<svg/);
   assert.equal(await awakened.evaluate(()=>chrome.alarms.get('imagecrate-pending-downloads')),undefined,'the recovery alarm is removed after reconciliation');
   report.limits.push('The real Chrome alarm wake test moves only the alarm scheduled time to 3 seconds; production uses a one-minute delay.');
-  checked('real Chrome alarm after workspace closure reconciles an orphan, completes the queue and clears the alarm');
+  checked('real Chrome alarm after workspace closure confirms owned native results, completes the budgeted queue and clears the alarm');
   await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2));
   console.log(`ImageCrate UX browser PASS: ${report.checks.length} checks. Screenshots/report: ${output}`);
   console.log('OS picker, real toolbar consent, screen reader and human experience remain unverified.');

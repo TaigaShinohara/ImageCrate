@@ -1,5 +1,25 @@
 # QA — v0.1
 
+## セキュリティ補強の最終検証 — 2026-10-31
+
+現行の収集・保存・プレビューの上限と保証範囲は [SECURITY-HARDENING.md](SECURITY-HARDENING.md) を参照。この節は、以下に残す過去の検証結果より新しい。
+
+- `npm test`: **296 PASS / 既存対象外1 SKIP**。巨大・不正・重複候補の仕事量、注入待機の分離、入力/出力/試行予算、deadline・idle timer遅延と時計逆行、遅延Promise、native I/O未確定、資源/lockの保持、worker回復、Chrome受付・所有ID・取消と完了の競合を含む。対象外は関連動画製品の録画lockテスト。
+- `npm run check` / `git diff --check`: PASS。Chrome116+ / MV3 / buildless、既存の権限とruntime依存を維持。CSPは画像表示をself/Blobに限定し、remote/dataの直接Image表示を拒否する。
+- `npm run test:browser`: 隔離Chrome **156.0.8078.79**でPASS。収集・選択・非表示選択込み保存・再試行・500件検索・worker再起動を回帰。JPEG/PNG/WebPの実再エンコード、署名・画素・alpha/JPEG白背景、2frame GIFの先頭静止画、実OPFS書込とChrome download、元形式のbyte保持、未知/破損形式の拒否を確認。
+- `npm run test:ux`: 同Chromeで **23項目PASS**。同意前placeholder、source寸法と384px/2048px生成画像の分離、条件・選択・draft/handle復元、checkbox→Tab→保存導線、viewer/別候補、360/640/1280px、実200% zoom、閉鎖後の実alarmによる所有ID照合・予算付きqueue継続を確認。スクリーンショットを主担当が目視。alarm試験は発火時刻だけ3秒へ短縮し、productionは1分のまま。
+- `npm run test:security`: 同Chromeで **12項目PASS、pageerror 0**。未同意/拒否時の追加画像取得ゼロ、別hostの同意分離、可視host/全path/portの説明、許可操作後focus、remote/data属性画像の実CSP拒否、生成BlobだけのImage表示、redirect拒否、既知/未知長の8MiB制限、30MP宣言のcodec未到達、filter/close/取消による失効・URL/ledger解放を確認。
+- 合成HttpOnly/SameSite=Lax Cookieだけを隔離profileへ設定。127.0.0.1/localhost両方でCookie到達、Refererなし、CORS許可ヘッダーのない別hostも明示同意後に取得成功。Cookie値やheaderは保存していない。この構成の観測であり、実サイトの全認証方式の保証ではない。
+- `CHROME_EXECUTABLE=<Chrome for Testing 116> npm run test:compat`: 実 **116.0.5845.96で10項目PASS、pageerror 0**。既存8項目にPNG/JPEG/WebP source×3encoderの9組と2frame GIF→先頭静止画を追加。実worker10生成/10終了、MIME・署名・寸法・画素・透明/JPEG白背景、各出力lease解放・最終共有ledgerゼロを確認。プレビューの本物のsuspend/disposeとChrome実終端を待ち、台帳の直接削除はしていない。
+- 最終のブラウザ自動試験は`chromiumSandbox:true`、個別の一時profile/拡張コピー・localhost合成データを使い、直列に実行。正本manifestへfixture用常時host権限やテストhookを追加していない。
+- 独立レビューでcollector、reader/writer、metadata/worker、preview、workspace/backgroundを相互点検。遅延出力の所有、live/retired owner、cleanup失敗後のtombstone、全fetch枠の合算、wildcard host、API/event不整合、ID 0、受付後の検索/保存失敗を修正し、対象範囲の未解決must-fixなし。
+
+実UIの途中確認: 同意UI統合時の隔離Chrome116で、正本manifestの実toolbar activeTab→収集、具体localhostの追加権限prompt、許可後の640×480寸法表示、macOS folder pickerのキャンセルと旧設定保持を確認。pickerの確定は操作ツール上で選択が無効と表示され、完了を確認できなかった。原因は未特定で、アプリの不具合と断定しない。現行Chromeの別processを操作対象として選べず、個人profileを変更しての追試は行っていない。
+
+未確認: 実OS pickerでの選択確定・書込許可拒否/再許可、実optional host権限の拒否/取消UI、通常Chromeで最新版を再読み込みした代表操作、実サイト固有の認証・リダイレクト、外付け/ネットワーク保存先、スクリーンリーダー、本人の理解・操作感。security suiteの権限拒否/取消は、必須localhost grantを削除できないため明記したAPI境界fixture。OPFSの成功を実OS pickerの成功扱いにしない。
+
+native Chrome保存の上限は観測と取消要求であり、書込前byte上限・wire総量・停止時刻やcodec内部RSSの厳密な保証ではない。通常profileへの反映確認と上の実操作は本人確認の残件とする。公開・ストア配布は行っていない。
+
 ## セキュリティ補強・収集処理 — 2026-10-31
 
 - `node --test tests/background.test.js tests/collector.test.js`: 98 PASS / 1既存の録画対象外SKIP。重複・不正token、途中再開、累積上限、mutation/root制限、空work応答、別workspaceの操作継続、同URL reload、旧結果破棄、未settle注入/後始末の再起動をまたぐ予約、元タブ閉鎖後の回復を確認。

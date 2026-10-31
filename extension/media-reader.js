@@ -13,21 +13,27 @@ function forget(promise) { Promise.resolve(promise).catch(() => {}); }
 export function createMediaOperation({signal, deadline, timeoutMs = MEDIA_LIMITS.original.timeoutMs,
   idleTimeoutMs = MEDIA_LIMITS.idleTimeoutMs, now = Date.now} = {}) {
   const controller = new AbortController();
+  let lastTime=now(),idleDeadline=Infinity;
   const absoluteDeadline = Math.min(Number.isFinite(deadline) ? deadline : Infinity,
-    now() + positive(timeoutMs, MEDIA_LIMITS.original.timeoutMs));
+    lastTime + positive(timeoutMs, MEDIA_LIMITS.original.timeoutMs));
   let absoluteTimer; let idleTimer; let disposed = false;
   const timeout = () => controller.abort(new DOMException('処理の制限時間を超えました。', 'TimeoutError'));
   const stopped = () => controller.abort(signal.reason);
+  const idleTimeout=()=>controller.abort(new DOMException(
+    `${Math.ceil(positive(idleTimeoutMs,MEDIA_LIMITS.idleTimeoutMs)/1000)}秒間処理が進みませんでした。接続や保存先を確認してください。`,'TimeoutError'));
   if (signal?.aborted) stopped(); else signal?.addEventListener('abort', stopped, {once:true});
   const check = () => {
-    if (now() >= absoluteDeadline && !controller.signal.aborted) timeout();
+    const current=now();
+    if(!Number.isFinite(current)||current<lastTime)controller.abort(new DOMException('時計の変更により処理期限を確認できません。','TimeoutError'));
+    lastTime=Math.max(lastTime,current);
+    if (current >= absoluteDeadline && !controller.signal.aborted) timeout();
+    if (current >= idleDeadline && !controller.signal.aborted) idleTimeout();
     if (controller.signal.aborted) throw abortReason(controller.signal);
   };
   const touch = () => {
     check(); clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => controller.abort(new DOMException(
-      '30秒間処理が進みませんでした。接続や保存先を確認してください。', 'TimeoutError')),
-    positive(idleTimeoutMs, MEDIA_LIMITS.idleTimeoutMs));
+    const idleDuration=positive(idleTimeoutMs,MEDIA_LIMITS.idleTimeoutMs);
+    idleDeadline=lastTime+idleDuration;idleTimer=setTimeout(idleTimeout,idleDuration);
   };
   absoluteTimer = setTimeout(timeout, Math.max(0, absoluteDeadline - now()));
   const wait = promise => {

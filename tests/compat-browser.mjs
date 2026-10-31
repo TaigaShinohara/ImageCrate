@@ -29,6 +29,15 @@ globalThis.__compatEvents=[];
 chrome.tabs.onRemoved.addListener(id=>globalThis.__compatEvents.push({event:'tab-removed',id}));
 chrome.storage.onChanged.addListener((changes,area)=>{if(area==='session')globalThis.__compatEvents.push({event:'session-change',changes:Object.entries(changes).map(([key,value])=>({key,removed:!value.newValue,closed:value.newValue?.closed}))});});
 `);
+const workspacePath=join(extension,'workspace.js');
+await writeFile(workspacePath,await readFile(workspacePath,'utf8')+`
+globalThis.__compatClosePreviews=async()=>{
+  const {imageResourceCoordinator}=await import('./image-decoder.js');
+  const before=Object.values(await imageResourceCoordinator().snapshot());
+  gallery.suspendPreviews();await previews.dispose();
+  return {before,after:Object.values(await imageResourceCoordinator().snapshot())};
+};
+`);
 const manifestPath = join(extension, 'manifest.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
 manifest.host_permissions = ['http://127.0.0.1/*'];
@@ -60,7 +69,7 @@ const checked = label => { report.checks.push(label); console.log(`PASS ${label}
 let context;
 try {
   context = await chromium.launchPersistentContext(profile, {
-    executablePath, headless: true, acceptDownloads: false, viewport: { width: 1200, height: 900 },
+    executablePath, headless: true, chromiumSandbox:true, acceptDownloads: false, viewport: { width: 1200, height: 900 },
     // Chrome 116's plain --headless is the older mode without extension support.
     ignoreDefaultArgs: ['--headless', '--disable-extensions'],
     args: ['--headless=new', `--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-first-run'],
@@ -240,6 +249,93 @@ try {
   }, [...png.bytes]);
   assert.deepEqual(decoded, { width: 640, height: 480, rgba: [204, 51, 102, 255] });
   checked('Chrome 116 SVG to real PNG conversion/download, signature, dimensions and decoded pixels');
+
+  // The SVG fixture uses the bounded rectangle renderer. Exercise actual
+  // createImageBitmap source decoding inside the dedicated worker as well.
+  // End the real preview lifecycle (the same suspend/dispose operations as
+  // pagehide) so later visibility events cannot recreate a legitimate cache
+  // during the direct-conversion ledger-zero checks. Never erase ledger data.
+  await source.bringToFront();
+  report.previewLifecycle=await manager.evaluate(()=>globalThis.__compatClosePreviews());
+  await manager.waitForFunction(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length===0,null,{polling:50});
+  const raster=await manager.evaluate(async()=>{
+    const {convertImage}=await import('./image-converter.js');
+    const {imageResourceCoordinator}=await import('./image-decoder.js');
+    const coordinator=imageResourceCoordinator(),NativeWorker=globalThis.Worker;
+    const trace={created:0,terminated:0,requests:[]};
+    globalThis.Worker=class extends NativeWorker{
+      constructor(...args){super(...args);trace.created++;this.__compatTerminated=false;}
+      postMessage(message,...rest){trace.requests.push({source:message.metadata?.format,width:message.metadata?.width,height:message.metadata?.height,frameCount:message.metadata?.frameCount,output:message.options?.format});return super.postMessage(message,...rest);}
+      terminate(){if(!this.__compatTerminated){this.__compatTerminated=true;trace.terminated++;}return super.terminate();}
+    };
+    const decode=async blob=>{
+      const image=await createImageBitmap(blob);let canvas;
+      try{
+        canvas=new OffscreenCanvas(image.width,image.height);const context=canvas.getContext('2d',{willReadFrequently:true});context.drawImage(image,0,0);
+        const pixel=(x,y)=>[...context.getImageData(Math.min(x,image.width-1),Math.min(y,image.height-1),1,1).data];
+        return {width:image.width,height:image.height,red:pixel(2,8),transparent:pixel(14,8),first:pixel(0,0)};
+      }finally{image.close();if(canvas){canvas.width=1;canvas.height=1;}}
+    };
+    const conversion=async(url,format)=>{
+      const ownerId='compat-raster:'+crypto.randomUUID();let blob;
+      try{
+        const before=trace.requests.length;blob=await convertImage(url,format,{ownerId});
+        if(typeof blob.releaseResources!=='function')throw new Error('Converted raster has no releaseResources owner.');
+        const held=Object.values(await coordinator.snapshot()).filter(entry=>entry.owner===ownerId);
+        if(held.reduce((sum,entry)=>sum+(entry.encodedBytes||0),0)!==blob.size||held.some(entry=>entry.pixels||entry.fetches))throw new Error('Raster output ownership does not match its retained Blob.');
+        return {format,type:blob.type,magic:[...new Uint8Array(await blob.slice(0,12).arrayBuffer())],pixels:await decode(blob),worker:trace.requests.slice(before)};
+      }finally{
+        await blob?.releaseResources?.();
+        if(Object.values(await coordinator.snapshot()).some(entry=>entry.owner===ownerId))throw new Error('Raster resources remained after releasing the converted output.');
+      }
+    };
+    try{
+      const canvas=document.createElement('canvas');canvas.width=16;canvas.height=12;
+      const context=canvas.getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,6,12);
+      const inputs={png:canvas.toDataURL('image/png'),jpg:canvas.toDataURL('image/jpeg',1),webp:canvas.toDataURL('image/webp',1)};
+      canvas.width=1;canvas.height=1;
+      const matrix=[];
+      for(const [source,url]of Object.entries(inputs))for(const format of ['jpg','png','webp'])matrix.push({source,...await conversion(url,format)});
+      // Two one-pixel frames use a global red/blue palette and distinct LZW
+      // payloads. The output must be a single static image of the red first frame.
+      const text=value=>new TextEncoder().encode(value);
+      const gifBytes=[...text('GIF89a'),1,0,1,0,128,0,0,255,0,0,0,0,255,
+        33,255,11,...text('NETSCAPE2.0'),3,1,0,0,0,
+        33,249,4,0,10,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,68,1,0,
+        33,249,4,0,10,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,76,1,0,59];
+      const gif=await conversion('data:image/gif;base64,'+btoa(String.fromCharCode(...gifBytes)),'png');
+      const remainingRecords=Object.values(await coordinator.snapshot());
+      return {matrix,gif,workersCreated:trace.created,workersTerminated:trace.terminated,remaining:remainingRecords.length,remainingRecords,documentHidden:document.hidden};
+    }finally{globalThis.Worker=NativeWorker;}
+  });
+  const magic=(entry,label)=>{
+    const expected={jpg:'image/jpeg',png:'image/png',webp:'image/webp'}[entry.format];assert.equal(entry.type,expected,`${label}: encoded MIME`);
+    if(entry.format==='jpg')assert.deepEqual(entry.magic.slice(0,3),[255,216,255],`${label}: JPEG signature`);
+    if(entry.format==='png')assert.deepEqual(entry.magic.slice(0,8),[137,80,78,71,13,10,26,10],`${label}: PNG signature`);
+    if(entry.format==='webp'){assert.equal(String.fromCharCode(...entry.magic.slice(0,4)),'RIFF');assert.equal(String.fromCharCode(...entry.magic.slice(8,12)),'WEBP');}
+  };
+  const near=(actual,expected,tolerance,label)=>expected.forEach((value,index)=>assert.ok(Math.abs(actual[index]-value)<=tolerance,`${label}: pixel ${actual} differs from ${expected}`));
+  for(const entry of raster.matrix){
+    const label=`Chrome116 ${entry.source}→${entry.format}`;magic(entry,label);
+    assert.deepEqual([entry.pixels.width,entry.pixels.height],[16,12],`${label}: decoded output dimensions`);
+    assert.deepEqual(entry.worker,[{source:entry.source==='jpg'?'jpeg':entry.source,width:16,height:12,frameCount:1,output:entry.format}],`${label}: the real worker receives validated source dimensions and raster format`);
+    near(entry.pixels.red,[255,0,0,255],30,label+' red');
+    if(entry.source==='jpg')near(entry.pixels.transparent,[0,0,0,255],15,label+' opaque JPEG source');
+    else if(entry.format==='jpg')near(entry.pixels.transparent,[255,255,255,255],10,label+' white transparency background');
+    else assert.equal(entry.pixels.transparent[3],0,`${label}: alpha survives`);
+  }
+  report.raster={matrix:raster.matrix,workersCreated:raster.workersCreated,workersTerminated:raster.workersTerminated,immediateRemaining:raster.remaining,immediateRecords:raster.remainingRecords,documentHidden:raster.documentHidden};
+  checked('Chrome 116 native raster worker: PNG/JPEG/WebP source × three encoders, MIME/magic/dimensions/pixels and output ownership');
+  magic(raster.gif,'Chrome116 GIF→PNG');assert.deepEqual([raster.gif.pixels.width,raster.gif.pixels.height],[1,1]);assert.deepEqual(raster.gif.pixels.first,[255,0,0,255]);
+  assert.deepEqual(raster.gif.worker,[{source:'gif',width:1,height:1,frameCount:2,output:'png'}]);
+  assert.equal(raster.workersCreated,10);assert.equal(raster.workersTerminated,10);
+  // Per-owner release is already checked after each conversion. Preview
+  // disposal above prevents any new cache ownership during final retirement.
+  await manager.waitForFunction(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length===0,null,{polling:50});
+  const finalRemaining=await worker.evaluate(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length);
+  assert.equal(finalRemaining,0,'all direct-conversion and preview reservations return to zero');report.raster.remaining=finalRemaining;
+  report.gif=raster.gif;checked('Chrome 116 animated GIF first-frame static output, worker termination and zero remaining shared ledger');
+  await manager.bringToFront();
   assert.deepEqual(errors, []);
   await manager.screenshot({ path: join(output, 'chrome116-workspace.png') });
   await writeFile(join(output, 'compat-report.json'), JSON.stringify(report, null, 2));
