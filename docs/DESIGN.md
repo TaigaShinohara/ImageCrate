@@ -1,5 +1,21 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## ImageCrate — 全14項目の現行契約、2026-10-31
+
+ImageCrateについては、この節と [UX-COMPLETION.md](UX-COMPLETION.md) を旧版より優先する。下のv1/v2、VideoHarbor、従来の実施結果は設計履歴であり、本変更の最終合格や人間による体験確認を表さない。公開・ストア申請は行わない。
+
+- 取得は1回500候補・12000要素で区切り、cursorで続きを取得する。上限到達で残りを永久に切り捨てない。DOM変更・期限切れは選択を保った先頭再スキャンへ案内し、保存失敗時の取得ページも再送可能にする。各取得分は現在表示する未選択候補を置換し、前の取得分の選択だけを別保持する。
+- 同じimg/pictureの候補は由来・descriptor・media・type・currentSrcの関係を持つ。通常一覧は代表候補を表示し、拡大表示から別候補を比較・選択できる。「選択済み」は条件・グループ・取得ページをまたぐ全選択を表示する。「今回追加」は直前の取得で増えたURLを示す。
+- 元ページ由来のnaturalWidth等は`source`であり、取得ファイルの実画素数と混同しない。拡張の画像表示で確認した`decoded`/`measured`寸法だけを最小寸法判定へ使い、未確認候補は残す。画像の読み込み直後に一覧を勝手に消さず、確認済み寸法で更新する操作を示す。
+- 選択・表示条件・表示モード・開閉状態・scroll位置・focusの起点はsessionに保持する。作業タブ再読み込み時に復元するが、ブラウザ終了や拡張再読み込み後の永続復元は保証しない。選択は各作業タブ500件、全作業タブの候補情報6MiB・session情報8MiBを上限予算とし、超過は状態を壊さず通知する。
+- 保存設定dialogはdraftを編集し、「設定を適用」でworker設定を確定する。キャンセル・閉じる・Escapeはdraftを破棄し、最後に適用した設定とhandleを保持する。新handleは別キーへ準備し、commit済みの応答を失った場合も実状態を確認して回復する。保存方法と最後のhandleは同じIndexedDB recordに記憶し、ページ別名と形式は新作業ページへ引き継がない。
+- 選択labelと拡大・保存移動buttonを分離し、altを選択名へ反映する。キーボードで保存操作へ移動し、一覧の候補へ戻れる。再描画・別候補・前後移動・dialog終了後に操作位置を復元する。キーボード用の保存移動buttonはoverlay表示とし、focusでカードや拡大buttonの位置を動かさない。
+- 再試行は元batchの中断分だけを、元の先・名前・形式で保存する。「新しい保存として準備」は中断分だけの別scopeを明示し、通常選択を保持する。取消時は通常選択へ戻し、確定時は元batch IDを由来として持つ新batchを作る。許可・取得・変換・書込・保存受付を区別してエラーと次の操作を示す。
+- Chromeの保存受付が未確定の間は、URLだけで別batchのdownloadを引き継がない。30秒の照合判定期限と所有・時刻・名前の照合で回復し、無期限の処理中や重複送信を避ける。未確定分がある間だけ内部`chrome.alarms`を1件使い、onCreated/onChanged/startupも照合し、全件解消後は解除する。Chrome116互換の1分遅延を使い、背景処理・OSスリープで遅れるため30秒以内の結果表示は保証しない。downloadの受付と実保存完了は区別する。host権限の範囲や外部通信は増やさない。
+- 元形式は内容を変換せず、拡張子不明候補へ既知画像MIMEによる名前を補う。任意フォルダでは先頭の限定的な署名確認も使う。確定できない形式は中立な`.img`と形式不明表示を使い、変換保存は実際の出力MIMEと一致する拡張子にする。
+
+全14項目の対応、独立審査で修正した安全性・focusの問題、今回の自動確認と本人試用の未確認範囲は [UX-COMPLETION.md](UX-COMPLETION.md) に集約する。最終suiteの数値は最終実行後に主担当が追記する。
+
 ## ImageCrate — 保存先とフォルダ名、2026-10-31
 
 追加の保存形式（元の形式/JPEG/PNG/WebP）、変換時の静止画・透過・batch・Blobの契約は [SAVE-DESTINATION.md](SAVE-DESTINATION.md) の「保存形式の追加」を優先する。保存先と名前に続けて形式を指定し、画面下で現在の形式を確認できる。
@@ -8,7 +24,7 @@
 
 ## ImageCrate v3 — gallery refinement, 2026-10-31
 
-ImageCrateの画面表現は [UX-REFINEMENT.md](UX-REFINEMENT.md) の詳細案v1を優先する。検索、画像グリッド、選択保存を常時表示。最小寸法/形式と使い方は開閉式とし、適用条件のチップと解除経路は閉鎖時も残す。カードの寸法/形式/保存状態、非表示選択件数、完了/中断/再試行は維持する。ローカルSVG、短い選択/開閉の反応、実状態に対応した進捗バーを用い、reduced-motionに対応。権限、取得、保存、sessionデータの契約はv2から変更しない。独立審査、案の比較、検証条件と人間評価の未確認範囲はリンク先を参照。
+ImageCrateの画面表現は [UX-REFINEMENT.md](UX-REFINEMENT.md) の現行追補を優先する。検索、画像グリッド、選択保存を常時表示。最小寸法/形式と使い方は開閉式とし、適用条件のチップと解除経路は閉鎖時も残す。カードの寸法/形式/保存状態、非表示選択件数、完了/中断/再試行は維持する。ローカルSVG、短い選択/開閉の反応、実状態に対応した進捗バーを用い、reduced-motionに対応。権限方針とローカル処理を維持し、取得・保存・sessionの現行契約は上の全14項目の節へ更新する。独立審査、案の比較、検証条件と人間評価の未確認範囲はリンク先を参照。
 
 ## v2 amendments (supersede v1 wording below)
 
@@ -28,7 +44,7 @@ User: create two separate Chrome extensions under separate repository folders; i
 
 Concept: people browsing a page can inspect what can be saved and deliberately keep the items or scene they need, with an honest result and a recovery path.
 
-ImageCrate: action click opens a persistent full-page gallery for that source tab. Temporary activeTab + scripting access; no permanent all-sites host permissions. Scan img/currentSrc/src/srcset/lazy src, picture sources, CSS background images, open shadow roots and accessible frames. Dedupe by full URL (preserve query). Scan only already-present DOM; no automatic scrolling or network sniffing. Explain inaccessible cross-origin frames and lazy loading. HTTP(S) and image data URLs only in v0.1; page blob URLs explicitly unsupported. Show thumbnail, dimensions when known, source filename. Nothing selected initially. Filter by text, minimum dimensions, image type; select visible/clear selection; hidden selected count and total count remain explicit. Save selection includes all selected; no silent inclusion. Chrome downloads to ImageCrate/<sanitized source title>, unique conflict names, sequential queue. Per-item queued/in-progress/completed/interrupted status, no false 'saved' on request acceptance, retry failed. Preserve selection and completed states on re-scan by URL; do not lose in-flight results. Empty/error/retry states and source-tab navigation/closure handled with visible error; action click on source grants again. Preview requests are limited to shown thumbnails with no referrer. Scan size bounded with visible truncation notice.
+ImageCrate: action click opens a persistent full-page gallery for that source tab. Temporary activeTab + scripting access; no permanent all-sites host permissions. Scan img/currentSrc/src/srcset/lazy src, picture sources, CSS background images, open shadow roots and accessible frames. Dedupe by full URL (preserve query). Scan only already-present DOM; no automatic scrolling or network sniffing. Explain inaccessible cross-origin frames and lazy loading. HTTP(S) and image data URLs only in v0.1; page blob URLs explicitly unsupported. Show thumbnail, dimensions when known, source filename. Nothing selected initially. Filter by text, minimum dimensions, image type; select visible/clear selection; hidden selected count and total count remain explicit. Save selection includes all selected; no silent inclusion. Chrome downloads to ImageCrate/<sanitized source title>, unique conflict names, sequential queue. Per-item queued/in-progress/completed/interrupted status, no false 'saved' on request acceptance, retry failed. Re-scan replaces the current candidate page while retaining selected records and completed results; continuation also keeps prior-page selections. Unknown file dimensions stay visible until measured in the extension. Empty/error/retry states and source-tab navigation/closure handled with visible error; action click on source grants again. Preview requests are limited to shown thumbnails with no referrer. Scan size bounded with visible truncation notice.
 
 VideoHarbor: same persistent workspace with two primary sections, found videos and recording. Scan video/src/source, direct links ending in known video or m3u8/mpd suffixes, performance resource entries with known media suffix (no webRequest). List direct HTTP(S) media files vs streaming manifests/blob/MSE needing recording. Direct save through Chrome downloads, sanitized name, progress/failure/retry. Do not claim all sites supported. DRM/protected content unsupported; no protection bypass. Do not play remote preview automatically or load video URLs merely by listing. No broad host permissions.
 
