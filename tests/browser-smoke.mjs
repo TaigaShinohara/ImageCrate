@@ -13,13 +13,18 @@ const extension=join(scratch,'extension');await cp(join(repo,'extension'),extens
 const workerPath=join(extension,'background.js');await writeFile(workerPath,(await readFile(workerPath,'utf8'))+'\nglobalThis.__openWorkspace=openWorkspace;globalThis.__workerBoot=crypto.randomUUID();\n');
 const manifest=JSON.parse(await readFile(join(extension,'manifest.json'),'utf8'));
 manifest.host_permissions=['http://127.0.0.1/*'];await writeFile(join(extension,'manifest.json'),JSON.stringify(manifest));
-let clip=Buffer.alloc(0), failedOnce=true;
+let clip=Buffer.alloc(0), failedOnce=true, slowDirectoryWrites=false;
 const fixture=`<!doctype html><html lang="ja"><title>Synthetic media fixture</title><body><h1>Local fixture</h1><img src="/red.svg" alt="赤" width="320" height="200"><img src="/blue.svg" alt="青" width="400" height="300"><img src="/red.svg"><div style="background-image:url('/green.svg');width:100px;height:100px"></div><picture><source srcset="/red.svg 1x, /blue.svg 2x"><img src="/red.svg"></picture><div id="shadow"></div><iframe src="/frame"></iframe><video controls src="/clip.webm" width="320" height="180"></video><a href="/stream.m3u8">stream</a><script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<img src="/shadow.svg">';</script></body></html>`;
 const server=createServer((req,res)=>{
   if(req.url==='/frame') {res.setHeader('Content-Type','text/html');return res.end('<img src="/frame.svg">');}
   if(req.url.startsWith('/clip.webm')) {res.setHeader('Content-Type','video/webm');return res.end(clip);}
   if(req.url.startsWith('/stream.m3u8')) {res.setHeader('Content-Type','application/vnd.apple.mpegurl');return res.end('#EXTM3U\n');}
   if(req.url.startsWith('/fail.svg') && failedOnce) {res.statusCode=403;return res.end('blocked');}
+  if(req.url==='/red.svg' && slowDirectoryWrites && req.headers['sec-fetch-dest']==='empty') {
+    res.setHeader('Content-Type','image/svg+xml');res.write('<svg xmlns="http://www.w3.org/2000/svg">');
+    const timer=setTimeout(()=>res.end('<rect width="4" height="4"/></svg>'),10000);
+    res.on('close',()=>clearTimeout(timer));return;
+  }
   if(req.url.endsWith('.svg')) {res.setHeader('Content-Type','image/svg+xml');return res.end(`<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="${req.url.includes('blue')?'#566ac4':req.url.includes('green')?'#58a884':'#e8987e'}"/></svg>`);}
   res.setHeader('Content-Type','text/html');res.end(fixture);
 });
@@ -141,6 +146,243 @@ try {
     assert.match(await manager.locator('#selection').textContent(),/選択1件/);
     failedOnce=false;
     await manager.locator('#retry').click();await manager.waitForFunction(()=>document.querySelector('#batch').textContent.includes('1件保存完了'));
+    // Save settings use the actual workspace, downloads, IndexedDB and file writer.
+    // Only native chooser / permission decisions are replaced at their API boundary.
+    const readImageSession=()=>manager.evaluate(async()=>{
+      const key=`workspace:${new URL(location.href).searchParams.get('id')}`;
+      return (await chrome.storage.session.get(key))[key];
+    });
+    // Poll the resolved storage value. waitForFunction treats an async
+    // predicate's Promise as truthy before its storage read has settled.
+    const waitForImageSession=async predicate=>{
+      const deadline=Date.now()+15000;
+      while(Date.now()<deadline) {
+        const current=await readImageSession();if(predicate(current))return current;
+        await manager.waitForTimeout(25);
+      }
+      throw new Error('Timed out waiting for the image batch state');
+    };
+    const openSaveSettings=async()=>{
+      await manager.locator('#destination-change').click();
+      await manager.waitForFunction(()=>document.querySelector('#save-settings').open);
+    };
+    const closeSaveSettings=async()=>{
+      await manager.locator('#settings-done').click();
+      await manager.waitForFunction(()=>!document.querySelector('#save-settings').open);
+    };
+    const selectRedImage=async()=>{
+      await manager.locator('#query').fill('');
+      await manager.locator('.card').filter({hasText:'red.svg'}).first().locator('.image-select').check();
+    };
+    const saveSelectedImage=async()=>{
+      const previousBatch=(await readImageSession()).batch?.id;
+      await manager.locator('#save').click();
+      await waitForImageSession(current=>current.batch?.id!==previousBatch && current.jobs.length===1 && current.jobs[0].status==='complete');
+      await manager.waitForFunction(()=>document.querySelector('#selection').textContent==='選択0件');
+      return readImageSession();
+    };
+    await manager.locator('#destination-change').focus();await manager.keyboard.press('Enter');
+    await manager.waitForFunction(()=>document.querySelector('#save-settings').open);
+    await manager.keyboard.press('Tab');
+    assert.equal(await manager.evaluate(()=>document.activeElement?.closest('dialog')?.id),'save-settings','native modal keeps keyboard focus inside its settings');
+    await manager.locator('#folder-name').focus();await manager.keyboard.press('Escape');
+    await manager.waitForFunction(()=>!document.querySelector('#save-settings').open);
+    assert.equal(await manager.evaluate(()=>document.activeElement?.id),'destination-change','Escape restores the save-settings trigger focus');
+    await openSaveSettings();
+    const sourceTitle=(await readImageSession()).title;
+    await manager.locator('#folder-name').fill('');
+    await manager.waitForFunction(title=>document.querySelector('#destination-preview').textContent.includes(title),sourceTitle);
+    await manager.locator('#folder-name').fill('旅行/週末:*?');
+    await manager.waitForFunction(()=>document.querySelector('#destination-preview').textContent.includes('旅行_週末___'));
+    assert.ok(await manager.locator('#folder-adjustment').isVisible(),'unsafe folder characters have a visible explanation and effective preview');
+    await manager.locator('#folder-name').fill('写真をまとめる_任意名');
+    await closeSaveSettings();
+    assert.match(await manager.locator('#destination-summary').textContent(),/写真をまとめる_任意名/);
+    await selectRedImage();
+    const namedDownloadState=await saveSelectedImage();
+    assert.equal(namedDownloadState.batch.destination,'downloads');
+    assert.equal(namedDownloadState.batch.folderName,'写真をまとめる_任意名');
+    assert.equal(namedDownloadState.jobs[0].filename,'ImageCrate/写真をまとめる_任意名/001_red.svg','the chosen folder is frozen into the actual download filename');
+    const namedDownload=await manager.evaluate(async downloadId=>(await chrome.downloads.search({id:downloadId}))[0],namedDownloadState.jobs[0].downloadId);
+    // Browser.setDownloadBehavior controls this test profile's physical output:
+    // this Chrome saves the source basename there instead of the extension's
+    // relative filename. Assert the requested route above and real saved bytes
+    // below; native Chrome subdirectory creation remains a manual QA item.
+    assert.equal(namedDownload.state,'complete',`Chrome completes the requested download: actual=${JSON.stringify(namedDownload.filename)} requested=${JSON.stringify(namedDownloadState.jobs[0].filename)}`);
+    assert.match(await readFile(namedDownload.filename,'utf8'),/<svg\b/,'custom-named default download contains the fixture image');
+    await openSaveSettings();await manager.locator('#folder-reset').click();
+    await manager.waitForFunction(title=>document.querySelector('#destination-preview').textContent.includes(title),sourceTitle);
+    await manager.locator('#folder-name').fill('OPFSまとめ先');
+    // OPFS is isolated in this temporary Chrome profile. This is an actual
+    // cloneable FileSystemDirectoryHandle, not a mock filesystem or OS chooser.
+    const qaDirectoryName='ImageCrate検証用_'+ '長い保存先フォルダ名'.repeat(6);
+    await manager.evaluate(async name=>{
+      const root=await navigator.storage.getDirectory();
+      window.__qaSelectedDirectory=await root.getDirectoryHandle(name,{create:true});
+      window.__qaPickerCancelled=false;window.__qaPickerCalls=0;
+      Object.defineProperty(window,'showDirectoryPicker',{configurable:true,value:async()=>{
+        window.__qaPickerCalls++;
+        if(window.__qaPickerCancelled)throw new DOMException('Synthetic chooser cancellation','AbortError');
+        return window.__qaSelectedDirectory;
+      }});
+    },qaDirectoryName);
+    await manager.locator('#choose-directory').click();
+    await manager.waitForFunction(()=>document.querySelector('#destination-directory').checked);
+    await manager.waitForFunction(name=>document.querySelector('#chosen-directory').textContent.includes(name),qaDirectoryName);
+    const beforePickerCancel=await manager.locator('#destination-preview').textContent();
+    await manager.evaluate(()=>{window.__qaPickerCancelled=true;});
+    await manager.locator('#choose-directory').click();
+    await manager.waitForFunction(()=>window.__qaPickerCalls===2 && !document.querySelector('#choose-directory').disabled);
+    assert.equal(await manager.locator('#destination-preview').textContent(),beforePickerCancel,'chooser cancel preserves the previously selected folder and preview');
+    assert.equal(await manager.locator('#destination-directory').isChecked(),true);
+    await closeSaveSettings();
+    assert.ok(await manager.locator('#directory-warning').isVisible(),'the open-tab condition is visible before saving to a selected folder');
+    assert.equal(await manager.evaluate(async()=>{
+      const {getDirectory}=await import('./directory-store.js');
+      const saved=await getDirectory(`session:${new URL(location.href).searchParams.get('id')}`);
+      return !!saved && saved.isSameEntry(window.__qaSelectedDirectory);
+    }),true,'the selected real directory handle survives an IndexedDB structured clone');
+    const readSelectedDirectory=folder=>manager.evaluate(async({name,folder})=>{
+      const directory=await (await navigator.storage.getDirectory()).getDirectoryHandle(name);
+      const child=await directory.getDirectoryHandle(folder);const files=[];
+      for await(const [name,handle] of child.entries()) {
+        if(handle.kind==='file') {const file=await handle.getFile();files.push({name,text:await file.text(),size:file.size});}
+      }
+      return files.sort((a,b)=>a.name.localeCompare(b.name));
+    },{name:qaDirectoryName,folder});
+    await selectRedImage();const directoryState=await saveSelectedImage();
+    assert.equal(directoryState.batch.destination,'directory');assert.equal(directoryState.batch.folderName,'OPFSまとめ先');
+    const firstDirectoryFiles=await readSelectedDirectory('OPFSまとめ先');
+    assert.equal(firstDirectoryFiles.length,1);assert.equal(firstDirectoryFiles[0].name,'001_red.svg');
+    assert.ok(firstDirectoryFiles[0].size>0);assert.match(firstDirectoryFiles[0].text,/<svg\b/,'real OPFS file writer saves the image content');
+    await selectRedImage();const repeatDirectoryState=await saveSelectedImage();
+    const repeatedDirectoryFiles=await readSelectedDirectory('OPFSまとめ先');
+    assert.equal(repeatedDirectoryFiles.length,2,'re-saving creates a second file instead of overwriting');
+    assert.equal(repeatDirectoryState.jobs[0].filename,'001_red (1).svg');
+    assert.deepEqual(repeatedDirectoryFiles.find(file=>file.name==='001_red.svg'),firstDirectoryFiles[0],'the first saved file remains intact');
+    assert.equal(repeatedDirectoryFiles.find(file=>file.name==='001_red (1).svg').text,firstDirectoryFiles[0].text);
+    await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回の取得結果'));
+    await openSaveSettings();
+    assert.equal(await manager.locator('#destination-directory').isChecked(),true,'selected-folder mode is restored after reload');
+    assert.equal(await manager.locator('#folder-name').inputValue(),'OPFSまとめ先');
+    assert.match(await manager.locator('#destination-preview').textContent(),new RegExp(qaDirectoryName));
+    await closeSaveSettings();
+    // Explicitly deny only the permission decision; do not revoke localhost
+    // access or change the production manifest / real Chrome profile.
+    await manager.evaluate(()=>{
+      window.__qaOriginalPermissions={contains:chrome.permissions.contains.bind(chrome.permissions),request:chrome.permissions.request.bind(chrome.permissions)};
+      chrome.permissions.contains=async()=>false;
+      chrome.permissions.request=async options=>{window.__qaDeniedOrigins=options.origins;return false;};
+    });
+    await selectRedImage();const beforeDeniedBatch=(await readImageSession()).batch.id;
+    await manager.locator('#save').click();
+    await manager.waitForFunction(()=>window.__qaDeniedOrigins?.length>0 && !document.querySelector('#save').disabled);
+    assert.deepEqual(await manager.evaluate(()=>window.__qaDeniedOrigins),['http://127.0.0.1/*'],'permission request is limited to the selected image source');
+    assert.equal((await readImageSession()).batch.id,beforeDeniedBatch,'permission denial never starts a new save batch');
+    assert.equal(await manager.locator('.image-select:checked').count(),1,'permission denial keeps the selected image for recovery');
+    assert.equal((await readSelectedDirectory('OPFSまとめ先')).length,2,'permission denial writes no file');
+    await manager.evaluate(()=>{chrome.permissions.contains=window.__qaOriginalPermissions.contains;chrome.permissions.request=window.__qaOriginalPermissions.request;});
+    if(await manager.locator('#save-settings').evaluate(dialog=>dialog.open))await closeSaveSettings();
+    await manager.locator('#clear').click();
+    // Stop a real fetch stream, then retry the original batch after changing
+    // the next-save setting. Exercise the UI/controller/worker boundary.
+    await openSaveSettings();await manager.locator('#folder-name').fill('停止と再試行');await closeSaveSettings();
+    slowDirectoryWrites=true;await selectRedImage();await manager.locator('#save').click();
+    await waitForImageSession(current=>current.batch?.folderName==='停止と再試行' && current.jobs[0]?.status==='in_progress' && current.jobs[0].bytesReceived>0);
+    const stoppedBatchId=(await readImageSession()).batch.id;
+    assert.ok(await manager.locator('#save').isDisabled());assert.ok(await manager.locator('#destination-change').isDisabled());
+    await manager.locator('#cancel').click();
+    await manager.waitForFunction(()=>!document.querySelector('#retry').hidden && !document.querySelector('#destination-change').disabled);
+    assert.equal((await readImageSession()).jobs[0].status,'interrupted');
+    assert.equal((await readImageSession()).batch.id,stoppedBatchId,'Stop keeps the batch ID');
+    assert.equal((await readSelectedDirectory('停止と再試行')).length,0,'Stop cleans its own unfinished file');
+    slowDirectoryWrites=false;
+    await openSaveSettings();await manager.locator('#folder-name').fill('次の保存先');await closeSaveSettings();
+    assert.match(await manager.locator('#batch-destination').textContent(),/停止と再試行/);
+    assert.equal((await readImageSession()).batch.id,stoppedBatchId,'changing settings keeps the batch ID');
+    await manager.locator('#retry').click();
+    await waitForImageSession(current=>current.jobs[0]?.status==='complete');
+    const retriedState=await readImageSession();
+    assert.equal(retriedState.batch.id,stoppedBatchId);assert.equal(retriedState.batch.folderName,'停止と再試行');
+    assert.equal((await readSelectedDirectory('停止と再試行')).length,1,'Retry uses the batch folder, not the changed setting');
+    assert.equal(await manager.locator('#selection').textContent(),'選択0件');
+
+    // Confirm beforeunload is wired and reload reclassifies unfinished jobs.
+    await openSaveSettings();await manager.locator('#folder-name').fill('再読込回復');await closeSaveSettings();
+    slowDirectoryWrites=true;await selectRedImage();await manager.locator('#save').click();
+    await waitForImageSession(current=>current.batch?.folderName==='再読込回復' && current.jobs[0]?.status==='in_progress' && current.jobs[0]?.bytesReceived>0);
+    let unloadWarning=false;
+    manager.once('dialog',async dialog=>{unloadWarning=dialog.type()==='beforeunload';await dialog.accept();});
+    await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回の取得結果'));
+    assert.ok(unloadWarning,'active custom saving warns before reload');
+    assert.equal((await readImageSession()).jobs[0].status,'interrupted','reload never reports an unfinished write as complete');
+    slowDirectoryWrites=false;await manager.locator('#retry').click();
+    await waitForImageSession(current=>current.jobs[0]?.status==='complete');
+    assert.ok((await readSelectedDirectory('再読込回復')).some(file=>file.size>0 && /<svg\b/.test(file.text)),'reload recovery can finish the saved image');
+    // A real OPFS handle normally remains granted. Simulate only the browser's
+    // restored-handle prompt/denial decisions; native permission UI stays manual.
+    await manager.addInitScript(({name})=>{
+      const prototype=FileSystemHandle.prototype;
+      const query=prototype.queryPermission,request=prototype.requestPermission;
+      window.__qaHandlePermissionRequests=0;
+      Object.defineProperty(prototype,'queryPermission',{configurable:true,writable:true,value:function(options){
+        if(this.kind==='directory' && this.name===name && sessionStorage.getItem('imagecrate-qa-directory-permission')==='prompt')return Promise.resolve('prompt');
+        return query.call(this,options);
+      }});
+      Object.defineProperty(prototype,'requestPermission',{configurable:true,writable:true,value:function(options){
+        if(this.kind==='directory' && this.name===name && sessionStorage.getItem('imagecrate-qa-directory-permission')==='prompt') {window.__qaHandlePermissionRequests++;return Promise.resolve('denied');}
+        return request.call(this,options);
+      }});
+    },{name:qaDirectoryName});
+    await manager.evaluate(()=>sessionStorage.setItem('imagecrate-qa-directory-permission','prompt'));
+    await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回の取得結果'));
+    await openSaveSettings();
+    assert.ok(await manager.locator('#directory-reconnect').isVisible(),'a restored handle needing permission exposes its recovery action');
+    const beforeReconnectBatch=(await readImageSession()).batch.id;
+    await manager.locator('#directory-reconnect').click();
+    await manager.waitForFunction(()=>window.__qaHandlePermissionRequests>0 && !document.querySelector('#directory-reconnect').disabled);
+    assert.ok(await manager.locator('#directory-reconnect').isVisible(),'denying restored folder access retains a recovery action');
+    assert.equal((await readImageSession()).batch.id,beforeReconnectBatch,'restored-folder permission denial never starts saving');
+    await manager.evaluate(()=>sessionStorage.removeItem('imagecrate-qa-directory-permission'));
+    await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回の取得結果'));
+    await openSaveSettings();await manager.locator('#folder-name').fill('日本語の写真をまとめる保存先'.repeat(10));await closeSaveSettings();
+    await selectRedImage();const longFolderState=await saveSelectedImage();
+    assert.ok(Buffer.byteLength(longFolderState.batch.folderName,'utf8')<=160,'long Japanese folder names respect the filesystem component byte limit');
+    assert.ok((await manager.locator('#batch-destination').getAttribute('title')).includes(longFolderState.batch.folderName),'the batch destination exposes its full effective name in title');
+    for(const width of [640,360]) {
+      await manager.setViewportSize({width,height:800});await manager.evaluate(()=>window.scrollTo(0,document.documentElement.scrollHeight));
+      const footerGeometry=await manager.evaluate(()=>{
+        const footer=document.querySelector('#footer').getBoundingClientRect(),save=document.querySelector('#save').getBoundingClientRect();
+        const destination=document.querySelector('#batch-destination'),styles=getComputedStyle(destination);
+        return {overflow:document.documentElement.scrollWidth>innerWidth,top:footer.top,bottom:footer.bottom,height:footer.height,saveTop:save.top,saveBottom:save.bottom,viewportHeight:innerHeight,clamp:styles.webkitLineClamp,destinationHeight:destination.getBoundingClientRect().height,lineHeight:parseFloat(styles.lineHeight)};
+      });
+      assert.equal(footerGeometry.overflow,false,`${width}px: long destination text does not cause horizontal overflow`);
+      assert.ok(footerGeometry.top>=0 && footerGeometry.bottom<=footerGeometry.viewportHeight+1,`${width}px: custom-folder footer stays in the viewport`);
+      assert.ok(footerGeometry.saveTop>=0 && footerGeometry.saveBottom<=footerGeometry.viewportHeight+1,`${width}px: saving remains reachable with custom-folder guidance and batch result`);
+      assert.ok(footerGeometry.height<footerGeometry.viewportHeight*.6,`${width}px: the footer leaves room for the gallery`);
+      assert.equal(footerGeometry.clamp,'2');assert.ok(footerGeometry.destinationHeight<=footerGeometry.lineHeight*2+1,`${width}px: batch destination is limited to two visual lines`);
+      await openSaveSettings();
+      const dialogGeometry=await manager.locator('#save-settings').evaluate(dialog=>{
+        const rect=dialog.getBoundingClientRect(),radio=document.querySelector('#destination-downloads').getBoundingClientRect();
+        return {left:rect.left,right:rect.right,top:rect.top,bottom:rect.bottom,viewportWidth:innerWidth,viewportHeight:innerHeight,overflow:dialog.scrollWidth>dialog.clientWidth,radioWidth:radio.width,radioHeight:radio.height,preview:document.querySelector('#destination-preview').textContent};
+      });
+      assert.ok(dialogGeometry.left>=0 && dialogGeometry.right<=dialogGeometry.viewportWidth+1 && dialogGeometry.top>=0 && dialogGeometry.bottom<=dialogGeometry.viewportHeight+1,`${width}px: settings modal stays within the viewport`);
+      assert.equal(dialogGeometry.overflow,false,`${width}px: long Japanese names wrap inside the settings modal`);
+      assert.ok(dialogGeometry.radioWidth>=16 && dialogGeometry.radioWidth<=32 && dialogGeometry.radioHeight<=32,`${width}px: native radios retain usable small control dimensions`);
+      assert.ok(dialogGeometry.preview.includes(longFolderState.batch.folderName),`${width}px: settings preview shows the full effective folder name`);
+      await manager.locator('#save-settings').evaluate(dialog=>{dialog.scrollTop=dialog.scrollHeight;});
+      const scrolledGeometry=await manager.evaluate(()=>{
+        const dialog=document.querySelector('#save-settings').getBoundingClientRect(),close=document.querySelector('#settings-close').getBoundingClientRect(),done=document.querySelector('#settings-done').getBoundingClientRect();
+        return {dialogTop:dialog.top,dialogBottom:dialog.bottom,closeTop:close.top,closeBottom:close.bottom,doneBottom:done.bottom};
+      });
+      assert.ok(scrolledGeometry.closeTop>=scrolledGeometry.dialogTop && scrolledGeometry.closeBottom<=scrolledGeometry.dialogBottom,`${width}px: close remains visible while settings scroll`);
+      assert.ok(scrolledGeometry.doneBottom<=scrolledGeometry.dialogBottom+1,`${width}px: the final settings action can be reached by scrolling`);
+      if(process.env.QA_SCREENSHOT)await manager.screenshot({path:process.env.QA_SCREENSHOT.replace('.png',`-save-settings-${width}.png`),fullPage:false,animations:'disabled'});
+      await closeSaveSettings();
+    }
+    await manager.setViewportSize({width:1280,height:900});
+    await openSaveSettings();await manager.locator('#destination-downloads').check();await manager.locator('#folder-reset').click();await closeSaveSettings();
+    if(await manager.locator('#clear').isEnabled())await manager.locator('#clear').click();
   } else {
     assert.ok(await manager.locator('.direct-save').count()>=1);assert.ok(await manager.locator('#unsupported-count').textContent());
     await manager.locator('.direct-save').first().click();await manager.waitForFunction(()=>document.querySelector('#batch').textContent.includes('1件保存完了'));

@@ -1,5 +1,6 @@
 import { collect } from './collector.js';
-import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError } from './utils.js';
+import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings } from './utils.js';
+import { pruneDirectories } from './directory-store.js';
 const KIND = 'images';
 const PREFIX = 'workspace:';
 let operations = Promise.resolve();
@@ -23,7 +24,7 @@ export async function openWorkspace(tab) {
     const existing = await all();
     for (const state of existing) {
       const manager=await liveTab(state.workspaceTabId);
-      if (manager?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { state.closed=true;state.items=[];state.history=[];if(active(state)) await pump(state); if(!active(state)) await chrome.storage.session.remove(PREFIX + state.id); continue; }
+      if (manager?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { state.closed=true;state.items=[];state.history=[];if(active(state) && state.batch?.destination !== 'directory') await pump(state); if(!active(state) || state.batch?.destination === 'directory') await chrome.storage.session.remove(PREFIX + state.id); continue; }
       if (state.tabId === tab.id && state.url === tab.url) {
         await chrome.tabs.update(state.workspaceTabId, {active:true}); return state.id;
       }
@@ -73,6 +74,7 @@ async function refreshJob(job) {
   }
 }
 async function pump(state) {
+  if (state.batch?.destination === 'directory') return state;
   for (const job of state.jobs) await refreshJob(job);
   if (!state.jobs.some(j=>j.status === 'in_progress')) {
     for (const job of state.jobs.filter(j=>j.status === 'queued')) {
@@ -113,6 +115,13 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
     if (!state || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
     switch(message.type) {
       case 'get': return pump(state);
+      case 'prune-directories': {
+        // Keep the live batch/session set under the same mutation queue as save.
+        // A page's startup snapshot may already be stale when another tab saves.
+        const sessions=await all();
+        await pruneDirectories(['last',...sessions.flatMap(s=>[`session:${s.id}`,...(s.batch?.id ? [`batch:${s.batch.id}`] : [])])]);
+        return {};
+      }
       case 'scan': return scan(state);
       case 'source': { const tab = await liveTab(state.tabId); if(!tab) throw new Error('元ページは閉じられています。'); await chrome.tabs.update(state.tabId,{active:true}); return {}; }
       case 'save': {
@@ -120,27 +129,61 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         const chosen = new Set(message.urls);
         const items = state.items.filter(item=>chosen.has(item.url) && allowedURL(item.url,KIND) && (KIND !== 'videos' || item.type === 'direct'));
         if (!items.length) throw new Error('保存する対象を選んでください。');
-        state.jobs = items.map((item,i)=>({url:item.url,status:'queued',filename:downloadName(item,state.title,i,KIND)}));
+        const settings = saveSettings(message.settings || state.saveSettings, state.title);
+        if (settings.destination === 'directory' && !settings.directoryName) throw new Error('保存先フォルダを選んでください。');
+        state.batch = {...settings,id:crypto.randomUUID(),owner:message.instance};
+        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),url:item.url,status:'queued',filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND).split('/').pop() : downloadName(item,settings.folderName,i,KIND)}));
+        if (settings.destination === 'directory') { await save(state); return state; }
         return pump(state);
+      }
+      case 'settings': {
+        if (active(state)) throw new Error('保存処理が終わってから設定を変更してください。');
+        const input = message.settings || {};
+        state.saveSettings = {...saveSettings(input,state.title),folderName:String(input.folderName ?? state.title).slice(0,300)};
+        await save(state); return state;
+      }
+      case 'directory-update': {
+        if (state.batch?.destination !== 'directory' || state.batch.id !== message.batchId || state.batch.owner !== message.instance) throw new Error('この保存処理は終了したか、別の作業ページに引き継がれました。');
+        for (const update of (message.updates || []).slice(0,500)) {
+          const job = state.jobs.find(job=>job.id === update.id);
+          if (!job || !['queued','in_progress'].includes(job.status) || !['in_progress','complete','interrupted'].includes(update.status)) continue;
+          job.status = update.status;
+          for (const key of ['bytesReceived','totalBytes']) if (Number.isFinite(update[key]) && update[key] >= 0) job[key] = update[key];
+          if (typeof update.filename === 'string' && !/[\\/]/.test(update.filename)) job.filename = update.filename.slice(0,240);
+          if (update.error) job.error = publicError(update.error).slice(0,500);
+        }
+        await save(state); return state;
       }
       case 'cancel': {
         for(const job of state.jobs) {
           if(job.status==='queued') { job.status='interrupted'; job.error='停止しました。'; }
-          if(job.status==='in_progress') { try { await chrome.downloads.cancel(job.downloadId); } catch {} await refreshJob(job); if(job.status==='interrupted') job.error='停止しました。'; }
+          if(job.status==='in_progress') {
+            if(state.batch?.destination === 'directory') {job.status='interrupted';job.error='停止しました。';}
+            else {try { await chrome.downloads.cancel(job.downloadId); } catch {} await refreshJob(job); if(job.status==='interrupted') job.error='停止しました。';}
+          }
         }
         await save(state); return state;
       }
       case 'retry': {
         if(active(state)) throw new Error('保存処理中です。');
-        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.status='queued'; delete job.downloadId; delete job.error; }
+        if(state.batch?.destination === 'directory') state.batch.owner = message.instance;
+        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; }
+        if(state.batch?.destination === 'directory') {await save(state);return state;}
         return pump(state);
       }
       case 'capture': return claim(state,message.instance,message.mode);
       case 'hello': {
+        if(state.batch?.destination === 'directory') {
+          if(state.batch.owner !== message.instance) for(const job of state.jobs.filter(j=>['queued','in_progress'].includes(j.status))) {
+            job.status='interrupted';job.error='作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、中断分を再試行できます。';
+          }
+          state.batch.owner=message.instance;await save(state);
+        }
         // Reload gets a new instance token; the old page no longer owns a live recorder.
         const lock = (await chrome.storage.session.get('captureLock')).captureLock;
         if(lock?.tabId === state.workspaceTabId && lock.instance !== message.instance) await chrome.storage.session.remove('captureLock');
-        return state;
+        const sessions=await all();
+        return {...state,activeDirectoryKeys:sessions.flatMap(s=>[`session:${s.id}`,...(s.batch?.id ? [`batch:${s.batch.id}`] : [])])};
       }
       case 'release': {
         const lock = (await chrome.storage.session.get('captureLock')).captureLock;
@@ -162,7 +205,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
     const lock = (await chrome.storage.session.get('captureLock')).captureLock;
     if(lock?.tabId === tabId) await chrome.storage.session.remove('captureLock');
     for(const state of await all()) if(state.workspaceTabId === tabId) {
-      if(active(state)) { state.closed=true;state.items=[];state.notices=[];state.history=[];await save(state); }
+      if(active(state) && state.batch?.destination !== 'directory') { state.closed=true;state.items=[];state.notices=[];state.history=[];await save(state); }
       else await chrome.storage.session.remove(PREFIX + state.id);
     }
   }).catch(()=>{});

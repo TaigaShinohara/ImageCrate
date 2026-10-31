@@ -33,7 +33,8 @@
           <li><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>選んだ画像を保存</span></li>
         </ol>
         <p>今ページにある画像を探します。追加したいときは、元ページをスクロールして再スキャン。</p>
-        <p>保存先は Downloads / ImageCrate / ページ名。非表示にした選択画像も保存します。</p>
+        <p>保存先と、画像をまとめるフォルダ名は画面下の「変更」から指定できます。最初はChromeのダウンロード先 / ImageCrate / ページ名に保存します。</p>
+        <p>非表示にした選択画像も保存します。</p>
       </div>
     </details>
   </header>
@@ -78,15 +79,41 @@
 </main>
 <footer id="footer" class="footer">
   <div class="footer-inner">
+    <div class="destination-row"><span class="destination-label">保存先</span><p id="destination-summary" class="destination-summary">Chromeのダウンロード先 / ImageCrate / ページ名</p><button id="destination-change" class="quiet" type="button" aria-label="保存先を変更" aria-haspopup="dialog" aria-controls="save-settings">変更</button></div>
+    <p id="directory-warning" class="directory-warning" hidden>選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。</p>
     <div class="selection-info"><span id="selection-mark" class="selection-mark" aria-hidden="true"><svg class="icon"><use href="#icon-select"/></svg></span><div><strong id="selection" class="selection-summary">選択0件</strong><p id="selection-hint" class="selection-hint">画像をクリックして選択</p></div></div>
     <div class="save-actions">
       <button id="cancel" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-stop"/></svg>保存を停止</button>
       <button id="retry" class="secondary" hidden><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>中断分を再試行</button>
       <button id="save" class="primary" disabled><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span id="save-label">選択0件を保存</span></button>
     </div>
-    <div id="batch-panel" class="batch-panel" hidden><progress id="batch-progress" max="1" value="0" aria-label="今回の保存の進捗"></progress><p id="batch" class="batch-status" role="status" aria-live="polite"></p></div>
+    <div id="batch-panel" class="batch-panel" hidden><progress id="batch-progress" max="1" value="0" aria-label="今回の保存の進捗"></progress><p id="batch" class="batch-status" role="status" aria-live="polite"></p><p id="batch-destination" class="batch-destination"></p></div>
   </div>
 </footer>
+<dialog id="save-settings" class="save-settings" aria-labelledby="settings-title" aria-describedby="settings-description">
+  <header class="settings-header"><h2 id="settings-title">保存先を変更</h2><button id="settings-close" class="quiet" type="button" aria-label="保存先の設定を閉じる">閉じる</button></header>
+  <div class="settings-body">
+    <p id="settings-description" class="settings-description">保存する場所と、画像をまとめるフォルダ名を指定できます。</p>
+    <fieldset class="destination-options">
+      <legend>保存する場所</legend>
+      <label class="destination-option"><input id="destination-downloads" type="radio" name="destination" value="downloads" checked><span><strong>Chromeのダウンロード先</strong><span class="option-caption">ImageCrateフォルダの中に保存</span></span></label>
+      <label class="destination-option"><input id="destination-directory" type="radio" name="destination" value="directory"><span><strong>選択したフォルダ</strong><span id="chosen-directory" class="option-caption">まだ選択していません</span></span></label>
+      <div class="directory-actions"><button id="choose-directory" class="secondary" type="button">フォルダを選ぶ</button><button id="directory-reconnect" class="secondary" type="button" hidden>このフォルダへの保存を許可</button></div>
+      <p id="directory-status" class="settings-note directory-status" role="status"></p>
+      <p id="directory-details" class="settings-note directory-details" hidden>選択したフォルダへ保存するときは、このタブを開いたままにしてください。保存する画像の配信元へのアクセス許可をChromeに求める場合があります。配信元へのアクセス許可は、Chromeの拡張機能設定で取り消せます。</p>
+    </fieldset>
+    <section class="folder-settings" aria-labelledby="folder-label">
+      <label id="folder-label" class="settings-label" for="folder-name">まとめるフォルダ名</label>
+      <input id="folder-name" type="text" maxlength="300" autocomplete="off" spellcheck="false" placeholder="ページ名を使う" aria-describedby="folder-hint folder-adjustment">
+      <div class="folder-tools"><p id="folder-hint" class="settings-note">空欄の場合はページ名を使います。</p><button id="folder-reset" class="quiet" type="button">ページ名に戻す</button></div>
+      <p id="folder-adjustment" class="settings-note folder-adjustment" role="status" hidden></p>
+    </section>
+    <section class="destination-result" aria-labelledby="destination-preview-label"><h3 id="destination-preview-label">保存先のプレビュー</h3><p id="destination-preview" class="destination-preview" aria-live="polite">Chromeのダウンロード先 / ImageCrate / ページ名</p></section>
+    <p class="settings-note">同じ名前のフォルダがある場合は、その中へ保存します。ファイル名が重なっても上書きせず、別名で保存します。</p>
+    <p id="settings-error" class="error settings-error" role="alert" hidden></p>
+    <div class="settings-actions"><button id="settings-done" class="primary" type="button">この設定で戻る</button></div>
+  </div>
+</dialog>
 <script type="module" src="workspace.js"></script>
 </body>
 </html>
