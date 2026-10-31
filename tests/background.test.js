@@ -35,6 +35,11 @@ async function browser(t, options = {}) {
   const cancelled = [];
   let nextDownloadId = 8;
   const changed = event();
+  const created=event();
+  const alarmEvent=event();
+  const alarms=new Map();
+  const alarmCreates=[];
+  const alarmClears=[];
   const determining = event();
   const updated = event();
   const scriptCalls=[];
@@ -62,7 +67,7 @@ async function browser(t, options = {}) {
       async get(id) { if (!tabs.has(id)) throw new Error('No such tab'); return clone(tabs.get(id)); },
       async update(id, values) { Object.assign(tabs.get(id), values); return clone(tabs.get(id)); },
     },
-    downloads: { onChanged: changed,onDeterminingFilename:determining,
+    downloads: { onChanged: changed,onCreated:created,onDeterminingFilename:determining,
       async download(options) {
         const id = nextDownloadId++;
         requested.push({ ...options, id });
@@ -89,6 +94,11 @@ async function browser(t, options = {}) {
     },
     tabCapture: { getCapturedTabs: async () => [], getMediaStreamId: async () => 'one-use-stream' },
   };
+  if (options.withAlarms) chrome.alarms={onAlarm:alarmEvent,
+    async get(name) { return clone(alarms.get(name)); },
+    async create(name,info) { alarmCreates.push({name,...info});alarms.set(name,{name,...info}); },
+    async clear(name) { alarmClears.push(name);return alarms.delete(name); },
+  };
   Object.defineProperty(globalThis, 'chrome', { configurable: true, value: chrome });
   t.after(() => {
     if (previous) Object.defineProperty(globalThis, 'chrome', previous); else delete globalThis.chrome;
@@ -102,9 +112,9 @@ async function browser(t, options = {}) {
   const persist = () => store.set('workspace:work', clone(state));
   persist();
   return {
-    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,
+    state, store, tabs, downloads, requested, cancelled, persist, options, chrome, determining, updated,scriptCalls,scriptResults,created,changed,alarms,alarmEvent,alarmCreates,alarmClears,
     async restartWorker() {
-      changed.clear();removed.clear();messages.clear();determining.clear();updated.clear();
+      changed.clear();created.clear();alarmEvent.clear();removed.clear();messages.clear();determining.clear();updated.clear();
       await import(`${new URL('../extension/background.js', import.meta.url).href}?test=${moduleNumber++}`);
     },
     closeWorkspace() { tabs.delete(100); removed.emit(100); },
@@ -959,4 +969,64 @@ test('late filename events for the same URL in two workspaces match accepted IDs
   await eventually(()=>h.store.get('workspace:work').jobs[0].filename.endsWith('.svg') && h.store.get('workspace:other').jobs[0].filename.endsWith('.svg'),'both ID-specific filename decisions are stored');
   assert.equal(h.store.get('workspace:work').jobs[0].filename,'ImageCrate/First/001_shared-image.svg');
   assert.equal(h.store.get('workspace:other').jobs[0].filename,'ImageCrate/Second/001_shared-image.svg');
+});
+
+test('an alarm reconciles a closed pending submission without UI polling and unrelated saves do not postpone it',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  const first=await h.send({type:'get'});
+  assert.equal(first.ok,true,first.error);
+  assert.equal(h.alarmCreates.length,1);
+  const alarm=h.alarmCreates[0];
+  assert.equal(alarm.delayInMinutes,1);
+  assert.equal(alarm.periodInMinutes,1);
+  h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'the workspace closes while acceptance is unresolved');
+  h.tabs.set(200,{id:200,url:'chrome-extension://test/workspace.html?id=other'});
+  h.store.set('workspace:other',{id:'other',workspaceTabId:200,items:[],jobs:[],notices:[]});
+  const other=await h.send({sessionId:'other',type:'ui',patch:{query:'other tab'}},200);
+  assert.equal(other.ok,true,other.error);
+  assert.equal(h.alarmCreates.length,1,'existing alarms keep their original wake-up time through all state writes');
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.alarmEvent.emit({name:alarm.name});
+  await eventually(()=>!h.store.has('workspace:work'),'the alarm expires and removes the closed unresolved session');
+  await eventually(()=>!h.alarms.has(alarm.name),'the last pending submission clears its recovery alarm');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('worker startup recreates a missing pending alarm and expires a closed submission without a UI message',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  await h.restartWorker();
+  await eventually(()=>h.alarms.size === 1,'startup schedules the pending reconciliation even without get/polling');
+  const state=h.store.get('workspace:work');state.closed=true;state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.tabs.delete(100);
+  await h.restartWorker();
+  await eventually(()=>!h.store.has('workspace:work'),'startup reconciles the expired closed submission');
+  await eventually(()=>h.alarms.size === 0,'startup removes a no-longer-needed alarm');
+  assert.deepEqual(h.requested,[]);
+});
+
+test('onCreated reconciles an unknown accepted ID after its workspace closes and preserves the completed file',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  await h.send({type:'get'});h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'closed pending work remains for recovery');
+  const item=acceptedSubmission(source,81,{state:'complete',bytesReceived:10});
+  h.downloads.set(item.id,item);
+  h.created.emit(structuredClone(item));
+  await eventually(()=>!h.store.has('workspace:work'),'an event with the unpersisted ID recovers and retires the completed batch');
+  await eventually(()=>h.alarms.size === 0,'recovered acceptance clears its pending alarm');
+  assert.equal(h.downloads.get(item.id).state,'complete');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
+});
+
+test('onChanged for an unknown download ID wakes pending sessions after their polling workspace has closed',async t=>{
+  const h=await browser(t,{withAlarms:true});pendingSubmission(h);
+  await h.send({type:'get'});h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'the original page no longer polls');
+  const state=h.store.get('workspace:work');state.jobs[0].submission.startedAt=Date.now()-31000;h.store.set('workspace:work',state);
+  h.changed.emit({id:999,filename:{current:'unrelated-file.png'}});
+  await eventually(()=>!h.store.has('workspace:work'),'even an unknown ID causes the persisted pending submission to be reconciled');
+  assert.deepEqual(h.requested,[]);
+  assert.deepEqual(h.cancelled,[]);
 });

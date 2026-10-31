@@ -7,6 +7,7 @@ const KIND = 'images';
 const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
 const FILENAME_DECISION_TTL = 5 * 60 * 1000;
+const RECOVERY_ALARM = 'imagecrate-pending-downloads';
 let operations = Promise.resolve();
 // One mutation queue protects storage read/modify/write across concurrent events.
 const serial = task => { const next = operations.then(task); operations = next.catch(() => {}); return next; };
@@ -33,9 +34,20 @@ const save = async state => {
     const current=state.jobs.find(job=>job.id === id);
     if (!current || ['complete','interrupted'].includes(current.status)) forgetSubmission(id);
   }
+  await syncRecoveryAlarm().catch(()=>{});
 };
 const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? sessionDefaults(state) : undefined; };
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>sessionDefaults(v));
+const hasPendingSubmission = state => state.jobs.some(job=>job.submission && !job.downloadId && ['queued','in_progress'].includes(job.status));
+async function syncRecoveryAlarm() {
+  if (!chrome.alarms?.create) return;
+  const pending=(await all()).some(hasPendingSubmission);
+  if (pending) {
+    // Repeated UI messages must not postpone a closed workspace's wake-up.
+    const current=await chrome.alarms.get(RECOVERY_ALARM);
+    if (!current) await chrome.alarms.create(RECOVERY_ALARM,{delayInMinutes:1,periodInMinutes:1});
+  } else await chrome.alarms.clear(RECOVERY_ALARM);
+}
 const active = state => summarizeJobs(state.jobs).active > 0;
 const managed = state => requiresWorkspace(state.batch || {});
 async function liveTab(id) { try { return await chrome.tabs.get(id); } catch { return null; } }
@@ -303,7 +315,7 @@ async function closeWorkspace(state) {
   state.closed=true;state.items=[];state.selectedItems=[];state.selectedURLs=[];state.ui={};state.notices=[];state.history=[];state.scan=null;
   if (managed(state)) await stopJobs(state,'作業ページが閉じられ、保存が中断しました。');
   if (active(state)) await pump(state);
-  if (!active(state)) await chrome.storage.session.remove(PREFIX + state.id);
+  if (!active(state)) { await chrome.storage.session.remove(PREFIX + state.id); await syncRecoveryAlarm().catch(()=>{}); }
 }
 function requireOwner(state, message) {
   if (!managed(state) || state.batch.id !== message.batchId || state.batch.owner !== message.instance) {
@@ -469,10 +481,30 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
   }).then(data=>respond({ok:true,data}),error=>respond({ok:false,error:publicError(error)}));
   return true;
 });
-// Register listeners at worker startup; storage keeps download IDs across suspension.
+// Downloads and a persistent alarm can wake a suspended worker after its last
+// workspace has closed. The 30-second acceptance deadline is checked on wake;
+// Chrome may deliver the alarm later (at least one minute on Chrome 116).
+async function reconcilePendingStates(downloadId, includeKnown = false) {
+  for (const state of await all()) {
+    if (!hasPendingSubmission(state) && !(includeKnown && state.jobs.some(job=>job.downloadId === downloadId))) continue;
+    if (!state.closed) {
+      const owner=await liveTab(state.workspaceTabId);
+      if (owner?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { await closeWorkspace(state); continue; }
+    }
+    await pump(state);
+    if (state.closed && !active(state)) await chrome.storage.session.remove(PREFIX + state.id);
+  }
+  await syncRecoveryAlarm();
+}
 chrome.downloads.onChanged.addListener(delta => {
-  if (!delta.state && !delta.error) return;
-  serial(async()=> {for(const state of await all()) if(state.jobs.some(j=>j.downloadId === delta.id)) { await pump(state); if(state.closed && !active(state)) await chrome.storage.session.remove(PREFIX + state.id); }}).catch(()=>{});
+  serial(()=>reconcilePendingStates(delta.id,true)).catch(()=>{});
+});
+chrome.downloads.onCreated?.addListener(item=>{
+  serial(()=>reconcilePendingStates(item.id,true)).catch(()=>{});
+});
+chrome.alarms?.onAlarm.addListener(alarm=>{
+  if (alarm.name !== RECOVERY_ALARM) return;
+  serial(()=>reconcilePendingStates()).catch(()=>{});
 });
 chrome.tabs.onRemoved.addListener(tabId => {
   serial(async()=> {
@@ -498,3 +530,7 @@ chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
     }
   }).catch(()=>{});
 });
+
+// A worker can be restarted without a matching download event. Reconcile its
+// persisted pending submissions and restore their alarm on every startup.
+serial(()=>reconcilePendingStates()).catch(()=>{});
