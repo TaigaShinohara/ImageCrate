@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createServer} from 'node:http';
+import {runFormatChecks} from './format-browser.mjs';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const repo=fileURLToPath(new URL('../',import.meta.url));
 const scratch=await mkdtemp(join(tmpdir(),'media-extension-qa-'));
@@ -383,6 +384,7 @@ try {
     await manager.setViewportSize({width:1280,height:900});
     await openSaveSettings();await manager.locator('#destination-downloads').check();await manager.locator('#folder-reset').click();await closeSaveSettings();
     if(await manager.locator('#clear').isEnabled())await manager.locator('#clear').click();
+    await runFormatChecks({manager,worker,origin,downloadFolder});
   } else {
     assert.ok(await manager.locator('.direct-save').count()>=1);assert.ok(await manager.locator('#unsupported-count').textContent());
     await manager.locator('.direct-save').first().click();await manager.waitForFunction(()=>document.querySelector('#batch').textContent.includes('1件保存完了'));

@@ -29,3 +29,19 @@ concept-driven-uxを使用。正本Page読取ツールが提供されていな�
 実装の独立コード審査では、handle整理競合・retryのuser activation切れ・予約名と先頭空白dotの安全化非冪等を指摘。worker内の最新一覧による整理、二段許可の別click化、安全化の順序とbyte予算修正を採用。検証結果と残件はQA.mdへ記録する。
 
 技術根拠: [Chrome downloads](https://developer.chrome.com/docs/extensions/reference/api/downloads)、[File System Access](https://developer.chrome.com/docs/capabilities/web-apis/file-system-access)、[optional permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[worker lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/service-workers/lifecycle)。実OS picker・実サイトの認証/リダイレクト・人間の体験は自動試験の合格へ含めない。
+
+## 保存形式の追加 — 2026-10-31
+
+本人依頼: ダウンロードする拡張子を選べるようにする。拡張子だけの変更は内容と拡張子が一致しなくなるため採用せず、元の形式（初期値）/JPEG(.jpg)/PNG(.png)/WebP(.webp)を実変換する方式を採用。品質sliderや画像ごとの設定を増やさず、既存dialogへ「保存形式」を統合。footerに次の保存形式、batchに今回の形式を表示し、元画像を絞り込む形式条件とは区別する。設定は作業ページ内で保持し、新作業ページでは元形式から開始する。
+
+JPEGは白背景、PNG/WebPはalpha保持。browser image decoderとOffscreenCanvasを利用し、同形式を選んでも再エンコードする。アニメ画像は既定画像/なければ最初のframeを静止画にし、SVGはdecodeした自然寸法で画像化。ChromiumでSVG Blobの直接decodeが拒否される場合はinert Image.decode→自然寸法を明示したbitmapを使用する。要求MIME・空でないBlobを確認し、PNGへの暗黙fallbackは拒否する。
+
+変換には選択した画像の具体hostだけの既存任意許可を使用し、manifest権限・外部依存は増やさない。元形式＋Chrome先の背景継続を保ち、`requiresWorkspace`で任意先または変換のbatchを共通管理する。変換する場合はChrome先でも作業タブ保持を開始前に表示する。形式・保存先・名前・対象はbatchへ固定し、変換失敗で元形式へ自動保存しない。
+
+Chrome先への変換保存はpageがBlobを作り、workerがbatch/owner/job/自拡張Blob URLを検証してdownload IDを保存する。Blob URLは受付時に破棄せず、Chromeの実complete/interruptedまで保持。応答喪失時も実状態を回復するまで早期解放しない。worker再起動後はIDを追跡し、元URLを代わりに開始しない。Stop/reload/closeはdownloadをcancel＋実状態を確認し、直前completeを保持。確定していないIDは処理中のままにして二重retryを防ぐ。未開始変換は中断へ回復する。
+
+圧縮入力32MiB/出力64MiB/2400万画素/片辺16384px、30秒無進捗timeout、1件ずつ処理する。Stop後に遅れてdecodeしたbitmapはclose、encode結果は破棄し保存を始めない。これは保持する入力/canvasの上限でnative decoder内部の一時allocationの厳密上限ではない。
+
+独立UX/技術設計審査で、FMT-01（管理主体）、FMT-02（Blob/download終端）、FMT-03（MIMEと静止画規則）を具体化。主担当ディレクターはこの範囲の実装開始を承認。独立コード審査では未対応形式のprototype名と、controller終了前retryの競合を指摘し、own-property検証と再試行guardを採用。正本Pageツール未提供のため、この案件も同梱UXマニュアルの参照を継続し、最新版差分は未確認。
+
+形式の仕様根拠: [HTML ImageBitmap](https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html)、[Canvas出力](https://html.spec.whatwg.org/multipage/canvas.html#serialising-bitmaps-to-a-file)。検証事実と残件はQA.mdへ記録する。

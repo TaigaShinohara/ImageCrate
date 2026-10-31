@@ -81,3 +81,16 @@
 - 独立設計審査とコードレビューを実施。handle整理の別タブ競合、二段許可のuser activation、preview/実pathの安全化差、確定直後reloadと確定中再編集を修正。最終コードレビューで対象範囲の未解決指摘なし。
 
 残件: 通常Chromeで拡張を再読込し、実OS folder pickerで任意の場所を選んで画像を保存する代表試験。実際の書込権限の拒否/再許可、サイト固有の認証/リダイレクト、外付け/ネットワーク保存先、スクリーンリーダー、本人の理解・操作感は未確認。強制終了等で後片付けが走らない場合は、未完成の空ファイルが残ることがある。既存の完成ファイルは上書きせず、新しい名前で再試行する。
+
+## 保存形式の選択と実変換 — 2026-10-31
+
+- `npm test`: 58 PASS / 1既存対象外SKIP。変換上限/拒否/timeout/Stop/遅延decoderの解放、要求MIMEと拡張子、JPEG白背景、alpha保持、SVG自然寸法fallback、Blobの非上書き保存、形式と保存先のbatch固定を確認。worker mockでBlobの受理/owner/job、downloadIdの保持、cancel直前complete、reload/close/worker再起動、Chrome確定前のretry拒否と元URLの無断開始防止を確認。
+- `npm run check` / `git diff --check`: PASS。manifest・実行時依存・ビルド不要の構成を維持し、新しい権限は追加していない。
+- 隔離Chrome156 / Playwright1.64.1の`npm run test:browser`: PASS。合成の透明PNGをJPEG/PNG/WebPへ実変換し、生成BlobのMIME・magic bytes・16×12の寸法・赤色内容・JPEGの白背景・PNG/WebPのalphaをdecodeし直して確認。同形式の元データ末尾に付けた合成markerが再エンコード後に残らないことも確認。
+- 各形式を実OPFS folderへ書込し、さらにChrome既定先にも実download。固定されたjob拡張子と、Chromeの完了・MIME・実ファイル内容の形式/寸法/画素を確認。CDPが物理basenameを変更する制約は従来と同じで、通常Chromeの物理pathそのものの追試とは区別。
+- 2frameの合成GIFは元形式で全byteと2frame保持。PNG変換では複数回同じ最初の赤frameになることと実保存を確認。SVGを自然寸法で実ラスタ化。壊れた画像は両保存先で中断し、原形式の無断fallbackファイル/downloadが作られないことを確認。
+- PNGで失敗したbatchの後に次回設定をJPEG/別名へ変え、retryが元のPNG・元の場所を使うことを実保存で確認。変換＋Chrome先でも具体hostだけを要求し、API境界の拒否でbatch不変・選択保持を確認。
+- 独立設計/コード審査でFMT-01〜03の管理主体・Blob終端・MIME/静止画規則を具体化。未対応形式のprototype名、controller終了前retryの競合を修正し、最終コードレビューの対象範囲で未解決指摘なし。
+- 変換したChrome downloadのURLとBlob URLを対応させ、実complete後にURLが解放されることを観測。長い日本語名・JPEG変換・任意先・完了batchの共存状態で、640/360×800のfooter Save/Change・形式/条件表示・dialog/selector領域・横overflowなし・Escape後focus復帰を確認。主担当が同条件の画面も目視した。
+
+残件: 実サイトの認証/配信元制限とリダイレクト、実OS folder picker・書込先、実Chrome116での追試、利用者が保存形式を見つけ選択できるか・変換結果を理解できるかの体験評価。native decoder内部の一時メモリ割当上限は測定・保証していない。変換は端末内で実施し、新しい変換サービスへの外部送信は追加していない。

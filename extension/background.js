@@ -1,5 +1,5 @@
 import { collect } from './collector.js';
-import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings } from './utils.js';
+import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings, requiresWorkspace } from './utils.js';
 import { pruneDirectories } from './directory-store.js';
 const KIND = 'images';
 const PREFIX = 'workspace:';
@@ -17,6 +17,7 @@ const save = state => {
 const load = async id => (await chrome.storage.session.get(PREFIX + id))[PREFIX + id];
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>v);
 const active = state => summarizeJobs(state.jobs).active > 0;
+const managed = state => requiresWorkspace(state.batch || {});
 async function liveTab(id) { try { return await chrome.tabs.get(id); } catch { return null; } }
 
 export async function openWorkspace(tab) {
@@ -24,7 +25,7 @@ export async function openWorkspace(tab) {
     const existing = await all();
     for (const state of existing) {
       const manager=await liveTab(state.workspaceTabId);
-      if (manager?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { state.closed=true;state.items=[];state.history=[];if(active(state) && state.batch?.destination !== 'directory') await pump(state); if(!active(state) || state.batch?.destination === 'directory') await chrome.storage.session.remove(PREFIX + state.id); continue; }
+      if (manager?.url !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) { await closeWorkspace(state); continue; }
       if (state.tabId === tab.id && state.url === tab.url) {
         await chrome.tabs.update(state.workspaceTabId, {active:true}); return state.id;
       }
@@ -74,8 +75,10 @@ async function refreshJob(job) {
   }
 }
 async function pump(state) {
-  if (state.batch?.destination === 'directory') return state;
   for (const job of state.jobs) await refreshJob(job);
+  // A workspace prepares converted images and owns custom-folder writes. The
+  // worker only follows their accepted download IDs; it must not fetch originals.
+  if (managed(state)) { await save(state); return state; }
   if (!state.jobs.some(j=>j.status === 'in_progress')) {
     for (const job of state.jobs.filter(j=>j.status === 'queued')) {
       try {
@@ -86,6 +89,32 @@ async function pump(state) {
     }
   }
   await save(state); return state;
+}
+async function stopJobs(state, reason) {
+  for (const job of state.jobs) {
+    if (!['queued','in_progress'].includes(job.status)) continue;
+    if (job.downloadId) {
+      await refreshJob(job);
+      if (job.status === 'in_progress') {
+        try { await chrome.downloads.cancel(job.downloadId); } catch {}
+        // Chrome may have completed before cancel, or cancel may still be
+        // settling. Keep an active ID until Chrome confirms a terminal state.
+        await refreshJob(job);
+      }
+      if (job.status === 'interrupted') job.error=reason;
+    } else { job.status='interrupted';job.error=reason; }
+  }
+}
+async function closeWorkspace(state) {
+  state.closed=true;state.items=[];state.notices=[];state.history=[];
+  if (managed(state)) await stopJobs(state,'作業ページが閉じられ、保存が中断しました。');
+  if (active(state)) await pump(state);
+  else await chrome.storage.session.remove(PREFIX + state.id);
+}
+function requireOwner(state, message) {
+  if (!managed(state) || state.batch.id !== message.batchId || state.batch.owner !== message.instance) {
+    throw new Error('この保存処理は終了したか、別の作業ページに引き継がれました。');
+  }
 }
 async function claim(state, instance, mode, wantStream = true) {
   if (KIND !== 'videos') throw new Error('未対応の操作です。');
@@ -132,8 +161,8 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         const settings = saveSettings(message.settings || state.saveSettings, state.title);
         if (settings.destination === 'directory' && !settings.directoryName) throw new Error('保存先フォルダを選んでください。');
         state.batch = {...settings,id:crypto.randomUUID(),owner:message.instance};
-        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),url:item.url,status:'queued',filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND).split('/').pop() : downloadName(item,settings.folderName,i,KIND)}));
-        if (settings.destination === 'directory') { await save(state); return state; }
+        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),url:item.url,status:'queued',filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND,settings.format).split('/').pop() : downloadName(item,settings.folderName,i,KIND,settings.format)}));
+        if (managed(state)) { await save(state); return state; }
         return pump(state);
       }
       case 'settings': {
@@ -142,11 +171,16 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         state.saveSettings = {...saveSettings(input,state.title),folderName:String(input.folderName ?? state.title).slice(0,300)};
         await save(state); return state;
       }
-      case 'directory-update': {
-        if (state.batch?.destination !== 'directory' || state.batch.id !== message.batchId || state.batch.owner !== message.instance) throw new Error('この保存処理は終了したか、別の作業ページに引き継がれました。');
+      case 'directory-update':
+      case 'managed-update': {
+        requireOwner(state,message);
         for (const update of (message.updates || []).slice(0,500)) {
           const job = state.jobs.find(job=>job.id === update.id);
           if (!job || !['queued','in_progress'].includes(job.status) || !['in_progress','complete','interrupted'].includes(update.status)) continue;
+          if (job.downloadId) { await refreshJob(job); continue; }
+          // Converted Chrome downloads are saved only after Chrome confirms
+          // completion. The page can report preparation or a conversion error.
+          if (state.batch.destination === 'downloads' && update.status === 'complete') continue;
           job.status = update.status;
           for (const key of ['bytesReceived','totalBytes']) if (Number.isFinite(update[key]) && update[key] >= 0) job[key] = update[key];
           if (typeof update.filename === 'string' && !/[\\/]/.test(update.filename)) job.filename = update.filename.slice(0,240);
@@ -154,29 +188,38 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         }
         await save(state); return state;
       }
+      case 'converted-download': {
+        requireOwner(state,message);
+        if (state.batch.destination !== 'downloads' || !['jpg','png','webp'].includes(state.batch.format)) throw new Error('この保存形式では変換後のダウンロードを開始できません。');
+        const job=state.jobs.find(job=>job.id === message.jobId);
+        if (!job || job.status !== 'in_progress' || job.downloadId) throw new Error('この画像の保存は終了したか、停止しました。');
+        if (typeof message.blobURL !== 'string' || !message.blobURL.startsWith(`blob:${chrome.runtime.getURL('')}`) || message.blobURL.length > 2048) throw new Error('変換後の画像データが不正です。');
+        if (state.jobs.some(other=>other !== job && other.downloadId && other.status === 'in_progress')) throw new Error('前の画像の保存が終わってから開始してください。');
+        try {
+          job.downloadId=await chrome.downloads.download({url:message.blobURL,filename:job.filename,conflictAction:'uniquify',saveAs:false});
+        } catch (error) { job.status='interrupted';job.error=publicError(error);await save(state);return state; }
+        // Persist the accepted ID before querying Chrome so an unrelated query
+        // failure cannot turn a live download into a freely retriable job.
+        await save(state);
+        await refreshJob(job);
+        await save(state);return state;
+      }
       case 'cancel': {
-        for(const job of state.jobs) {
-          if(job.status==='queued') { job.status='interrupted'; job.error='停止しました。'; }
-          if(job.status==='in_progress') {
-            if(state.batch?.destination === 'directory') {job.status='interrupted';job.error='停止しました。';}
-            else {try { await chrome.downloads.cancel(job.downloadId); } catch {} await refreshJob(job); if(job.status==='interrupted') job.error='停止しました。';}
-          }
-        }
+        if (managed(state) && state.batch.owner !== message.instance) throw new Error('この保存処理は別の作業ページに引き継がれました。');
+        await stopJobs(state,'停止しました。');
         await save(state); return state;
       }
       case 'retry': {
         if(active(state)) throw new Error('保存処理中です。');
-        if(state.batch?.destination === 'directory') state.batch.owner = message.instance;
+        if(managed(state) && state.batch.owner !== message.instance) throw new Error('この保存処理は別の作業ページに引き継がれました。');
         for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; }
-        if(state.batch?.destination === 'directory') {await save(state);return state;}
+        if(managed(state)) {await save(state);return state;}
         return pump(state);
       }
       case 'capture': return claim(state,message.instance,message.mode);
       case 'hello': {
-        if(state.batch?.destination === 'directory') {
-          if(state.batch.owner !== message.instance) for(const job of state.jobs.filter(j=>['queued','in_progress'].includes(j.status))) {
-            job.status='interrupted';job.error='作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、中断分を再試行できます。';
-          }
+        if(managed(state)) {
+          if(state.batch.owner !== message.instance) await stopJobs(state,'作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、中断分を再試行できます。');
           state.batch.owner=message.instance;await save(state);
         }
         // Reload gets a new instance token; the old page no longer owns a live recorder.
@@ -204,9 +247,6 @@ chrome.tabs.onRemoved.addListener(tabId => {
   serial(async()=> {
     const lock = (await chrome.storage.session.get('captureLock')).captureLock;
     if(lock?.tabId === tabId) await chrome.storage.session.remove('captureLock');
-    for(const state of await all()) if(state.workspaceTabId === tabId) {
-      if(active(state) && state.batch?.destination !== 'directory') { state.closed=true;state.items=[];state.notices=[];state.history=[];await save(state); }
-      else await chrome.storage.session.remove(PREFIX + state.id);
-    }
+    for(const state of await all()) if(state.workspaceTabId === tabId) await closeWorkspace(state);
   }).catch(()=>{});
 });
