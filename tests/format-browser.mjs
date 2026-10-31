@@ -27,12 +27,13 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
   const directoryName='ImageCrate形式検証';
   // Startup prunes stale batch handles. Keep backups under non-session keys so
   // restoring the old session also restores its original selected folder.
-  await manager.evaluate(async({id,batchId,prefix})=>{
+  await manager.evaluate(async({id,batchId,directoryKey,prefix})=>{
     const {getDirectory,putDirectory}=await import('./directory-store.js');
-    for(const [name,key] of [['session',`session:${id}`],['last','last'],['batch',`batch:${batchId}`]]) {
+    for(const [name,key] of [['session',`session:${id}`],['last','last'],['last-destination','last-destination'],['applied',directoryKey],['batch',`batch:${batchId}`]]) {
+      if(!key)continue;
       const handle=await getDirectory(key);if(handle)await putDirectory(prefix+name,handle);
     }
-  },{id:original.id,batchId:original.batch?.id,prefix:backupPrefix});
+  },{id:original.id,batchId:original.batch?.id,directoryKey:original.saveSettings?.directoryKey,prefix:backupPrefix});
   const poll=async(predicate,label='format batch',timeout=15000)=>{
     const deadline=Date.now()+timeout;
     while(Date.now()<deadline) {
@@ -306,7 +307,8 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     // responsive-layout and 500-item tests. Restore their exact fixture state.
     await manager.evaluate(async({state,local,prefix,key})=>{
       const {getDirectory,putDirectory,deleteDirectory}=await import('./directory-store.js');
-      for(const [name,target] of [['session',`session:${state.id}`],['last','last'],['batch',`batch:${state.batch?.id}`]]) {
+      for(const [name,target] of [['session',`session:${state.id}`],['last','last'],['last-destination','last-destination'],['applied',state.saveSettings?.directoryKey],['batch',`batch:${state.batch?.id}`]]) {
+        if(!target)continue;
         const handle=await getDirectory(prefix+name);
         if(handle)await putDirectory(target,handle);else if(name!=='batch' || state.batch)await deleteDirectory(target);
         await deleteDirectory(prefix+name);
