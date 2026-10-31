@@ -3,6 +3,8 @@ import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicE
 import { pruneDirectories } from './directory-store.js';
 import { extensionForMime } from './image-format.js';
 import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
+import {MEDIA_LIMITS, MEDIA_POLICY_VERSION} from './media-limits.js';
+import {createTransferBudget, reserveTransferAttempt, settleTransferAttempt, transferBudgetRemaining, transferOutputBudgetRemaining} from './transfer-budget.js';
 const KIND = 'images';
 const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
@@ -40,8 +42,8 @@ const save = async (state, extra = {}) => {
   }
   await syncRecoveryAlarm().catch(()=>{});
 };
-const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? sessionDefaults(state) : undefined; };
-const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>sessionDefaults(v));
+const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? normalizeManagedChromeOwnership(sessionDefaults(state)) : undefined; };
+const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>normalizeManagedChromeOwnership(sessionDefaults(v)));
 const hasPendingSubmission = state => state.jobs.some(job=>['queued','in_progress'].includes(job.status) && (job.submission && !job.downloadId || job.cancelRequested));
 async function syncRecoveryAlarm() {
   if (!chrome.alarms?.create) return;
@@ -266,6 +268,14 @@ async function refreshJob(job,state) {
     const matches=recent.filter(item=>submissionMatches(job,item,usedIds));
     if (matches.length === 1) { job.downloadId=matches[0].id; delete job.submission; delete job.error; }
     else if (!Number.isFinite(startedAt) || Date.now()-startedAt >= SUBMISSION_TIMEOUT) {
+      if (managed(state)) {
+        // A missing/ambiguous acceptance result does not prove that Chrome
+        // stopped consuming the Blob. Retain the bounded matching evidence and
+        // durable cancel intent until an actual owned terminal item is found.
+        job.status='in_progress';job.outcomeUnknown=true;delete job.chromeOutcomeKnown;
+        job.error='Chromeの保存受付と結果を確認できません。照合が終わるまで再試行できません。';
+        return;
+      }
       job.status='interrupted';
       job.error='保存結果を確認できませんでした。Chromeのダウンロード履歴を確認してから再試行してください。同名ファイルは上書きしません。';
       delete job.submission;
@@ -274,26 +284,36 @@ async function refreshJob(job,state) {
   }
   if (!job.downloadId || !['queued','in_progress'].includes(job.status)) return;
   const [item] = await chrome.downloads.search({id:job.downloadId});
-  applyChromeDownload(job,item);
+  applyChromeDownload(job,item,state);
   if (job.cancelRequested && job.status === 'in_progress') {
     try { await chrome.downloads.cancel(job.downloadId); } catch {}
     // Cancellation races completion and can settle asynchronously. Keep the
     // durable intent until Chrome reports the real terminal state.
     const [current]=await chrome.downloads.search({id:job.downloadId});
-    applyChromeDownload(job,current);
+    applyChromeDownload(job,current,state);
     if (job.status === 'interrupted') job.error=job.cancelReason || '停止しました。';
   }
 }
-function applyChromeDownload(job,item) {
-  if (!item) { job.status='interrupted'; job.error='ダウンロード履歴から見つかりません。再試行できます。'; return; }
+function applyChromeDownload(job,item,state) {
+  if (!item) {
+    job.status='interrupted';job.error='ダウンロード履歴から見つかりません。再試行できます。';
+    if (managed(state)) {
+      job.status='in_progress';job.outcomeUnknown=true;
+      job.error='Chromeのダウンロード履歴から保存結果を照合しています。確定するまで再試行できません。';
+    }
+    delete job.chromeOutcomeKnown;
+    return;
+  }
   job.bytesReceived = item.bytesReceived; job.totalBytes = item.totalBytes;
   if (item.filename) job.actualFilename = String(item.filename).slice(0,2048);
   if (item.mime) { job.mime=item.mime; job.typeKnown=Boolean(extensionForMime(item.mime)); }
   job.status = item.state;
+  job.chromeOutcomeKnown=['complete','interrupted'].includes(item.state);
   if (item.error) job.error = item.error;
   if (item.state === 'complete' && /^(text\/html|application\/(json|xml))/i.test(item.mime || '')) {
     job.status='interrupted'; job.error='メディアではない応答が保存されました。サイトの認証・制限を確認してください。';
   }
+  recoverKnownChromeTransfer(state,job);
 }
 // onDeterminingFilename can fire before download() resolves. It must never wait
 // for the mutation queue that is currently awaiting Chrome's filename decision.
@@ -423,6 +443,7 @@ async function stopJobs(state, reason) {
 }
 async function closeWorkspace(state) {
   disposeScan(state);
+  if (managed(state)) abandonManagedTransfers(state);
   delete state.scanRequest;
   state.closed=true;state.items=[];state.selectedItems=[];state.selectedURLs=[];state.ui={};state.notices=[];state.history=[];state.scan=null;
   await save(state);
@@ -433,6 +454,142 @@ async function closeWorkspace(state) {
 function requireOwner(state, message) {
   if (!managed(state) || state.batch.id !== message.batchId || state.batch.owner !== message.instance) {
     throw new Error('この保存処理は終了したか、別の作業ページに引き継がれました。');
+  }
+}
+function normalizeManagedChromeOwnership(state) {
+  if (managed(state) && state.batch.destination === 'downloads') for (const job of state.jobs) {
+    if (job.status === 'interrupted' && (job.downloadId || job.submission) && !job.chromeOutcomeKnown) {
+      // Earlier versions could mark a missing lookup as interrupted. That is
+      // not proof that an accepted Blob has stopped being consumed by Chrome.
+      job.status='in_progress';job.outcomeUnknown=true;
+      job.error='Chromeの保存受付と結果を照合しています。確定するまで再試行できません。';
+    }
+  }
+  return state;
+}
+function requireTransferBudget(state) {
+  const budget=state.batch?.transferBudget;
+  if (budget?.version !== MEDIA_POLICY_VERSION || state.batch.transferPolicyLegacy) {
+    throw new Error('以前の保存処理には容量・時間の記録がありません。保存先を確認してから新しい保存として準備してください。');
+  }
+  transferBudgetRemaining(budget); // Validate a persisted policy before use.
+  return budget;
+}
+function transferAttempt(state,job) {
+  const attempts=state.batch?.transferBudget?.attempts;
+  return attempts && Object.hasOwn(attempts,job.id) ? attempts[job.id] : undefined;
+}
+function knownTransferOutcome(state,job,status) {
+  const budget=state.batch?.transferBudget,attempt=transferAttempt(state,job);
+  if (!budget || attempt?.status !== 'unknown') return;
+  // We still charge the full source reservation: learning a real file outcome
+  // cannot reconstruct how many source bytes the departed owner consumed.
+  state.batch.transferBudget={...budget,attempts:{...budget.attempts,[job.id]:{...attempt,status,usageUnknown:Boolean(job.transfer?.usageUnknown)}}};
+}
+function recoverKnownChromeTransfer(state,job) {
+  if (!state || state.batch?.destination !== 'downloads' || !(job.outcomeUnknown || job.transfer?.usageUnknown || job.transfer?.outputUnknown)
+    || !job.chromeOutcomeKnown || !['complete','interrupted'].includes(job.status)) return;
+  knownTransferOutcome(state,job,job.status);
+  delete job.outcomeUnknown;
+}
+function markManagedOutcomeUnknown(state,job) {
+  job.outcomeUnknown=true;
+  if (state.batch.destination === 'downloads' && (job.downloadId || job.submission)) {
+    // Only an actual Chrome terminal result can resolve a Blob ownership doubt.
+    recoverKnownChromeTransfer(state,job);
+  } else if (job.status !== 'complete') {
+    // A confirmed completed file stays complete. Otherwise stop this job and
+    // reject same-batch retry without claiming that its file is absent.
+    job.status='interrupted';
+    job.error='書き込みの結果を確認できません。保存先のファイルを確認してから新しい保存として準備してください。';
+  }
+}
+function abandonManagedTransfers(state) {
+  const budget=state.batch?.transferBudget;
+  if (budget?.version !== MEDIA_POLICY_VERSION) {
+    state.batch.transferPolicyLegacy=true;
+    for (const job of state.jobs) {
+      if (state.batch.destination === 'directory' && job.status === 'in_progress') job.outcomeUnknown=true;
+    }
+    return;
+  }
+  for (const job of state.jobs) {
+    if (transferAttempt(state,job)?.status !== 'reserved') continue;
+    const outputKnown=job.status==='complete' && (state.batch.destination === 'directory' || job.chromeOutcomeKnown);
+    const noFileAccepted=state.batch.destination === 'downloads' && !job.downloadId && !job.submission;
+    const outputUnknown=!(outputKnown || noFileAccepted);
+    const outputBytes=outputKnown && Number.isSafeInteger(job.bytesReceived) && job.bytesReceived>=0 ? job.bytesReceived : 0;
+    state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,outcome:'unknown',outputBytes,outputUnknown});
+    job.transfer={...job.transfer,settledAt:Date.now(),settlement:'unknown',usageUnknown:true,outputUnknown,outputBytes};
+    if (state.batch.destination === 'directory') {
+      if (job.status === 'complete') knownTransferOutcome(state,job,'complete');
+      else {
+        job.status='interrupted';job.outcomeUnknown=true;
+        job.error='書き込みの結果を確認できません。保存先のファイルを確認してから新しい保存として準備してください。';
+      }
+    } else if (!job.downloadId && !job.submission) {
+      // No Blob was accepted by Chrome. There is no OS file operation to retry
+      // concurrently; source usage alone remains conservatively unknown.
+      knownTransferOutcome(state,job,'interrupted');
+    } else { job.outcomeUnknown=true;recoverKnownChromeTransfer(state,job); }
+  }
+}
+function managedReservation(state,message) {
+  requireOwner(state,message);
+  const budget=requireTransferBudget(state);
+  const job=state.jobs.find(job=>job.id===message.jobId);
+  if (!job || !['queued','in_progress'].includes(job.status) || job.cancelRequested || job.outcomeUnknown) {
+    throw new Error('この画像の保存は終了したか、停止しました。');
+  }
+  const existing=transferAttempt(state,job);
+  if (existing?.status === 'reserved') {
+    if (!job.transfer || Date.now() >= job.transfer.deadline || Date.now() >= budget.deadline) throw new Error('この保存試行の制限時間を超えました。');
+    return;
+  }
+  const original=(state.batch.format || 'original') === 'original';
+  let maxBytes=Math.min(original
+    ? MEDIA_LIMITS.original.maxBytes : MEDIA_LIMITS.converter.maxInputBytes,transferBudgetRemaining(budget));
+  if (!maxBytes) throw new Error('今回の保存の容量予算が不足しています。新しい保存として準備してください。');
+  const maxOutputBytes=Math.min(original ? maxBytes : MEDIA_LIMITS.converter.maxOutputBytes,transferOutputBudgetRemaining(budget));
+  if (!maxOutputBytes) throw new Error('今回の保存の出力容量予算が不足しています。新しい保存として準備してください。');
+  if (original) maxBytes=Math.min(maxBytes,maxOutputBytes);
+  const startedAt=Date.now();
+  state.batch.transferBudget=reserveTransferAttempt(budget,{attemptId:job.id,logicalJobId:job.logicalJobId,maxBytes,maxOutputBytes,now:startedAt});
+  job.transfer={maxBytes,maxOutputBytes,deadline:Math.min(budget.deadline,startedAt+MEDIA_LIMITS.original.timeoutMs),startedAt};
+  job.status='in_progress';
+}
+function managedSettlement(state,message) {
+  requireOwner(state,message);requireTransferBudget(state);
+  const job=state.jobs.find(job=>job.id===message.jobId);
+  const attempt=job && transferAttempt(state,job);
+  if (!job || !attempt || attempt.logicalJobId !== job.logicalJobId
+    || !['complete','interrupted','unknown'].includes(message.outcome)
+    || !Number.isSafeInteger(message.outputBytes ?? 0) || (message.outputBytes ?? 0) < 0
+    || message.outputUnknown !== undefined && typeof message.outputUnknown !== 'boolean'
+    || message.bytesReceived !== undefined && (!Number.isSafeInteger(message.bytesReceived) || message.bytesReceived < 0)
+    || message.outcome !== 'unknown' && message.bytesReceived === undefined) {
+    throw new Error('保存試行の結果が正しくありません。');
+  }
+  if (attempt.status !== 'reserved') {
+    if (message.outcome === 'unknown' || message.outputUnknown) {
+      // A lost terminal acknowledgement can follow a successful accounting
+      // write. Strengthen the outcome monotonically without undoing completed
+      // accounting or allowing the file to become freely retriable.
+      job.transfer={...job.transfer,acknowledgementUnknown:true};
+      const budget=state.batch.transferBudget;
+      state.batch.transferBudget={...budget,attempts:{...budget.attempts,[job.id]:{...attempt,outcomeUnknown:true}}};
+      markManagedOutcomeUnknown(state,job);
+    }
+    return;
+  }
+  state.batch.transferBudget=settleTransferAttempt(state.batch.transferBudget,{attemptId:job.id,
+    bytesReceived:message.bytesReceived,outcome:message.outcome,outputBytes:message.outputBytes ?? 0,
+    outputUnknown:message.outputUnknown ?? message.outcome==='unknown'});
+  job.transfer={...job.transfer,settledAt:Date.now(),settlement:message.outcome,
+    bytesReceived:message.bytesReceived ?? attempt.maxBytes,outputBytes:message.outputBytes ?? 0,
+    outputUnknown:message.outputUnknown ?? message.outcome==='unknown'};
+  if (message.outcome === 'unknown' || job.transfer.outputUnknown) {
+    job.transfer.usageUnknown=message.outcome === 'unknown';markManagedOutcomeUnknown(state,job);
   }
 }
 async function claim(state, instance, mode, wantStream = true) {
@@ -498,9 +655,10 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         if (!items.length) throw new Error('保存する対象を選んでください。');
         const settings = saveSettings(message.settings || state.saveSettings, state.title);
         if (settings.destination === 'directory' && !settings.directoryName) throw new Error('保存先フォルダを選んでください。');
-        state.batch = {...settings,id:crypto.randomUUID(),owner:message.instance,...(sourceBatchId ? {sourceBatchId} : {})};
+        state.batch = {...settings,id:crypto.randomUUID(),owner:message.instance,
+          transferBudget:createTransferBudget(),...(sourceBatchId ? {sourceBatchId} : {})};
         state.ui={...state.ui,saveScope:'selection',failedBatchId:null};
-        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),url:item.url,status:'queued',completionApplied:false,filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND,settings.format).split('/').pop() : downloadName(item,settings.folderName,i,KIND,settings.format)}));
+        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),logicalJobId:crypto.randomUUID(),url:item.url,status:'queued',completionApplied:false,filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND,settings.format).split('/').pop() : downloadName(item,settings.folderName,i,KIND,settings.format)}));
         if (managed(state)) { await save(state); return state; }
         return pump(state);
       }
@@ -547,6 +705,12 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         }
         await save(state); return state;
       }
+      case 'managed-reserve': {
+        managedReservation(state,message);await save(state);return state;
+      }
+      case 'managed-settle': {
+        managedSettlement(state,message);await save(state);return state;
+      }
       case 'converted-download': {
         requireOwner(state,message);
         if (state.batch.destination !== 'downloads' || !['jpg','png','webp'].includes(state.batch.format)) throw new Error('この保存形式では変換後のダウンロードを開始できません。');
@@ -571,14 +735,27 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
       case 'retry': {
         if(active(state)) throw new Error('保存処理中です。');
         if(managed(state) && state.batch.owner !== message.instance) throw new Error('この保存処理は別の作業ページに引き継がれました。');
-        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; delete job.cancelRequested; delete job.cancelReason; delete job.submission; }
+        if (managed(state)) {
+          const budget=requireTransferBudget(state);
+          if (Date.now() >= budget.deadline) throw new Error('今回の保存の制限時間を超えました。新しい保存として準備してください。');
+          if (!transferBudgetRemaining(budget)) throw new Error('今回の保存の容量予算を使い切りました。新しい保存として準備してください。');
+          if (!transferOutputBudgetRemaining(budget)) throw new Error('今回の保存の出力容量予算を使い切りました。新しい保存として準備してください。');
+          for (const job of state.jobs.filter(job=>job.status==='interrupted')) {
+            if (job.outcomeUnknown || ['reserved','unknown'].includes(transferAttempt(state,job)?.status)) throw new Error('前の書き込みの結果を確認できません。保存先を確認してから新しい保存として準備してください。');
+            if ((Object.hasOwn(budget.logicalAttempts,job.logicalJobId) ? budget.logicalAttempts[job.logicalJobId] : 0) >= budget.maxAttempts) throw new Error('この画像の再試行回数の上限に達しました。新しい保存として準備してください。');
+          }
+        }
+        for(const job of state.jobs.filter(j=>j.status==='interrupted')) { job.id=crypto.randomUUID();job.status='queued';job.completionApplied=false;delete job.transfer;delete job.chromeOutcomeKnown;delete job.bytesReceived;delete job.totalBytes; delete job.downloadId; delete job.error; delete job.cancelRequested; delete job.cancelReason; delete job.submission; }
         if(managed(state)) {await save(state);return state;}
         return pump(state);
       }
       case 'capture': return claim(state,message.instance,message.mode);
       case 'hello': {
         if(managed(state)) {
-          if(state.batch.owner !== message.instance) await stopJobs(state,'作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、中断分を再試行できます。');
+          if(state.batch.owner !== message.instance || state.batch.transferBudget?.version !== MEDIA_POLICY_VERSION) {
+            abandonManagedTransfers(state);
+            await stopJobs(state,'作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、結果が確定した中断分を再試行できます。');
+          }
           state.batch.owner=message.instance;await save(state);
         }
         // Reload gets a new instance token; the old page no longer owns a live recorder.

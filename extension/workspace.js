@@ -3,11 +3,13 @@ import { getDirectory, putDirectory, deleteDirectory, getLastDestination, putLas
 import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
+import { createMediaOperation } from './media-reader.js';
 
 const KIND = 'images';
 const $ = id => document.getElementById(id);
 const sessionId = new URL(location.href).searchParams.get('id');
 const instance = crypto.randomUUID();
+const resourceOwner=`${sessionId}:${instance}:conversion`;
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
 let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
@@ -19,6 +21,11 @@ let closingSettings = false;
 
 // A converted download owns its Blob URL until Chrome reports a terminal state.
 const convertedURLs = new Map();
+function releaseConverted(jobId){
+  const owned=convertedURLs.get(jobId);if(!owned)return;
+  URL.revokeObjectURL(owned.url);convertedURLs.delete(jobId);
+  try{Promise.resolve(owned.release?.()).catch(()=>{});}catch{}
+}
 async function send(type, extra = {}) {
   const response = await chrome.runtime.sendMessage({type, sessionId, instance, ...extra});
   if (!response?.ok) throw new Error(response?.error || '拡張の接続が切れました。作業タブを開き直してください。');
@@ -73,8 +80,8 @@ function applyState(next) {
   if(state && (next.revision || 0) < (state.revision || 0)) return;
   const selectionBefore=[...selected].join('\n');
   state=next;if(!pendingSelections)selected=new Set(state.selectedURLs || []);
-  for(const job of state.jobs) if(['complete','interrupted'].includes(job.status) && convertedURLs.has(job.id)) {
-    URL.revokeObjectURL(convertedURLs.get(job.id));convertedURLs.delete(job.id);
+  for(const job of state.jobs) if(['complete','interrupted'].includes(job.status) && (!job.downloadId || job.chromeOutcomeKnown) && !job.outcomeUnknown && convertedURLs.has(job.id)) {
+    releaseConverted(job.id);
   }
   updateSummary();
   for(const el of document.querySelectorAll('.item-status')) {const job=jobFor(el.dataset.url);el.textContent=jobLabel(job);el.dataset.state=job?.status || '';}
@@ -112,7 +119,7 @@ function updateSummary() {
   $('footer').dataset.batchState=batch.active ? 'active' : batch.interrupted ? 'interrupted' : batch.total ? 'complete' : '';
   $('cancel').hidden=!batch.active;
   $('retry').hidden=!batch.interrupted || batch.active > 0;
-  $('retry').disabled=requestPending || managedRunning;
+  $('retry').disabled=requestPending || managedRunning || state.jobs.some(job=>job.outcomeUnknown);
   const reconnect=state.batch?.destination==='directory' && batchDirectoryHandle && batchDirectoryPermission!=='granted';
   $('retry').textContent=reconnect?'今回の保存先へ再接続':`中断${batch.interrupted}件を再試行`;
   $('prepare-failed').hidden=!batch.interrupted || !!batch.active;
@@ -311,65 +318,117 @@ async function reconnectDirectory() {
 }
 async function interruptManagedJobs(reason) {
   // Downloads already handed to Chrome must settle there before a retry.
-  if(state.jobs.some(j=>j.downloadId && j.status === 'in_progress')) applyState(await send('cancel'));
-  const updates=state.jobs.filter(j=>['queued','in_progress'].includes(j.status)).map(j=>({id:j.id,status:'interrupted',error:reason}));
-  if(updates.length) applyState(await send('managed-update',{batchId:state.batch.id,updates}));
+  if(state.jobs.some(j=>(j.downloadId || j.submission) && j.status === 'in_progress')) await managedState('cancel');
+  const updates=state.jobs.filter(j=>['queued','in_progress'].includes(j.status) && !j.downloadId && !j.submission).map(j=>({id:j.id,status:'interrupted',error:reason}));
+  if(updates.length) await managedState('managed-update',{batchId:state.batch.id,updates});
+}
+async function managedState(type,extra={},operation) {
+  const owned=!operation;
+  operation??=createMediaOperation({timeoutMs:20000,idleTimeoutMs:20000});
+  // A timed-out RPC may still commit. Always apply its eventual snapshot, but
+  // never let that late acknowledgement authorize another fetch or file write.
+  const pending=send(type,extra).then(next=>{applyState(next);return next;});
+  try{return await operation.wait(pending);}finally{if(owned)operation.dispose();}
 }
 async function runManagedBatch(handle) {
   managedRunning=true;managedController=new AbortController();$('cancel').disabled=false;updateSummary();
   const controller=managedController,batchId=state.batch.id;
   let updates=Promise.resolve();
   const report=update=> {
-    const result=updates.then(()=>send('managed-update',{batchId,updates:[update]})).then(applyState);
+    const result=updates.then(()=>managedState('managed-update',{batchId,updates:[update]}));
     updates=result.catch(()=>{});return result;
   };
   try {
     const batch={...state.batch};
-    const folder=handle ? await handle.getDirectoryHandle(batch.folderName,{create:true}) : null;
+    let folder=null;
+    if(handle){
+      const preparation=createMediaOperation({signal:controller.signal,deadline:batch.transferBudget?.deadline});
+      try{folder=await preparation.wait(handle.getDirectoryHandle(batch.folderName,{create:true}));}finally{preparation.dispose();}
+    }
     for(const job of [...state.jobs].filter(j=>j.status === 'queued')) {
       if(controller.signal.aborted) break;
-      await report({id:job.id,status:'in_progress'});
-      let lastProgress=0;
+      let lastProgress=0,sourceBytes=0,operation,blob,reserved=false,reservationKnown=false,fileCommitted=false,resourcesSettled;
       try {
-        const options={signal:controller.signal,onProgress:progress=>{
+        // The worker persists a conservative reservation before any fetch.
+        operation=createMediaOperation({signal:controller.signal,deadline:Math.min(batch.transferBudget?.deadline??Infinity,Date.now()+120000)});
+        await operation.wait(updates);reserved=true;
+        await managedState('managed-reserve',{batchId,jobId:job.id},operation);reservationKnown=true;
+        const transfer=state.jobs.find(current=>current.id===job.id)?.transfer;
+        if(!transfer)throw new Error('保存予算を確認できません。新しい保存として準備してください。');
+        const attemptDeadline=Math.min(operation.deadline,transfer.deadline);operation.dispose();
+        operation=createMediaOperation({signal:controller.signal,deadline:attemptDeadline});
+        const progressUpdate=progress=>{
           if(Date.now()-lastProgress < 300) return;lastProgress=Date.now();
           report({id:job.id,status:'in_progress',...progress}).catch(e=>{controller.abort();error(e);});
-        }};
+        };
+        const options={signal:operation.signal,operation,maxBytes:transfer.maxBytes,deadline:transfer.deadline,
+          onBytes:progress=>{sourceBytes=progress.bytesReceived;},onProgress:progress=>{sourceBytes=Math.max(sourceBytes,progress.bytesReceived||0);progressUpdate(progress);}};
+        const settle=async(outcome,outputBytes=0)=>{
+          await updates;
+          await managedState('managed-settle',{batchId,jobId:job.id,bytesReceived:sourceBytes,outcome,outputBytes});
+        };
         if(batch.format && batch.format !== 'original') {
           const item=candidateCatalog(state).find(item=>item.url===job.url);
-          const blob=await convertImage(job.url,batch.format,{...options,knownWidth:item?.width,knownHeight:item?.height});
+          blob=await convertImage(job.url,batch.format,{...options,maxInputBytes:transfer.maxBytes,maxOutputBytes:transfer.maxOutputBytes,ownerId:resourceOwner,knownWidth:item?.width,knownHeight:item?.height});
+          sourceBytes=Math.max(sourceBytes,blob.sourceBytes||0);
           if(controller.signal.aborted) throw new DOMException('停止しました。','AbortError');
           if(folder) {
-            const result=await writeBlob(folder,job.filename,blob,options);
+            // Local output is a separate accounting unit, not a second network
+            // transfer of the original source bytes.
+            const result=await writeBlob(folder,job.filename,blob,{signal:operation.signal,operation,maxBytes:transfer.maxOutputBytes,onProgress:progressUpdate});
+            fileCommitted=true;await settle('complete',result.bytesReceived);
             await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
           } else {
-            const blobURL=URL.createObjectURL(blob);convertedURLs.set(job.id,blobURL);
+            operation.check();
+            const blobURL=URL.createObjectURL(blob);convertedURLs.set(job.id,{url:blobURL,release:()=>blob.releaseResources?.()});
             try {
               // Ownership is checked again in the worker before starting a file.
-              applyState(await send('converted-download',{batchId,jobId:job.id,blobURL}));
+              await managedState('converted-download',{batchId,jobId:job.id,blobURL},operation);
             } catch(e) {
               // A response can be lost after Chrome accepted the download.
               // Recover its ID before releasing data or offering another try.
               let recovered=false;
-              try {applyState(await send('get'));recovered=true;} catch {}
+              try {await managedState('get');recovered=true;} catch {}
               const current=state.jobs.find(j=>j.id===job.id);
-              if(recovered && !current?.downloadId) {URL.revokeObjectURL(blobURL);convertedURLs.delete(job.id);}
+              if(recovered && !current?.downloadId && !current?.submission)releaseConverted(job.id);
               throw e;
             }
             while(state.jobs.find(j=>j.id === job.id)?.status === 'in_progress') {
-              if(controller.signal.aborted) {applyState(await send('cancel'));break;}
-              await new Promise(resolve=>setTimeout(resolve,150));
-              applyState(await send('get'));
+              if(operation.signal.aborted) {await managedState('cancel');break;}
+              await operation.wait(new Promise(resolve=>setTimeout(resolve,150)));
+              await managedState('get',{},operation);
             }
-            // An interruption from Chrome is already canonical in state.
+            const current=state.jobs.find(j=>j.id===job.id);
+            await settle(current?.status==='complete'?'complete':current?.status==='interrupted'?'interrupted':'unknown',current?.status==='complete'?blob.size:0);
+            if(current?.status==='in_progress'){controller.abort();break;}
+            // An accepted Blob remains alive until Chrome's real terminal state.
           }
         } else {
           const result=await writeImage(folder,job.filename,job.url,options);
+          sourceBytes=result.bytesReceived;fileCommitted=true;await settle('complete',result.bytesReceived);
           await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
         }
       } catch(e) {
-        const reason=controller.signal.aborted ? '停止しました。中断分を再試行できます。' : e.name==='NotFoundError'?'保存先が見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':e.name === 'TypeError' ? '画像を取得できません。接続・サイトの認証・配信元の制限を確認するか、Chromeのダウンロード先・元の形式で新しく保存してください。' : publicError(e);
-        await report({id:job.id,status:'interrupted',error:reason});
+        resourcesSettled=e.resourcesSettled;
+        sourceBytes=Math.max(sourceBytes,Number.isSafeInteger(e.bytesReceived)?e.bytesReceived:0);
+        const uncertain=Boolean(e.outcomeUnknown || fileCommitted || reserved&&!reservationKnown);
+        if(uncertain)controller.abort();
+        const reason=uncertain?'書き込みの結果を確認できません。保存先のファイルを確認してから新しい保存として準備してください。'
+          :controller.signal.aborted?'停止しました。中断分を再試行できます。':e.name==='NotFoundError'?'保存先が見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':publicError(e);
+        if(reserved){
+          await updates;
+          const current=state.jobs.find(j=>j.id===job.id);
+          await managedState('managed-settle',{batchId,jobId:job.id,bytesReceived:sourceBytes,outcome:uncertain||(current?.downloadId||current?.submission)&&current.status==='in_progress'?'unknown':'interrupted'});
+        }
+        const current=state.jobs.find(j=>j.id===job.id);
+        if(current?.status==='in_progress' && (current.downloadId || current.submission))controller.abort();
+        else await report({id:job.id,status:'interrupted',error:reason});
+      } finally {
+        operation?.dispose();
+        if(blob&&!convertedURLs.has(job.id)){
+          const output=blob;
+          Promise.resolve(resourcesSettled).then(()=>output.releaseResources?.()).catch(()=>{});
+        }
       }
     }
     await updates;

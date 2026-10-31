@@ -284,3 +284,89 @@ test('cancel while waiting for an unknown signature creates no file', async () =
   await assert.rejects(saving, {name:'AbortError'});
   assert.equal(cancelled, true); assert.equal(h.entries.size, 0);
 });
+
+test('the first oversized chunk is never written and understating Content-Length cannot bypass the limit', async () => {
+  const h = directoryFixture(); const progress = [];
+  const body = new ReadableStream({start(stream) {
+    stream.enqueue(Uint8Array.from([137,80,78,71,13,10,26,10]));
+    stream.enqueue(new Uint8Array(4)); stream.close();
+  }});
+  await assert.rejects(writeImage(h.directory, 'photo.png', 'https://images.test/a', {maxBytes:10,
+    fetchImpl:async () => image(body), onProgress:value => progress.push(value.bytesReceived)}), error =>
+    error.code === 'byte-limit' && error.bytesReceived === 12);
+  assert.deepEqual(progress, [8]);
+  assert.equal(h.events.filter(([event]) => event === 'write').length, 1);
+  assert.equal(h.events.some(([event]) => event === 'close'), false);
+  assert.equal(h.entries.size, 0);
+});
+
+test('timeout during pending close returns outcome-unknown and holds ownership until that close settles', async () => {
+  const closing = deferred(); const finish = deferred(); let once = true;
+  const h = directoryFixture({onClose:async () => {
+    if (once) { once = false; closing.resolve(); await finish.promise; }
+  }});
+  const first = writeImage(h.directory, 'photo.png', 'https://images.test/a', {
+    timeoutMs:15,cleanupGraceMs:0,fetchImpl:async () => image()});
+  const firstFailure = assert.rejects(first, error => error.code === 'outcome-unknown' && error.filename === 'photo.png');
+  await closing.promise; await firstFailure;
+  let secondFetches = 0;
+  await assert.rejects(writeImage(h.directory, 'photo.png', 'https://images.test/b', {
+    timeoutMs:10,cleanupGraceMs:0,fetchImpl:async () => { secondFetches++; return image(); }}), {name:'TimeoutError'});
+  assert.equal(secondFetches, 0); assert.equal(h.entries.has('photo.png'), true);
+  assert.equal(h.events.some(([event]) => event === 'remove'), false);
+  finish.resolve(); await new Promise(resolve => setImmediate(resolve));
+  const next = await writeImage(h.directory, 'photo.png', 'https://images.test/c', {fetchImpl:async () => image()});
+  assert.equal(next.filename, 'photo (1).png');
+  assert.deepEqual([...h.entries.get('photo.png').data], [1,2,3]);
+});
+
+test('Stop during pending write returns outcome-unknown and never removes the uncertain entry', async () => {
+  const writing = deferred(); const finish = deferred(); const controller = new AbortController();
+  const h = directoryFixture({onWrite:async () => { writing.resolve(); await finish.promise; }});
+  const saving = writeImage(h.directory, 'photo.png', 'https://images.test/a', {
+    signal:controller.signal,cleanupGraceMs:0,fetchImpl:async () => image()});
+  const failed = assert.rejects(saving, error => error.code === 'outcome-unknown');
+  await writing.promise; controller.abort(); await failed;
+  assert.equal(h.entries.has('photo.png'), true);
+  assert.equal(h.events.some(([event]) => event === 'remove'), false);
+  finish.resolve(); await new Promise(resolve => setImmediate(resolve));
+});
+
+test('a hung abort does not hold the caller open but prevents a conflicting queued write', async () => {
+  const aborting = deferred(); const finish = deferred(); let once = true;
+  const h = directoryFixture({onWrite:async () => { if (once) { once = false; throw new Error('disk failed'); } },
+    onAbort:async () => { aborting.resolve(); await finish.promise; }});
+  const saving = writeImage(h.directory, 'photo.png', 'https://images.test/a', {
+    cleanupGraceMs:0,fetchImpl:async () => image()});
+  const failed = assert.rejects(saving, /disk failed/);
+  await aborting.promise; await failed;
+  let fetched = false;
+  await assert.rejects(writeImage(h.directory, 'photo.png', 'https://images.test/b', {
+    timeoutMs:10,fetchImpl:async () => { fetched = true; return image(); }}), {name:'TimeoutError'});
+  assert.equal(fetched, false); finish.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.entries.size, 0);
+});
+
+
+test('converted output resources settle only after pending native write and abort both settle', async () => {
+  const writing=deferred(),finishWrite=deferred(),aborting=deferred(),finishAbort=deferred(),controller=new AbortController();
+  const h=directoryFixture({onWrite:async()=>{writing.resolve();await finishWrite.promise;},onAbort:async()=>{aborting.resolve();await finishAbort.promise;}});
+  const saving=writeBlob(h.directory,'converted.png',new Blob([Uint8Array.from([1,2,3])],{type:'image/png'}),{signal:controller.signal,cleanupGraceMs:0});
+  const rejected=saving.catch(error=>error);await writing.promise;controller.abort();await aborting.promise;
+  const failure=await rejected;assert.equal(failure.outcomeUnknown,true);assert.ok(failure.resourcesSettled instanceof Promise);
+  let released=false;const releasing=failure.resourcesSettled.then(()=>{released=true;});
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(released,false,'UI failure must not free the still-owned output Blob');
+  finishWrite.resolve();await new Promise(resolve=>setImmediate(resolve));assert.equal(released,false,'pending abort still owns the resource lifetime');
+  finishAbort.resolve();await releasing;assert.equal(released,true);
+  assert.equal(h.events.some(([event])=>event==='remove'),false,'uncertain completed native I/O never deletes its entry');
+});
+
+test('resource settlement is also attached to known write failures with delayed cleanup', async () => {
+  const aborting=deferred(),finishAbort=deferred();
+  const h=directoryFixture({onWrite:async()=>{throw new Error('synthetic disk failure');},onAbort:async()=>{aborting.resolve();await finishAbort.promise;}});
+  const rejected=writeBlob(h.directory,'converted.png',new Blob(['x'],{type:'image/png'}),{cleanupGraceMs:0}).catch(error=>error);
+  await aborting.promise;const failure=await rejected;assert.match(failure.message,/synthetic disk failure/);assert.ok(failure.resourcesSettled instanceof Promise);
+  let settled=false;failure.resourcesSettled.then(()=>{settled=true;});await new Promise(resolve=>setImmediate(resolve));assert.equal(settled,false);
+  finishAbort.resolve();await failure.resourcesSettled;assert.equal(h.entries.size,0);
+});
