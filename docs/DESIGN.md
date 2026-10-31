@@ -1,5 +1,13 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## 画像の事前検査と共有codec — 2026-10-31
+
+プレビューと形式変換は共通のmetadata検査と専用workerを使う。PNG/APNG・JPEG・GIF・WebP・BMP・ICOのcontainer、寸法、frameや埋込画像の合計画素をnative decode前に検査する。入力1枚24MP、aggregate64MP・64frame・8192chunkまで。破損・未対応・不確実な形式は拒否し、元形式保存へ自動で切り替えない。AVIFと一般的なSVGは拒否する。SVGは明示的寸法を持つ単純な塗り矩形だけを独自に描画し、元SVGをnative Image/codecへ渡さない。
+
+全workspace共通のWeb Lockでcodecを1つにし、session ledgerでencoded bytes128MiB・source/output pixels64MP・fetch4枠を共有する。生成後は実Blob量へ予約を縮小する。preview cacheはglobal32MiB/workspace16MiB、表示buffer換算はglobal64MiB/workspace32MiB、同時preview fetchはworkspace2枠。ledgerのbyte/pixel値はアプリ所有量の会計で、ブラウザ内部codecのRSS・copy・GPU割当の測定値ではない。
+
+変換は入力32MiB・出力64MiB、JPEG/PNG/WebPの実MIMEを確認する。sourceと検査用copyの予約は検査/decodeの実Promise終了まで保持し、生成出力の予約は書込完了またはChromeの実terminal結果まで引き渡す。生存workspaceがBlob/URLを持つ間はbackgroundが先に資源を解放しない。閉鎖・reloadが確定した旧ownerだけをbackgroundが回収し、未確定のnative書込は保守的に保持する。後片付け記録はsessionに残し、worker再起動で再開する。native書込が永久に未確定の予約はブラウザsession終了まで残る場合がある。
+
 ## 管理保存の通信・書込予算 — 2026-10-31
 
 任意フォルダへの元形式保存と形式変換は、共通のstream readerで実際の展開後bodyを数える。Content-Lengthは早期拒否だけに使い、未知長・圧縮応答も各chunkを上限検査してから呼出側へ渡す。元形式は128MiB/120秒、変換入力は32MiB/120秒、無進捗は30秒。redirectは追従せず、認証は選択した配信元への既存Cookieをfetchのcredentialsで利用する。Cookie APIや広い常時host権限は使わない。絶対期限は待機・fetch・変換・書込を通じて進み、停止直後やタイマー遅延後も再検査する。

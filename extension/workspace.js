@@ -290,7 +290,7 @@ function renderDestination() {
   $('directory-status').textContent=!draftHandle?'保存するフォルダを選んでください。':draftPermission==='granted'?'このフォルダに保存できます。':'保存前にフォルダへの書き込み許可を確認してください。';
   $('directory-reconnect').hidden=!custom || !draftHandle || draftPermission==='granted';$('directory-details').hidden=!custom || converting;
   $('format-details').hidden=!converting;$('format-help').hidden=converting;
-  $('format-details').textContent=`アニメーションは1コマの静止画、SVGは固定サイズの画像になります。${resolved.format==='jpg'?'JPEGの透明部分は白背景です。':'透明部分は保持します。'}画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
+  $('format-details').textContent=`アニメーションは最初の1コマの静止画になります。複雑なSVG・AVIFなど、安全に検査できない画像は変換せず、元形式で保存できます。${resolved.format==='jpg'?'JPEGの透明部分は白背景です。':'透明部分は保持します。'}画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
   $('folder-adjustment').hidden=!draft.folderName.trim() || resolved.folderName===draft.folderName;
   $('folder-adjustment').textContent=`作成する名前: ${resolved.folderName}`;
   const busy=closingSettings || requestPending;
@@ -333,10 +333,21 @@ async function managedState(type,extra={},operation) {
 async function runManagedBatch(handle) {
   managedRunning=true;managedController=new AbortController();$('cancel').disabled=false;updateSummary();
   const controller=managedController,batchId=state.batch.id;
-  let updates=Promise.resolve();
+  let updates=Promise.resolve(),progressQueued=null,progressTask=null;
   const report=update=> {
+    progressQueued=null;
     const result=updates.then(()=>managedState('managed-update',{batchId,updates:[update]}));
     updates=result.catch(()=>{});return result;
+  };
+  const reportProgress=update=>{
+    progressQueued=update;if(progressTask)return;
+    progressTask=(async()=>{
+      while(progressQueued&&!controller.signal.aborted){
+        const latest=progressQueued;progressQueued=null;
+        await managedState('managed-update',{batchId,updates:[latest]});
+      }
+    })();
+    updates=progressTask.catch(e=>{progressQueued=null;controller.abort();error(e);}).finally(()=>{progressTask=null;});
   };
   try {
     const batch={...state.batch};
@@ -359,7 +370,7 @@ async function runManagedBatch(handle) {
         operation=createMediaOperation({signal:controller.signal,deadline:attemptDeadline});
         const progressUpdate=progress=>{
           if(Date.now()-lastProgress < 300) return;lastProgress=Date.now();
-          report({id:job.id,status:'in_progress',...progress}).catch(e=>{controller.abort();error(e);});
+          reportProgress({id:job.id,status:'in_progress',...progress});
         };
         const options={signal:operation.signal,operation,maxBytes:transfer.maxBytes,deadline:transfer.deadline,
           onBytes:progress=>{sourceBytes=progress.bytesReceived;},onProgress:progress=>{sourceBytes=Math.max(sourceBytes,progress.bytesReceived||0);progressUpdate(progress);}};
@@ -380,10 +391,11 @@ async function runManagedBatch(handle) {
             await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
           } else {
             operation.check();
-            const blobURL=URL.createObjectURL(blob);convertedURLs.set(job.id,{url:blobURL,release:()=>blob.releaseResources?.()});
+            const outputBytes=blob.size,outputLease=blob.resourceLease;
+            const blobURL=URL.createObjectURL(blob);convertedURLs.set(job.id,{url:blobURL,release:blob.releaseResources});blob=null;
             try {
               // Ownership is checked again in the worker before starting a file.
-              await managedState('converted-download',{batchId,jobId:job.id,blobURL},operation);
+              await managedState('converted-download',{batchId,jobId:job.id,blobURL,resourceLease:outputLease},operation);
             } catch(e) {
               // A response can be lost after Chrome accepted the download.
               // Recover its ID before releasing data or offering another try.
@@ -399,7 +411,7 @@ async function runManagedBatch(handle) {
               await managedState('get',{},operation);
             }
             const current=state.jobs.find(j=>j.id===job.id);
-            await settle(current?.status==='complete'?'complete':current?.status==='interrupted'?'interrupted':'unknown',current?.status==='complete'?blob.size:0);
+            await settle(current?.status==='complete'?'complete':current?.status==='interrupted'?'interrupted':'unknown',current?.status==='complete'?outputBytes:0);
             if(current?.status==='in_progress'){controller.abort();break;}
             // An accepted Blob remains alive until Chrome's real terminal state.
           }

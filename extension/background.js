@@ -5,6 +5,7 @@ import { extensionForMime } from './image-format.js';
 import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
 import {MEDIA_LIMITS, MEDIA_POLICY_VERSION} from './media-limits.js';
 import {createTransferBudget, reserveTransferAttempt, settleTransferAttempt, transferBudgetRemaining, transferOutputBudgetRemaining} from './transfer-budget.js';
+import {createImageResourceCoordinator} from './image-decoder.js';
 const KIND = 'images';
 const PREFIX = 'workspace:';
 const SUBMISSION_TIMEOUT = 30000;
@@ -15,6 +16,60 @@ const workerInstance = crypto.randomUUID();
 const scanFlights = new Map();
 const SOURCE_FLIGHTS_KEY = 'imagecrate.sourceFlights.v1';
 let operations = Promise.resolve();
+const resourceCleanups=new Map();
+const hasImageCleanup=state=>Boolean(state.retiredImageOwners?.length||state.jobs.some(job=>job.resourceLease));
+const recoverableImageCleanup=state=>Boolean(state.retiredImageOwners?.some(item=>!item.blocked)||state.jobs.some(job=>job.resourceLease));
+function scheduleImageCleanup(state) {
+  const coordinator=createImageResourceCoordinator();
+  const schedule=(key,release,commit)=>{
+    if(resourceCleanups.has(key))return;
+    const pending=Promise.resolve().then(release).then(released=>released===false?undefined:serial(async()=>{
+      const current=await load(state.id);if(!current||!commit(current))return;
+      await save(current);
+      if(current.closed&&!active(current)&&!hasImageCleanup(current))await chrome.storage.session.remove(PREFIX+current.id);
+    })).catch(()=>{}).finally(()=>resourceCleanups.delete(key));
+    resourceCleanups.set(key,pending);
+  };
+  for(const job of state.jobs)if(job.resourceLease&&job.chromeOutcomeKnown&&['complete','interrupted'].includes(job.status)){
+    const {id,owner}=job.resourceLease;
+    const retired=state.imageContextGone||state.retiredImageOwners?.some(item=>item.owner===owner);
+    schedule(`lease:${id}`,async()=>{
+      if(retired){
+        await coordinator.releaseLease(id,owner);
+        const resources=(await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{};
+        return !resources[id];
+      }
+      // A live/frozen page may still own its URL/Blob after Chrome finishes.
+      // It releases the lease itself after revoking the URL. Only drop our
+      // handoff record once that release is already durably visible.
+      const resources=(await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{};
+      return !resources[id];
+    },current=>{
+      const owned=current.jobs.find(item=>item.id===job.id);
+      if(owned?.resourceLease?.id!==id)return false;
+      delete owned.resourceLease;return true;
+    });
+  }
+  for(const retired of state.retiredImageOwners||[]){
+    if(retired.blocked)continue;
+    if(retired.jobs?.some(id=>{const job=state.jobs.find(item=>item.id===id);return !job?.chromeOutcomeKnown||!['complete','interrupted'].includes(job.status);}))continue;
+    schedule(`owner:${retired.owner}`,()=>coordinator.releaseOwner(retired.owner),current=>{
+      const before=current.retiredImageOwners?.length||0;
+      current.retiredImageOwners=(current.retiredImageOwners||[]).filter(item=>item.owner!==retired.owner);
+      return before!==current.retiredImageOwners.length;
+    });
+  }
+}
+function retireImageOwner(state,instance) {
+  if(typeof instance!=='string'||!instance||instance.length>100)return;
+  const prefix=`${state.id}:${instance}:`,records=state.retiredImageOwners||[];
+  const add=record=>{if(!records.some(item=>item.owner===record.owner))records.push(record);};
+  if(records.length>62)throw new Error('未確定の画像処理が多すぎます。保存結果を確認してブラウザを再起動してください。');
+  add({owner:prefix+'preview'});
+  add({owner:prefix+'conversion',blocked:state.batch?.destination==='directory'&&state.jobs.some(job=>job.outcomeUnknown),
+    jobs:state.jobs.filter(job=>job.resourceLease?.owner===prefix+'conversion'&&!job.chromeOutcomeKnown&&(job.downloadId||job.submission)).map(job=>job.id)});
+  state.retiredImageOwners=records;
+}
 // One mutation queue protects storage read/modify/write across concurrent events.
 const serial = task => { const next = operations.then(task); operations = next.catch(() => {}); return next; };
 const save = async (state, extra = {}) => {
@@ -41,13 +96,14 @@ const save = async (state, extra = {}) => {
     if (!current || ['complete','interrupted'].includes(current.status)) forgetSubmission(id);
   }
   await syncRecoveryAlarm().catch(()=>{});
+  scheduleImageCleanup(state);
 };
 const load = async id => { const state=(await chrome.storage.session.get(PREFIX + id))[PREFIX + id]; return state ? normalizeManagedChromeOwnership(sessionDefaults(state)) : undefined; };
 const all = async () => Object.entries(await chrome.storage.session.get(null)).filter(([k]) => k.startsWith(PREFIX)).map(([,v])=>normalizeManagedChromeOwnership(sessionDefaults(v)));
 const hasPendingSubmission = state => state.jobs.some(job=>['queued','in_progress'].includes(job.status) && (job.submission && !job.downloadId || job.cancelRequested));
 async function syncRecoveryAlarm() {
   if (!chrome.alarms?.create) return;
-  const pending=(await all()).some(hasPendingSubmission);
+  const pending=(await all()).some(state=>hasPendingSubmission(state)||recoverableImageCleanup(state));
   if (pending) {
     // Repeated UI messages must not postpone a closed workspace's wake-up.
     const current=await chrome.alarms.get(RECOVERY_ALARM);
@@ -75,13 +131,14 @@ export async function openWorkspace(tab) {
   return serial(async () => {
     const existing = await all();
     for (const state of existing) {
+      if(state.closed){scheduleImageCleanup(state);continue;}
       const manager=await liveTab(state.workspaceTabId);
       if (!await ownsWorkspaceTab(state,manager)) { await closeWorkspace(state); continue; }
       if (state.tabId === tab.id && state.url === tab.url) {
         await chrome.tabs.update(state.workspaceTabId, {active:true}); return state.id;
       }
     }
-    if ((await all()).length >= 4) throw new Error('作業タブは4つまでです。使い終わった作業タブを閉じてください。');
+    if ((await all()).filter(state=>!state.closed).length >= 4) throw new Error('作業タブは4つまでです。使い終わった作業タブを閉じてください。');
     const id = crypto.randomUUID();
     const state = {id, tabId:tab.id, url:tab.url || '', title:(tab.title || 'ページ').slice(0,160), items:[], jobs:[], notices:[], scanned:false};
     // Open inactive first so messages cannot arrive before the session is persisted.
@@ -441,15 +498,16 @@ async function stopJobs(state, reason) {
     } else { job.status='interrupted'; job.error=reason; }
   }
 }
-async function closeWorkspace(state) {
+async function closeWorkspace(state,resourcesGone=false) {
   disposeScan(state);
   if (managed(state)) abandonManagedTransfers(state);
+  if(resourcesGone){retireImageOwner(state,state.imageInstance);state.imageContextGone=true;}
   delete state.scanRequest;
   state.closed=true;state.items=[];state.selectedItems=[];state.selectedURLs=[];state.ui={};state.notices=[];state.history=[];state.scan=null;
   await save(state);
   if (managed(state)) await stopJobs(state,'作業ページが閉じられ、保存が中断しました。');
   if (active(state)) await pump(state);
-  if (!active(state)) { await chrome.storage.session.remove(PREFIX + state.id); await syncRecoveryAlarm().catch(()=>{}); }
+  if (!active(state)&&!hasImageCleanup(state)) { await chrome.storage.session.remove(PREFIX + state.id); await syncRecoveryAlarm().catch(()=>{}); }
 }
 function requireOwner(state, message) {
   if (!managed(state) || state.batch.id !== message.batchId || state.batch.owner !== message.instance) {
@@ -624,7 +682,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
   }
   serial(async () => {
     const state = await load(message.sessionId);
-    if (!state || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
+    if (!state || state.closed || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
     switch(message.type) {
       case 'get': return pump(state);
       case 'prune-directories': {
@@ -717,6 +775,18 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         const job=state.jobs.find(job=>job.id === message.jobId);
         if (!job || job.status !== 'in_progress' || job.downloadId || job.cancelRequested) throw new Error('この画像の保存は終了したか、停止しました。');
         if (typeof message.blobURL !== 'string' || !message.blobURL.startsWith(`blob:${chrome.runtime.getURL('')}`) || message.blobURL.length > 2048) throw new Error('変換後の画像データが不正です。');
+        const lease=message.resourceLease;
+        if(state.imageInstance===message.instance&&!lease)throw new Error('変換画像の資源予約を確認できません。');
+        if(lease!==undefined){
+          const expected=`${state.id}:${message.instance}:conversion`;
+          if(typeof lease?.id!=='string'||!lease.id||lease.id.length>256||lease.owner!==expected)throw new Error('変換画像の資源所有者を確認できません。');
+          // Read the already committed ownership record without acquiring the
+          // codec/resource Web Lock inside the worker's mutation queue. The
+          // page retains this immutable lease until native terminal evidence.
+          const snapshot=(await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{};
+          if(snapshot[lease.id]?.owner!==expected)throw new Error('変換画像の資源予約が失効しました。');
+          job.resourceLease={id:lease.id,owner:expected};
+        }
         if (state.jobs.some(other=>other !== job && other.downloadId && other.status === 'in_progress')) throw new Error('前の画像の保存が終わってから開始してください。');
         try {
           job.downloadId=await submitDownload(state,job,message.blobURL);
@@ -751,12 +821,16 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
       }
       case 'capture': return claim(state,message.instance,message.mode);
       case 'hello': {
+        const oldInstance=state.imageInstance;
         if(managed(state)) {
           if(state.batch.owner !== message.instance || state.batch.transferBudget?.version !== MEDIA_POLICY_VERSION) {
             abandonManagedTransfers(state);
             await stopJobs(state,'作業ページが再読み込みされ、保存が中断しました。保存済みの画像はそのままに、結果が確定した中断分を再試行できます。');
           }
           state.batch.owner=message.instance;await save(state);
+        }
+        if(oldInstance!==message.instance){
+          retireImageOwner(state,oldInstance);state.imageInstance=message.instance;await save(state);
         }
         // Reload gets a new instance token; the old page no longer owns a live recorder.
         const lock = (await chrome.storage.session.get('captureLock')).captureLock;
@@ -779,13 +853,14 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
 // Chrome may deliver the alarm later (at least one minute on Chrome 116).
 async function reconcilePendingStates(downloadId, includeKnown = false) {
   for (const state of await all()) {
-    if (!hasPendingSubmission(state) && !(includeKnown && state.jobs.some(job=>job.downloadId === downloadId))) continue;
+    if (!hasPendingSubmission(state) && !hasImageCleanup(state) && !(includeKnown && state.jobs.some(job=>job.downloadId === downloadId))) continue;
     if (!state.closed) {
       const owner=await liveTab(state.workspaceTabId);
       if (!await ownsWorkspaceTab(state,owner)) { await closeWorkspace(state); continue; }
     }
     await pump(state);
-    if (state.closed && !active(state)) await chrome.storage.session.remove(PREFIX + state.id);
+    scheduleImageCleanup(state);
+    if (state.closed && !active(state)&&!hasImageCleanup(state)) await chrome.storage.session.remove(PREFIX + state.id);
   }
   await syncRecoveryAlarm();
 }
@@ -808,7 +883,7 @@ chrome.tabs.onRemoved.addListener(tabId => {
     const lock = (await chrome.storage.session.get('captureLock')).captureLock;
     if(lock?.tabId === tabId) await chrome.storage.session.remove('captureLock');
     for(const state of await all()) {
-      if(state.workspaceTabId === tabId) await closeWorkspace(state);
+      if(state.workspaceTabId === tabId) await closeWorkspace(state,true);
       else if (state.tabId === tabId) {
         disposeScan(state);state.sourceEpoch=(state.sourceEpoch || 0)+1;delete state.sourceDocumentId;delete state.scanRequest;
         state.scan={cursor:null,hasMore:false,invalidated:true};await save(state);
@@ -821,7 +896,7 @@ chrome.tabs.onUpdated?.addListener((tabId,changeInfo,tab)=>{
   if (!changeInfo.url && changeInfo.status !== 'loading') return;
   serial(async()=>{
     for (const state of await all()) {
-      if (state.workspaceTabId === tabId && (tab.url || changeInfo.url) && (tab.url || changeInfo.url) !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state);
+      if (state.workspaceTabId === tabId && (tab.url || changeInfo.url) && (tab.url || changeInfo.url) !== chrome.runtime.getURL(`workspace.html?id=${state.id}`)) await closeWorkspace(state,true);
       else if (state.tabId === tabId) {
         disposeScan(state);
         state.sourceEpoch=(state.sourceEpoch || 0)+1;delete state.sourceDocumentId;delete state.scanRequest;
