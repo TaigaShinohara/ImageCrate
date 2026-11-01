@@ -114,6 +114,8 @@
       <div class="directory-actions"><button id="choose-directory" class="secondary" type="button">フォルダを選ぶ</button><button id="directory-reconnect" class="secondary" type="button" hidden>このフォルダへの保存を許可</button></div>
       <p id="directory-status" class="settings-note directory-status" role="status"></p>
       <p id="directory-details" class="settings-note directory-details" hidden>選択したフォルダへ保存するときは、このタブを開いたままにしてください。保存する画像の配信元へのアクセス許可をChromeに求める場合があります。配信元へのアクセス許可は、Chromeの拡張機能設定で取り消せます。</p>
+      <label class="remember-destination"><input id="remember-destination" type="checkbox" checked aria-describedby="remember-destination-help"><span>次の作業でもこの保存先を使う</span></label>
+      <p id="remember-destination-help" class="settings-note">OFFで次回用の保存先を忘れます。現在の作業の再読み込み・中断分の再開に必要な参照は保持します。</p>
     </fieldset>
     <section class="folder-settings" aria-labelledby="folder-label">
       <label id="folder-label" class="settings-label" for="folder-name">まとめるフォルダ名</label>
@@ -129,7 +131,7 @@
         <option value="png">PNG（.png）</option>
         <option value="webp">WebP（.webp）</option>
       </select>
-      <p id="format-help" class="settings-note">元の形式では、アニメーションや元データをそのまま保存します。</p>
+      <p id="format-help" class="settings-note">元の形式では、アニメーションや元データをそのまま保存します。撮影者・位置情報などの付属情報も残る場合があります。</p>
       <p id="format-details" class="settings-note directory-details" hidden></p>
     </section>
     <section class="destination-result" aria-labelledby="destination-preview-label"><h3 id="destination-preview-label">保存先のプレビュー</h3><p id="destination-preview" class="destination-preview" aria-live="polite">Chromeのダウンロード先 / ImageCrate / ページ名</p></section>

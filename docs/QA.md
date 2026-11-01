@@ -1,5 +1,22 @@
 # QA — v0.1
 
+## 情報保持・保存先記憶の制御 — 2026-11-01
+
+対象は保存結果のbasename化・旧session移行、閉鎖済みsource情報の削減、次回用保存先のON/OFF、連絡先と保持説明、合成メタデータ検証。実装・自動検証・実UI・本人試用は分けて記録する。
+
+- `npm test`: **318 PASS / 既存対象外1 SKIP**。POSIX/Windows/UNCの旧jobs/historyの移行、revisionの単調増加、移行失敗後の再試行、新規保存の抑止、閉鎖後の受付回復、IDBの原子的OFF・CAS競合・旧記録・破損記録を確認。`npm run check` / `git diff --check`: PASS。manifest・権限・runtime依存は変更せず、buildlessを維持。
+- Chrome **156.0.8078.80** / Playwright **1.64.1** の `npm run test:browser`: PASS。既存の選択・保存・再試行・worker回復と、実エンコーダによるPNG/JPEG/WebPの9組合せを確認。合成の妥当なEXIF Artist/GPS/orientation、JPEG IPTC/XMP、WebP XMP、PNG textを対象に、元形式3種のbyte保持と、9組合せをChrome既定先・実OPFSへ保存した出力の対象フィールド/marker不残存を検査。EXIF6のJPEGは各出力形式で12×16への回転と画素を確認。既存のalpha・JPEG白背景・MIME/署名・非上書きも維持。
+- 同Chromeの `npm run test:ux`: **29項目PASS**。記憶OFF後の新規作業はChrome先、同一作業のreloadは固定済みフォルダを維持。古い別タブdraftの形式変更、IDB失敗を注入した後の再試行、ON/OFF往復後の明示競合、記憶失敗時のdialog/表示を確認。未編集の古いONが失敗後に明示ONとして復活する経路を修正した。読込み中のcheckboxは操作不可・aria-busyと専用表示になり、試験も読込み完了を待つ。360/640/1280px、200% zoom、Escape・Cancel、既存の選択・保存を回帰。主担当が360/1280pxの設定画面も目視。
+- 同Chromeの `npm run test:security`: **12項目PASS**。未同意/拒否の画像取得ゼロ、CSP、具体host同意、合成Cookieの到達・Referer不在、redirect拒否、入力/画素上限、取消と資源解放を回帰。取消はテスト用必須host grantを外せないため、従来どおり明示したAPI境界fixtureで確認。
+- 公式Chrome for Testing **116.0.5845.96** の `npm run test:compat`: **13項目PASS**。実IDBのOFF維持・古いrevision拒否・作業/batch handle保護、9組合せのメタデータ検査、EXIF6の寸法・画素を確認。実Worker13生成/13終了と最後の共有ledger解放を確認。Chrome116での設定取消・元形式保存も回帰。
+- 独立コードレビューでsession移行/復旧、保存先記憶と競合、合成メタデータ構造、説明文を相互確認。指摘された未編集ONの再試行問題を修正し、対象範囲の未解決must-fixなし。試験したメタデータ構造だけの結果であり、完全除去・匿名化の保証にはしない。
+
+実UIを別途確認した範囲: 正本extensionの全ファイルhashと一致するコピー・追加host grantやJS hookのない隔離Chrome116で、実ツールバーactiveTabから合成2画像を収集、実localhost許可プロンプトの拒否→再要求→許可、許可後640×480プレビュー、記憶ONからOFFの適用と実reload後のOFF保持、実OS pickerのキャンセルと旧設定保持を確認した。個人用Chromeプロフィールは試験に使っていない。
+
+実OS pickerの選択確定は未確認。専用の空フォルダへ移動し、そのフォルダ行を選択しても「選択」が無効のままで、画面表示でも確認した。無効な操作を強制せずキャンセルした。原因は未特定で、アプリの不具合と断定しない。現行Chrome156の別の隔離プロセスも準備したが、UI操作ツールは通常利用側を選択したため、それ以上の操作を行わず試験プロセスだけを正常終了した。
+
+残件: 実OS picker確定後の書込、実書込権限拒否/再許可、実optional host権限の取消、通常Chromeでの最新版再読み込み、VoiceOver、本人の初回・反復試用。既存の本人確認待ちの担当・条件を維持する。OPFSやAPI境界fixtureの成功を実OS操作の成功とは扱わない。
+
 ## 広告候補の除外フィルター — 2026-10-31
 
 - 初期OFFの単一checkboxで、縦横比3:1以上・短辺200px未満・GIFをまとめて除外する。元ページの寸法を概算に使い、プレビューの検査済み実寸法・形式を優先する。不明情報はその条件では除外しない。追加の取得・権限・実行時依存はない。

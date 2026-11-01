@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {tagPrivacyMetadata,readPrivacyMetadata,SYNTHETIC_METADATA} from './helpers/privacy-metadata.mjs';
 
 const executablePath = process.env.CHROME_EXECUTABLE;
 if (!executablePath) throw new Error('Set CHROME_EXECUTABLE to the official Chrome for Testing 116 executable.');
@@ -201,6 +202,35 @@ try {
   assert.equal(await manager.locator('#destination-summary').textContent(), footerBefore);
   checked('Chrome 116 settings cancel preserves the applied name/format');
 
+  const remember = await manager.evaluate(async()=>{
+    const {getDirectory,putDirectory,deleteDirectory,getLastDestination,getRememberDestination,putLastDestination}=await import('./directory-store.js');
+    const keys=['last','last-destination','remember-destination'],snapshot=[];
+    for(const key of keys)snapshot.push([key,await getDirectory(key)]);
+    const handle=await (await navigator.storage.getDirectory()).getDirectoryHandle('compat-policy-probe',{create:true});
+    const suffix=crypto.randomUUID(),liveKeys=[`session:compat-policy:${suffix}`,`batch:compat-policy:${suffix}`];
+    try {
+      for(const key of liveKeys)await putDirectory(key,handle);
+      const initial=await getRememberDestination();
+      const on=await putLastDestination({handle,destination:'directory'},{remember:true,expectedRevision:initial.revision});
+      const off=await putLastDestination({handle,destination:'directory'},{remember:false,expectedRevision:on.revision});
+      const forgotten=await getLastDestination()===null && await getDirectory('last')===null && await getDirectory('last-destination')===null;
+      const ordinary=await putLastDestination({handle,destination:'directory'});
+      const ordinaryPreservesOff=!ordinary.remember && ordinary.revision===off.revision && await getLastDestination()===null;
+      let staleRejected=false;
+      try {await putLastDestination({handle,destination:'directory'},{remember:true,expectedRevision:on.revision});}
+      catch(error){staleRejected=error.constructor?.name==='DestinationPolicyError' && /別の作業/.test(error.message);}
+      const pinnedHandles=await getDirectory(liveKeys[0])!==null && await getDirectory(liveKeys[1])!==null;
+      const final=await getRememberDestination();
+      return {forgotten,ordinaryPreservesOff,staleRejected,pinnedHandles,stillOff:!final.remember,revisionAdvanced:off.revision===on.revision+1};
+    } finally {
+      for(const [key,value]of snapshot){if(value===null)await deleteDirectory(key);else await putDirectory(key,value);}
+      for(const key of liveKeys)await deleteDirectory(key);
+    }
+  });
+  assert.deepEqual(remember,{forgotten:true,ordinaryPreservesOff:true,staleRejected:true,pinnedHandles:true,stillOff:true,revisionAdvanced:true});
+  report.rememberDestination=remember;
+  checked('Chrome 116 real IndexedDB: remember OFF, format-only persistence, stale CAS rejection and pinned recovery handles');
+
   const session = await context.newCDPSession(manager);
   // Playwright interception/behavior:allow can bypass onDeterminingFilename.
   // Restore Chrome's normal path so MIME-derived naming is actually exercised.
@@ -227,7 +257,7 @@ try {
     const download = await worker.evaluate(async id => (await chrome.downloads.search({ id }))[0], job.downloadId);
     assert.equal(download.state, 'complete');
     assert.equal(download.filename, join(downloads, job.filename), 'normal Chrome uses the extension\'s requested MIME-resolved path');
-    assert.equal(job.actualFilename, download.filename);
+    assert.equal(job.actualFilename, download.filename.split(/[\\/]/).pop(),'session retains only the actual basename while raw Chrome filename still proves the complete requested path');
     const bytes = await readFile(download.filename);
     report.downloads.push({ format, requested: job.filename, actual: download.filename, bytes: bytes.length, mime: download.mime });
     return { job, bytes };
@@ -258,7 +288,24 @@ try {
   await source.bringToFront();
   report.previewLifecycle=await manager.evaluate(()=>globalThis.__compatClosePreviews());
   await manager.waitForFunction(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length===0,null,{polling:50});
-  const raster=await manager.evaluate(async()=>{
+  const rasterInputs=await manager.evaluate(()=>{
+    const canvas=document.createElement('canvas');canvas.width=16;canvas.height=12;
+    const context=canvas.getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,6,12);
+    return {png:canvas.toDataURL('image/png'),jpg:canvas.toDataURL('image/jpeg',1),webp:canvas.toDataURL('image/webp',1)};
+  });
+  const baseJpeg=Buffer.from(rasterInputs.jpg.split(',')[1],'base64');
+  for(const format of ['png','jpg','webp']) {
+    const bytes=tagPrivacyMetadata(Buffer.from(rasterInputs[format].split(',')[1],'base64'),format);
+    const metadata=readPrivacyMetadata(bytes,format);
+    assert.equal(metadata.exif[0].artist,SYNTHETIC_METADATA.artist);
+    assert.deepEqual(metadata.exif[0].gps.latitude,[0,0,0]);assert.deepEqual(metadata.exif[0].gps.longitude,[0,0,0]);
+    if(format==='png')assert.deepEqual(metadata.text,[{keyword:SYNTHETIC_METADATA.keyword,value:SYNTHETIC_METADATA.marker}]);
+    else assert.deepEqual(metadata.xmp,[{creators:[SYNTHETIC_METADATA.artist],descriptions:[SYNTHETIC_METADATA.marker]}]);
+    if(format==='jpg')assert.deepEqual(metadata.iptc.map(value=>value.dataset),[80,120]);
+    rasterInputs[format]=`data:${{png:'image/png',jpg:'image/jpeg',webp:'image/webp'}[format]};base64,${Buffer.from(bytes).toString('base64')}`;
+  }
+  const orientedJpeg=`data:image/jpeg;base64,${Buffer.from(tagPrivacyMetadata(baseJpeg,'jpg',{orientation:6})).toString('base64')}`;
+  const raster=await manager.evaluate(async({inputs,orientedJpeg})=>{
     const {convertImage}=await import('./image-converter.js');
     const {imageResourceCoordinator}=await import('./image-decoder.js');
     const coordinator=imageResourceCoordinator(),NativeWorker=globalThis.Worker;
@@ -273,7 +320,7 @@ try {
       try{
         canvas=new OffscreenCanvas(image.width,image.height);const context=canvas.getContext('2d',{willReadFrequently:true});context.drawImage(image,0,0);
         const pixel=(x,y)=>[...context.getImageData(Math.min(x,image.width-1),Math.min(y,image.height-1),1,1).data];
-        return {width:image.width,height:image.height,red:pixel(2,8),transparent:pixel(14,8),first:pixel(0,0)};
+        return {width:image.width,height:image.height,red:pixel(2,8),transparent:pixel(14,8),first:pixel(0,0),top:pixel(6,2),bottom:pixel(6,13)};
       }finally{image.close();if(canvas){canvas.width=1;canvas.height=1;}}
     };
     const conversion=async(url,format)=>{
@@ -283,19 +330,17 @@ try {
         if(typeof blob.releaseResources!=='function')throw new Error('Converted raster has no releaseResources owner.');
         const held=Object.values(await coordinator.snapshot()).filter(entry=>entry.owner===ownerId);
         if(held.reduce((sum,entry)=>sum+(entry.encodedBytes||0),0)!==blob.size||held.some(entry=>entry.pixels||entry.fetches))throw new Error('Raster output ownership does not match its retained Blob.');
-        return {format,type:blob.type,magic:[...new Uint8Array(await blob.slice(0,12).arrayBuffer())],pixels:await decode(blob),worker:trace.requests.slice(before)};
+        return {format,type:blob.type,magic:[...new Uint8Array(await blob.slice(0,12).arrayBuffer())],bytes:[...new Uint8Array(await blob.arrayBuffer())],pixels:await decode(blob),worker:trace.requests.slice(before)};
       }finally{
         await blob?.releaseResources?.();
         if(Object.values(await coordinator.snapshot()).some(entry=>entry.owner===ownerId))throw new Error('Raster resources remained after releasing the converted output.');
       }
     };
     try{
-      const canvas=document.createElement('canvas');canvas.width=16;canvas.height=12;
-      const context=canvas.getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,6,12);
-      const inputs={png:canvas.toDataURL('image/png'),jpg:canvas.toDataURL('image/jpeg',1),webp:canvas.toDataURL('image/webp',1)};
-      canvas.width=1;canvas.height=1;
       const matrix=[];
       for(const [source,url]of Object.entries(inputs))for(const format of ['jpg','png','webp'])matrix.push({source,...await conversion(url,format)});
+      const oriented=[];
+      for(const format of ['jpg','png','webp'])oriented.push(await conversion(orientedJpeg,format));
       // Two one-pixel frames use a global red/blue palette and distinct LZW
       // payloads. The output must be a single static image of the red first frame.
       const text=value=>new TextEncoder().encode(value);
@@ -305,9 +350,9 @@ try {
         33,249,4,0,10,0,0,0,44,0,0,0,0,1,0,1,0,0,2,2,76,1,0,59];
       const gif=await conversion('data:image/gif;base64,'+btoa(String.fromCharCode(...gifBytes)),'png');
       const remainingRecords=Object.values(await coordinator.snapshot());
-      return {matrix,gif,workersCreated:trace.created,workersTerminated:trace.terminated,remaining:remainingRecords.length,remainingRecords,documentHidden:document.hidden};
+      return {matrix,oriented,gif,workersCreated:trace.created,workersTerminated:trace.terminated,remaining:remainingRecords.length,remainingRecords,documentHidden:document.hidden};
     }finally{globalThis.Worker=NativeWorker;}
-  });
+  },{inputs:rasterInputs,orientedJpeg});
   const magic=(entry,label)=>{
     const expected={jpg:'image/jpeg',png:'image/png',webp:'image/webp'}[entry.format];assert.equal(entry.type,expected,`${label}: encoded MIME`);
     if(entry.format==='jpg')assert.deepEqual(entry.magic.slice(0,3),[255,216,255],`${label}: JPEG signature`);
@@ -315,8 +360,17 @@ try {
     if(entry.format==='webp'){assert.equal(String.fromCharCode(...entry.magic.slice(0,4)),'RIFF');assert.equal(String.fromCharCode(...entry.magic.slice(8,12)),'WEBP');}
   };
   const near=(actual,expected,tolerance,label)=>expected.forEach((value,index)=>assert.ok(Math.abs(actual[index]-value)<=tolerance,`${label}: pixel ${actual} differs from ${expected}`));
+  const privacy=entry=>{
+    const metadata=readPrivacyMetadata(entry.bytes,entry.format);
+    assert.equal(metadata.exif.some(value=>Object.hasOwn(value,'artist')||Object.hasOwn(value,'gps')),false,'tested EXIF Artist/GPS fields are absent');
+    assert.equal(metadata.iptc.some(value=>value.record===2 && [80,120].includes(value.dataset)),false,'tested IPTC fields are absent');
+    assert.equal(metadata.xmp.some(value=>value.creators.length||value.descriptions.length),false,'tested XMP fields are absent');
+    assert.equal(metadata.text.some(value=>value.keyword===SYNTHETIC_METADATA.keyword),false,'tested PNG text field is absent');
+    assert.equal(Buffer.from(entry.bytes).includes(Buffer.from(SYNTHETIC_METADATA.marker)),false,'synthetic marker is absent');
+  };
   for(const entry of raster.matrix){
     const label=`Chrome116 ${entry.source}→${entry.format}`;magic(entry,label);
+    privacy(entry);
     assert.deepEqual([entry.pixels.width,entry.pixels.height],[16,12],`${label}: decoded output dimensions`);
     assert.deepEqual(entry.worker,[{source:entry.source==='jpg'?'jpeg':entry.source,width:16,height:12,frameCount:1,output:entry.format}],`${label}: the real worker receives validated source dimensions and raster format`);
     near(entry.pixels.red,[255,0,0,255],30,label+' red');
@@ -324,17 +378,28 @@ try {
     else if(entry.format==='jpg')near(entry.pixels.transparent,[255,255,255,255],10,label+' white transparency background');
     else assert.equal(entry.pixels.transparent[3],0,`${label}: alpha survives`);
   }
-  report.raster={matrix:raster.matrix,workersCreated:raster.workersCreated,workersTerminated:raster.workersTerminated,immediateRemaining:raster.remaining,immediateRecords:raster.remainingRecords,documentHidden:raster.documentHidden};
+  const withoutBytes=({bytes,...entry})=>entry;
+  report.raster={matrix:raster.matrix.map(withoutBytes),workersCreated:raster.workersCreated,workersTerminated:raster.workersTerminated,immediateRemaining:raster.remaining,immediateRecords:raster.remainingRecords,documentHidden:raster.documentHidden};
   checked('Chrome 116 native raster worker: PNG/JPEG/WebP source × three encoders, MIME/magic/dimensions/pixels and output ownership');
+  checked('Chrome 116 valid synthetic EXIF/IPTC/XMP/PNG text fields absent after all nine source/encoder conversions');
+  for(const entry of raster.oriented){
+    const label=`Chrome116 EXIF6→${entry.format}`;magic(entry,label);privacy(entry);
+    assert.deepEqual([entry.pixels.width,entry.pixels.height],[12,16],`${label}: clockwise dimensions`);
+    near(entry.pixels.top,[255,0,0,255],30,`${label}: red band rotates to the top`);
+    near(entry.pixels.bottom,[0,0,0,255],20,`${label}: opaque source rotates with pixels`);
+    assert.deepEqual(entry.worker,[{source:'jpeg',width:12,height:16,frameCount:1,output:entry.format}],`${label}: worker receives oriented preflight dimensions`);
+  }
+  report.oriented=raster.oriented.map(withoutBytes);
+  checked('Chrome 116 EXIF orientation 6: clockwise dimensions, pixels and tested metadata fields');
   magic(raster.gif,'Chrome116 GIF→PNG');assert.deepEqual([raster.gif.pixels.width,raster.gif.pixels.height],[1,1]);assert.deepEqual(raster.gif.pixels.first,[255,0,0,255]);
   assert.deepEqual(raster.gif.worker,[{source:'gif',width:1,height:1,frameCount:2,output:'png'}]);
-  assert.equal(raster.workersCreated,10);assert.equal(raster.workersTerminated,10);
+  assert.equal(raster.workersCreated,13);assert.equal(raster.workersTerminated,13);
   // Per-owner release is already checked after each conversion. Preview
   // disposal above prevents any new cache ownership during final retirement.
   await manager.waitForFunction(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length===0,null,{polling:50});
   const finalRemaining=await worker.evaluate(async()=>Object.keys((await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{}).length);
   assert.equal(finalRemaining,0,'all direct-conversion and preview reservations return to zero');report.raster.remaining=finalRemaining;
-  report.gif=raster.gif;checked('Chrome 116 animated GIF first-frame static output, worker termination and zero remaining shared ledger');
+  report.gif=withoutBytes(raster.gif);checked('Chrome 116 animated GIF first-frame static output, worker termination and zero remaining shared ledger');
   await manager.bringToFront();
   assert.deepEqual(errors, []);
   await manager.screenshot({ path: join(output, 'chrome116-workspace.png') });

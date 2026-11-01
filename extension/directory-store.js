@@ -1,5 +1,7 @@
 const DATABASE = 'imagecrate-directories';
 const STORE = 'handles';
+const REMEMBER_POLICY = 'remember-destination';
+class DestinationPolicyError extends Error {}
 let opening;
 
 function database() {
@@ -48,7 +50,22 @@ export const getDirectory = key => access(key, 'readonly', store => store.get(ke
 export const putDirectory = (key, handle) => access(key, 'readwrite', store => store.put(handle, key));
 export const deleteDirectory = key => access(key, 'readwrite', store => store.delete(key));
 
+function rememberPolicy(stored) {
+  // Absence is the pre-policy behavior. A malformed existing policy must not
+  // silently turn a deliberate OFF setting back on.
+  if (stored == null) return {remember:true, revision:0};
+  if (typeof stored.remember !== 'boolean' || !Number.isSafeInteger(stored.revision) || stored.revision < 0) {
+    throw new DestinationPolicyError('次回用の保存先設定を読み込めません。保存設定からもう一度確認してください。');
+  }
+  return {remember:stored.remember, revision:stored.revision};
+}
+
+export async function getRememberDestination() {
+  return rememberPolicy(await access(REMEMBER_POLICY, 'readonly', store => store.get(REMEMBER_POLICY)));
+}
+
 export async function getLastDestination() {
+  if (!(await getRememberDestination()).remember) return null;
   const stored = await access('last-destination', 'readonly', store => store.get('last-destination'));
   if (stored && ['directory','downloads'].includes(stored.destination)) {
     return {handle:stored.handle || null, destination:stored.destination};
@@ -57,15 +74,44 @@ export async function getLastDestination() {
   return handle ? {handle, destination:'directory'} : null;
 }
 
-export function putLastDestination({handle = null, destination} = {}) {
+export async function putLastDestination({handle = null, destination} = {}, policyChange = {}) {
   if (!['directory','downloads'].includes(destination) || (destination === 'directory' && !handle)) {
-    return Promise.reject(new Error('保存先の設定が不正です。もう一度フォルダを選んでください。'));
+    throw new Error('保存先の設定が不正です。もう一度フォルダを選んでください。');
   }
-  // The selected handle and destination mode are one record. Update the old
-  // handle-only entry in the same transaction for existing callers and data.
-  return access('last-destination', 'readwrite', store => {
-    if (handle) store.put(handle, 'last'); else store.delete('last');
-    return store.put({handle, destination}, 'last-destination');
+  const explicit = Object.hasOwn(policyChange,'remember');
+  if (explicit && (typeof policyChange.remember !== 'boolean' || !Number.isSafeInteger(policyChange.expectedRevision) || policyChange.expectedRevision < 0)) {
+    throw new Error('次回用の保存先設定が正しくありません。設定を開き直してください。');
+  }
+  const db = await database();
+  // IndexedDB serializes these readwrite transactions across extension tabs.
+  // Read the current policy inside the same transaction as both memo entries;
+  // a format-only apply from an old tab can therefore never resurrect OFF.
+  return new Promise((resolve,reject) => {
+    let result, failure;
+    const fail = () => reject(failure || new Error('次回用の保存先設定を記録できませんでした。もう一度お試しください。'));
+    try {
+      const transaction = db.transaction(STORE,'readwrite'), store = transaction.objectStore(STORE);
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = fail; transaction.onabort = fail;
+      const request = store.get(REMEMBER_POLICY);
+      request.onsuccess = () => {
+        try {
+          const current = rememberPolicy(request.result);
+          if (explicit && current.revision !== policyChange.expectedRevision) {
+            throw new DestinationPolicyError('次回用の保存先設定が別の作業で変更されました。最新の状態を確認して、もう一度適用してください。');
+          }
+          if (explicit && current.revision === Number.MAX_SAFE_INTEGER) throw new DestinationPolicyError('次回用の保存先設定を更新できません。設定を確認してください。');
+          result = explicit ? {remember:policyChange.remember,revision:current.revision+1} : current;
+          if (explicit) store.put(result,REMEMBER_POLICY);
+          if (result.remember) {
+            if (handle) store.put(handle,'last'); else store.delete('last');
+            store.put({handle,destination},'last-destination');
+          } else {
+            store.delete('last'); store.delete('last-destination');
+          }
+        } catch (error) { failure=error instanceof DestinationPolicyError ? error : undefined;transaction.abort(); }
+      };
+    } catch { fail(); }
   });
 }
 

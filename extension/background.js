@@ -2,7 +2,7 @@ import { collect } from './collector.js';
 import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings, requiresWorkspace, isDetectedImageFormat } from './utils.js';
 import { pruneDirectories } from './directory-store.js';
 import { extensionForMime } from './image-format.js';
-import { sessionDefaults, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
+import { sessionDefaults, minimizeSessionPrivacy, needsSessionPrivacyMigration, actualFilenameBasename, selectableItems, applyUIPatch, applyJobCompletions, assertSessionBudget, serializedBytes, CANDIDATE_BYTE_LIMIT, SESSION_BYTE_LIMIT } from './session-state.js';
 import {MEDIA_LIMITS, MEDIA_POLICY_VERSION} from './media-limits.js';
 import {createTransferBudget, reserveTransferAttempt, recordTransferBytes, settleTransferAttempt, transferBudgetRemaining, transferOutputBudgetRemaining} from './transfer-budget.js';
 import {createImageResourceCoordinator} from './image-decoder.js';
@@ -74,7 +74,25 @@ function retireImageOwner(state,instance) {
   state.retiredImageOwners=records;
 }
 // One mutation queue protects storage read/modify/write across concurrent events.
-const serial = task => { const next = operations.then(task); operations = next.catch(() => {}); return next; };
+// Rewrite old stored paths before recovery starts, not just the values returned
+// to the UI. Failure keeps the gate closed and is retried by the next task.
+let privacyMigrationComplete=false;
+async function migrateSessionPrivacy() {
+  const stored=await chrome.storage.session.get(null);
+  for (const [key,state] of Object.entries(stored)) {
+    if (!key.startsWith(PREFIX) || !needsSessionPrivacyMigration(state)) continue;
+    const next=minimizeSessionPrivacy(state);
+    next.revision=(Number.isSafeInteger(state.revision)?state.revision:0)+1;
+    await chrome.storage.session.set({[key]:next});
+  }
+}
+const serial = task => {
+  const next = operations.then(async()=>{
+    if (!privacyMigrationComplete) { await migrateSessionPrivacy();privacyMigrationComplete=true; }
+    return task();
+  });
+  operations = next.catch(() => {});return next;
+};
 const save = async (state, extra = {}) => {
   const candidate=sessionDefaults(state);
   applyJobCompletions(candidate);
@@ -497,7 +515,7 @@ function applyChromeDownload(job,item,state) {
   }
   job.bytesReceived = !managed(state)&&job.nativeObservation ? job.nativeObservation.bytesReceived : item.bytesReceived;
   job.totalBytes = !managed(state)&&job.nativeObservation ? job.nativeObservation.knownTotalBytes||item.totalBytes : item.totalBytes;
-  if (item.filename) job.actualFilename = String(item.filename).slice(0,2048);
+  if (item.filename) job.actualFilename = actualFilenameBasename(item.filename);
   if (item.mime) { job.mime=item.mime; job.typeKnown=Boolean(extensionForMime(item.mime)); }
   job.status = item.state;
   job.chromeOutcomeKnown=['complete','interrupted'].includes(item.state);
@@ -618,7 +636,7 @@ function nameDecision(item,match,suggest) {
   if (!match || match.state.batch?.destination === 'directory' || !safeDownloadPath(match.job.filename)) { suggest(); return null; }
   const original=(match.state.batch?.format || 'original') === 'original';
   const filename=(original && suggestedOriginalName(match.job,item.mime)) || match.job.filename;
-  // actualFilename belongs to Chrome search: its absolute path and conflict
+  // actualFilename belongs to Chrome search: its actual basename and conflict
   // suffix must survive this later, relative requested-name decision.
   const decision={filename,typeKnown:Boolean(extensionForMime(item.mime)) || !original,...(item.mime ? {mime:item.mime} : {})};
   Object.assign(match.job,decision);
@@ -728,6 +746,7 @@ async function closeWorkspace(state,resourcesGone=false) {
   if(resourcesGone){retireImageOwner(state,state.imageInstance);state.imageContextGone=true;}
   delete state.scanRequest;
   state.closed=true;state.items=[];state.selectedItems=[];state.selectedURLs=[];state.ui={};state.notices=[];state.history=[];state.scan=null;
+  delete state.url;delete state.title;
   await save(state);
   if (managed(state)) await stopJobs(state,'作業ページが閉じられ、保存が中断しました。');
   if (active(state)) await pump(state);
@@ -983,7 +1002,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
           if (typeof update.filename === 'string' && !/[\\/]/.test(update.filename)) job.filename = update.filename.slice(0,240);
           if (typeof update.typeKnown === 'boolean') job.typeKnown=update.typeKnown;
           if (typeof update.mime === 'string' && update.mime.length < 120) job.mime=update.mime;
-          if (typeof update.filename === 'string' && !/[\\/]/.test(update.filename)) job.actualFilename=update.filename.slice(0,240);
+          if (typeof update.filename === 'string' && !/[\\/]/.test(update.filename)) job.actualFilename=actualFilenameBasename(update.filename);
           if (update.error) job.error = publicError(update.error).slice(0,500);
         }
         await save(state); return state;

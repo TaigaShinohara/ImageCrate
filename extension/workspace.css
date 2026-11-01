@@ -209,6 +209,9 @@ body:has(.save-settings[open]) { overflow: hidden; }
 .directory-actions > button { min-width: 0; font-size: 12px; }
 .directory-status { margin-top: 10px; }
 .directory-status:empty { display: none; }
+.remember-destination { display: flex; align-items: center; gap: 10px; min-height: 44px; margin-top: 10px; cursor: pointer; font-size: 13px; }
+.remember-destination input { flex: 0 0 20px; width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
+.remember-destination:has(input:disabled) { cursor: default; }
 .directory-details { margin-top: 12px; padding: 12px; border-radius: 9px; background: #fff8e7; color: #735917; }
 .folder-settings { min-width: 0; }
 .folder-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 2px 8px; margin-top: 5px; }

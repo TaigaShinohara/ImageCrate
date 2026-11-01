@@ -8,7 +8,7 @@ async function fixture(initial = {}) {
   const db = {close() {}, transaction(_name, mode) {
     const draft = new Map(records);
     let pending = 0; let aborted = false;
-    const transaction = {objectStore:() => store};
+    const transaction = {objectStore:() => store,abort() { aborted=true;queueMicrotask(()=>transaction.onabort?.()); }};
     const finish = () => {
       if (!pending && !aborted) {
         if (mode === 'readwrite') { records.clear(); for (const [key,value] of draft) records.set(key,value); }
@@ -64,6 +64,8 @@ test('last destination reads legacy handle data without writing a migration', as
   assert.equal(h.records.has('last-destination'), false);
   assert.equal(await h.getDirectory('last'), handle);
   assert.equal(await (await fixture()).getLastDestination(), null);
+  assert.deepEqual(await h.getRememberDestination(), {remember:true,revision:0});
+  assert.equal(h.records.has('remember-destination'), false);
 });
 
 test('remembered destination contains only its mode and handle, retaining a directory in downloads mode', async () => {
@@ -97,4 +99,54 @@ test('pruning removes expired session and batch handles while keeping the rememb
   await h.pruneDirectories(['session:keep']);
   assert.deepEqual([...h.records.keys()].sort(), ['last','last-destination','session:keep','unrelated']);
   assert.deepEqual(await h.getLastDestination(), {handle,destination:'downloads'});
+});
+
+test('OFF atomically forgets only next-use memo and remains OFF through ordinary settings applies', async () => {
+  const handle={name:'Active directory'}, other={name:'Other directory'};
+  const h=await fixture();
+  await h.putLastDestination({handle,destination:'directory'});
+  await h.putDirectory('session:active',handle);await h.putDirectory('batch:pending',handle);
+  assert.deepEqual(await h.putLastDestination({handle,destination:'directory'},{remember:false,expectedRevision:0}), {remember:false,revision:1});
+  assert.equal(await h.getLastDestination(),null);
+  assert.equal(h.records.has('last'),false);assert.equal(h.records.has('last-destination'),false);
+  assert.equal(await h.getDirectory('session:active'),handle);assert.equal(await h.getDirectory('batch:pending'),handle);
+  // A pre-policy/older tab could leave a legacy value. Reads must not use it,
+  // and applying a format/location from a stale tab must not turn OFF back on.
+  await h.putDirectory('last',other);await h.putDirectory('last-destination',{handle:other,destination:'directory'});
+  assert.equal(await h.getLastDestination(),null);
+  assert.deepEqual(await h.putLastDestination({handle:other,destination:'directory'}),{remember:false,revision:1});
+  assert.equal(h.records.has('last'),false);assert.equal(h.records.has('last-destination'),false);
+  await h.pruneDirectories(['session:active','batch:pending']);
+  assert.deepEqual(await h.getRememberDestination(),{remember:false,revision:1});
+  assert.equal(await h.getDirectory('session:active'),handle);assert.equal(await h.getDirectory('batch:pending'),handle);
+});
+
+test('explicit policy changes require the latest revision and ON can remember again', async () => {
+  const handle={name:'Chosen directory'}, stale={name:'Stale draft'};
+  const h=await fixture();await h.putLastDestination({handle,destination:'directory'},{remember:false,expectedRevision:0});
+  await assert.rejects(h.putLastDestination({handle:stale,destination:'directory'},{remember:true,expectedRevision:0}),/別の作業で変更/);
+  assert.deepEqual(await h.getRememberDestination(),{remember:false,revision:1});assert.equal(await h.getLastDestination(),null);
+  assert.deepEqual(await h.putLastDestination({handle,destination:'directory'},{remember:true,expectedRevision:1}),{remember:true,revision:2});
+  assert.deepEqual(await h.getLastDestination(),{handle,destination:'directory'});
+});
+
+test('failed OFF and ON transactions preserve policy and both memo entries', async () => {
+  const handle={name:'Applied directory'};const h=await fixture();await h.putLastDestination({handle,destination:'directory'});
+  h.control.failWriteKey='remember-destination';
+  await assert.rejects(h.putLastDestination({handle,destination:'directory'},{remember:false,expectedRevision:0}),/記録できません/);
+  assert.deepEqual(await h.getRememberDestination(),{remember:true,revision:0});
+  assert.deepEqual(await h.getLastDestination(),{handle,destination:'directory'});assert.equal(await h.getDirectory('last'),handle);
+  h.control.failWriteKey=null;await h.putLastDestination({handle,destination:'directory'},{remember:false,expectedRevision:0});
+  h.control.failWriteKey='last-destination';
+  await assert.rejects(h.putLastDestination({handle,destination:'directory'},{remember:true,expectedRevision:1}),/記録できません/);
+  assert.deepEqual(await h.getRememberDestination(),{remember:false,revision:1});assert.equal(await h.getLastDestination(),null);
+  assert.equal(h.records.has('last'),false);assert.equal(h.records.has('last-destination'),false);
+});
+
+test('malformed existing policy fails without remembering a destination', async () => {
+  const handle={name:'Directory'},h=await fixture({'remember-destination':{remember:'false',revision:1}});
+  await assert.rejects(h.getRememberDestination(),/読み込めません/);
+  await assert.rejects(h.getLastDestination(),/読み込めません/);
+  await assert.rejects(h.putLastDestination({handle,destination:'directory'}),/読み込めません/);
+  assert.equal(h.records.has('last'),false);assert.equal(h.records.has('last-destination'),false);
 });
