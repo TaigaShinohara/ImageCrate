@@ -149,6 +149,64 @@ async function browser(t, options = {}) {
   };
 }
 
+test('worker startup rewrites legacy jobs and history without resetting operational state',async t=>{
+  const h=await browser(t),url='https://source.test/photo?signature=synthetic';
+  const legacy={...structuredClone(h.state),revision:19,selectionRevision:7,url:'https://source.test/page?fixture=1#section',title:'Synthetic source',
+    items:[{url}],selectedURLs:[url],jobs:[{id:'job',logicalJobId:'logical',url,filename:'ImageCrate/Folder/001_photo.jpg',
+      actualFilename:'C:\\Users\\example\\Pictures\\001_photo (2).jpg',status:'complete',completionApplied:true,
+      attempt:2,outcomeUnknown:true,submission:{filename:'ImageCrate/Folder/001_photo.jpg'},resourceLease:undefined}],
+    history:[{id:'previous',url:'https://source.test/previous?fixture=2',actualFilename:'/Users/example/Pictures/previous.jpg',status:'complete'}],
+    batch:{id:'batch',destination:'directory',transferBudget:{usedInputBytes:123,attempts:2}},saveSettings:{directoryKey:'session:work:chosen'}};
+  h.store.set('workspace:work',structuredClone(legacy));
+  await h.restartWorker();
+  await eventually(()=>h.store.get('workspace:work').jobs[0].actualFilename==='001_photo (2).jpg','startup rewrites old persisted jobs');
+  const stored=h.store.get('workspace:work');
+  assert.equal(stored.history[0].actualFilename,'previous.jpg');
+  assert.equal(stored.revision,20,'privacy migration advances revision once');
+  assert.equal(stored.selectionRevision,7);assert.deepEqual(stored.selectedURLs,[url]);
+  assert.equal(stored.url,legacy.url);assert.equal(stored.title,legacy.title);
+  assert.deepEqual(stored.batch,legacy.batch);assert.deepEqual(stored.saveSettings,legacy.saveSettings);
+  assert.deepEqual(stored.jobs[0],{...legacy.jobs[0],actualFilename:'001_photo (2).jpg'});
+  await h.restartWorker();await nextTurn();
+  assert.equal(h.store.get('workspace:work').revision,20,'a new worker does not rewrite an already minimal session');
+  assert.deepEqual(h.requested,[]);
+});
+
+test('failed privacy migration blocks new work and retries without losing old operation evidence',async t=>{
+  const h=await browser(t),url='https://source.test/photo?signature=synthetic';
+  h.state.items=[{url}];h.state.jobs=[{id:'old',url,status:'interrupted',actualFilename:'/Users/example/Pictures/photo.jpg'}];h.state.revision=9;h.persist();
+  h.options.beforeStorageSet=async()=>{throw new Error('Synthetic migration storage failure');};
+  await h.restartWorker();
+  const blocked=await h.send({type:'save',urls:[url]});
+  assert.equal(blocked.ok,false);assert.deepEqual(h.requested,[]);
+  assert.equal(h.store.get('workspace:work').jobs[0].actualFilename,'/Users/example/Pictures/photo.jpg');
+  assert.equal(h.store.get('workspace:work').revision,9,'failed migration does not publish a new revision');
+  delete h.options.beforeStorageSet;
+  const recovered=await h.send({type:'get'});
+  assert.equal(recovered.ok,true,recovered.error);
+  assert.equal(h.store.get('workspace:work').jobs[0].actualFilename,'photo.jpg');
+  assert.equal(h.store.get('workspace:work').jobs[0].status,'interrupted');
+  assert.ok(h.store.get('workspace:work').revision>9);assert.deepEqual(h.requested,[]);
+});
+
+test('closing and restarting a pending workspace removes source metadata but keeps native recovery proof',async t=>{
+  const h=await browser(t,{withAlarms:true});const source=pendingSubmission(h);
+  const legacy=h.store.get('workspace:work');legacy.url='https://source.test/private?fixture=1#section';legacy.title='Synthetic private title';
+  legacy.ui={query:'synthetic search'};legacy.history=[{url:'https://source.test/old?fixture=2'}];h.store.set('workspace:work',legacy);
+  await h.send({type:'get'});h.closeWorkspace();
+  await eventually(()=>h.store.get('workspace:work')?.closed,'workspace is closed while native acceptance is pending');
+  const closed=h.store.get('workspace:work');
+  assert.equal(Object.hasOwn(closed,'url'),false);assert.equal(Object.hasOwn(closed,'title'),false);
+  assert.equal(closed.ui.query,'');assert.equal(closed.ui.focusAnchor,'');assert.deepEqual(closed.items,[]);assert.deepEqual(closed.history,[]);
+  assert.equal(closed.jobs[0].url,source.url);assert.equal(closed.jobs[0].submission.filename,source.filename);
+  await h.restartWorker();await eventually(()=>h.alarms.size===1,'restart retains the pending recovery alarm');
+  assert.equal(Object.hasOwn(h.store.get('workspace:work'),'url'),false);
+  const item=acceptedSubmission(source,91,{state:'complete',bytesReceived:10});
+  h.downloads.set(item.id,item);h.created.emit(structuredClone(item));
+  await eventually(()=>!h.store.has('workspace:work'),'real terminal evidence still retires the closed session');
+  assert.equal(h.downloads.get(item.id).state,'complete');assert.deepEqual(h.requested,[]);assert.deepEqual(h.cancelled,[]);
+});
+
 test('inspected image formats persist with dimensions for current and retained selected candidates',async t=>{
   const h=await browser(t),current='https://source.test/image',retained='https://source.test/previous.gif';
   h.state.items=[{url:current,width:400,height:300,dimensionSource:'source'}];
@@ -1639,7 +1697,7 @@ test('extensionless original downloads use MIME before download() resolves witho
   const saved=await h.send({type:'save',urls:h.state.items.map(item=>item.url),settings:{folderName:'Safe',format:'original'}});
   assert.equal(saved.ok,true,saved.error);
   assert.equal(saved.data.jobs[0].filename,'ImageCrate/Safe/001_image.png');
-  assert.equal(saved.data.jobs[0].actualFilename,'ImageCrate/Safe/001_image.png');
+  assert.equal(saved.data.jobs[0].actualFilename,'001_image.png');
   assert.equal(saved.data.jobs[0].typeKnown,true);
   assert.equal(h.requested[0].url,h.state.items[0].url,'no image conversion or alternate fetch is used');
   h.complete(saved.data.jobs[0].downloadId);
@@ -1972,7 +2030,7 @@ test('a filename event after download() resolves retains its accepted ID while a
   assert.equal(emitted,true);
   await eventually(()=>h.store.get('workspace:work').jobs[0].filename === 'ImageCrate/Frozen/001_image.svg','the immutable filename decision survives the older candidate overwriting its mutable job');
   const persisted=h.store.get('workspace:work').jobs[0];
-  assert.equal(persisted.actualFilename,'ImageCrate/Frozen/001_image.svg');
+  assert.equal(persisted.actualFilename,'001_image.svg');
   assert.equal(persisted.typeKnown,true);
   assert.equal(persisted.mime,'image/svg+xml');
   assert.deepEqual(suggestions,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
@@ -1994,7 +2052,7 @@ test('known originals and converted downloads explicitly suggest their fixed bat
   const convertedCalls=[];
   h.determining.emit({id:second.downloadId,url:'blob:chrome-extension://test/converted-image',byExtensionId:'test',filename:'browser-default.jpg',mime:'image/jpeg'},(...args)=>convertedCalls.push(args));
   assert.deepEqual(convertedCalls,[[{filename:'ImageCrate/Converted/001_second.jpg',conflictAction:'uniquify'}]]);
-  await eventually(()=>h.store.get('workspace:work').jobs[0].actualFilename === 'ImageCrate/Converted/001_second.jpg','converted filenames are persisted through the same decision path');
+  await eventually(()=>h.store.get('workspace:work').jobs[0].actualFilename === '001_second.jpg','converted filenames are persisted through the same decision path');
 });
 
 test('late filename events for the same URL in two workspaces match accepted IDs before URL',async t=>{
@@ -2076,7 +2134,7 @@ test('onChanged for an unknown download ID wakes pending sessions after their po
   assert.deepEqual(h.cancelled,[]);
 });
 
-test('a delayed filename decision preserves the completed Chrome absolute actual filename',async t=>{
+test('a delayed filename decision preserves the completed Chrome basename and conflict suffix',async t=>{
   const h=await browser(t);
   const url='https://source.test/image';
   h.state.items=[{url,width:20,height:10}];h.persist();
@@ -2090,7 +2148,7 @@ test('a delayed filename decision preserves the completed Chrome absolute actual
     const job=values['workspace:work']?.jobs[0];
     if (emitted || job?.status !== 'complete') return;
     emitted=true;
-    assert.equal(job.actualFilename,actual,'Chrome search already reported its completed absolute path');
+    assert.equal(job.actualFilename,'001_image (1).svg','Chrome search retains the actual basename only');
     h.determining.emit(structuredClone(h.downloads.get(id)),(...args)=>calls.push(args));
     assert.equal(calls[0][0].filename,'ImageCrate/Frozen/001_image.svg');
     await nextTurn();
@@ -2100,7 +2158,8 @@ test('a delayed filename decision preserves the completed Chrome absolute actual
   const final=h.store.get('workspace:work').jobs[0];
   assert.equal(final.status,'complete');
   assert.equal(final.filename,'ImageCrate/Frozen/001_image.svg','requested path remains relative');
-  assert.equal(final.actualFilename,actual,'the late requested-path decision cannot replace Chrome actual path or its conflict suffix');
+  assert.equal(final.actualFilename,'001_image (1).svg','the late requested-path decision cannot replace the actual basename or its conflict suffix');
+  assert.equal(h.downloads.get(id).filename,actual,'the raw Chrome path remains available to ownership checks');
   assert.deepEqual(calls,[[{filename:'ImageCrate/Frozen/001_image.svg',conflictAction:'uniquify'}]]);
 });
 

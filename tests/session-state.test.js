@@ -1,8 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {sessionDefaults, applyUIPatch, applyJobCompletions, assertSessionBudget, selectableItems} from '../extension/session-state.js';
+import {sessionDefaults, minimizeSessionPrivacy, needsSessionPrivacyMigration, actualFilenameBasename, applyUIPatch, applyJobCompletions, assertSessionBudget, selectableItems} from '../extension/session-state.js';
 const record=index=>({url:`https://synthetic.test/${index}.png`,width:20,height:10});
 const session=()=>sessionDefaults({id:'s',items:[record(1),record(2)],jobs:[]});
+test('saved actual filenames retain only the real basename in both jobs and history',()=>{
+  const requested='ImageCrate/Folder/001_photo.jpg',url='https://synthetic.test/photo?signature=fixture';
+  for(const path of ['/Users/example/Pictures/001_photo (1).jpg','C:\\Users\\example\\Pictures\\001_photo (1).jpg','\\\\server\\share\\001_photo (1).jpg']) {
+    const old={id:'s',url:'https://synthetic.test/private?fixture=1#part',title:'Synthetic page',revision:8,selectionRevision:5,
+      selectedURLs:[url],items:[{url}],jobs:[{id:'j',url,filename:requested,actualFilename:path,status:'in_progress',outcomeUnknown:true,
+        submission:{filename:requested},budget:{inputBytes:12}}],history:[{url,actualFilename:path,status:'complete'}]};
+    const original=structuredClone(old),state=sessionDefaults(old);
+    assert.equal(state.jobs[0].actualFilename,'001_photo (1).jpg');
+    assert.equal(state.history[0].actualFilename,'001_photo (1).jpg');
+    assert.equal(state.jobs[0].filename,requested);assert.equal(state.jobs[0].submission.filename,requested);
+    assert.equal(state.jobs[0].url,url);assert.equal(state.url,old.url);assert.equal(state.title,old.title);
+    assert.equal(state.revision,8);assert.equal(state.selectionRevision,5);assert.equal(state.jobs[0].outcomeUnknown,true);
+    assert.deepEqual(state.jobs[0].budget,{inputBytes:12});assert.deepEqual(old,original,'normalization does not mutate the previous snapshot');
+    assert.equal(needsSessionPrivacyMigration(old),true);
+    assert.equal(needsSessionPrivacyMigration(state),false);
+    assert.deepEqual(minimizeSessionPrivacy(state),state,'privacy normalization is idempotent');
+  }
+  assert.equal(actualFilenameBasename('/a/'+ '画像'.repeat(80)+' (12).png'),'画像'.repeat(80)+' (12).png');
+  assert.equal(actualFilenameBasename(null),'');
+});
+test('closed session privacy removes source metadata without forgetting unresolved operations',()=>{
+  const old={closed:true,url:'https://synthetic.test/private?fixture=1#part',title:'Synthetic title',tabId:1,workspaceTabId:2,
+    scanRequest:{id:'scan'},batch:{id:'batch',directoryKey:'session:s:setting'},jobs:[{id:'job',url:'https://synthetic.test/media?fixture=2',
+      downloadId:0,outcomeUnknown:true,resourceLease:{id:'lease'},submission:{filename:'ImageCrate/Safe/001_photo.jpg'},status:'in_progress'}]};
+  const state=minimizeSessionPrivacy(old);
+  assert.equal(Object.hasOwn(state,'url'),false);assert.equal(Object.hasOwn(state,'title'),false);
+  assert.deepEqual(state.jobs,old.jobs);assert.deepEqual(state.batch,old.batch);assert.equal(state.tabId,1);
+  assert.equal(needsSessionPrivacyMigration(old),true);assert.equal(needsSessionPrivacyMigration(state),false);
+});
 test('session defaults restore legacy sessions without clearing deliberate selection for an old completed job',()=>{
   const state=sessionDefaults({id:'s',items:[record(1)],selectedURLs:[record(1).url],jobs:[{url:record(1).url,status:'complete'}]});
   applyJobCompletions(state);

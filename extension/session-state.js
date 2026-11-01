@@ -5,7 +5,35 @@ export const SELECTION_LIMIT = 500;
 const encoder = new TextEncoder();
 export const serializedBytes = value => encoder.encode(JSON.stringify(value)).byteLength;
 export const defaultUI = () => ({view:'all',query:'',width:0,height:0,type:'',excludeAdLike:false,onlySelected:false,scrollY:0,focusAnchor:'',saveScope:'selection',failedBatchId:null});
+// Display metadata is not the requested path or Chrome's ownership evidence.
+// Keep the actual basename/suffix, never the local directory it came from.
+export function actualFilenameBasename(value) {
+  return typeof value === 'string' ? value.split(/[\\/]/).pop().slice(0,2048) : '';
+}
+export function minimizeSessionPrivacy(input) {
+  const state={...input};
+  for (const field of ['jobs','history']) if (Array.isArray(input[field])) {
+    state[field]=input[field].map(job=>{
+      const next={...job};
+      if (Object.hasOwn(job,'actualFilename')) {
+        const name=actualFilenameBasename(job.actualFilename);
+        if(name)next.actualFilename=name;else delete next.actualFilename;
+      }
+      return next;
+    });
+  }
+  // Closed workspaces cannot be scanned or shown again. Operational job URLs,
+  // ownership and resource records remain until native outcomes are certain.
+  if (state.closed) { delete state.url;delete state.title; }
+  return state;
+}
+export function needsSessionPrivacyMigration(input) {
+  return Boolean(input.closed && (Object.hasOwn(input,'url') || Object.hasOwn(input,'title')))
+    || ['jobs','history'].some(field=>Array.isArray(input[field]) && input[field].some(job=>
+      Object.hasOwn(job,'actualFilename') && (!actualFilenameBasename(job.actualFilename) || job.actualFilename!==actualFilenameBasename(job.actualFilename))));
+}
 export function sessionDefaults(input) {
+  input=minimizeSessionPrivacy(input);
   const state = {...input,revision:Number.isSafeInteger(input.revision) ? input.revision : 0,
     selectionRevision:Number.isSafeInteger(input.selectionRevision) ? input.selectionRevision : 0,
     items:[...(input.items || [])],selectedItems:[...(input.selectedItems || [])],selectedURLs:[...new Set(input.selectedURLs || [])],
