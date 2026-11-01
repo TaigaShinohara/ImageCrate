@@ -152,6 +152,17 @@ try {
     await manager.waitForFunction(() => !document.querySelector('#save-settings').open);
     assert.equal(await manager.evaluate(() => document.activeElement.id), 'destination-change');
   };
+  const readyRemember = page => page.waitForFunction(()=>{
+    const input=document.querySelector('#remember-destination');
+    return input && !input.disabled && input.getAttribute('aria-busy')==='false'
+      && document.querySelector('#remember-destination-help').textContent.includes('現在の次回用設定:');
+  });
+  const setRemember = async (page, remember) => {
+    // setChecked also samples before waiting for enabled. Wait for the actual
+    // policy first so a disabled loading placeholder cannot invert the click.
+    await readyRemember(page);
+    await page.locator('#remember-destination').setChecked(remember);
+  };
 
   // Actual DOM/TreeWalker boundaries; no querySelectorAll stand-in for collection.
   const source = await context.newPage();
@@ -394,7 +405,8 @@ try {
       const remembered = await getLastDestination();
       return remembered && { destination: remembered.destination, name: remembered.handle?.name || null };
     });
-    return { saveSettings: state.saveSettings || null, last };
+    const policy = await manager.evaluate(async () => (await import('./directory-store.js')).getRememberDestination());
+    return { saveSettings: state.saveSettings || null, last, policy };
   };
   const originalSettings = await appliedSnapshot();
   const installPicker = () => manager.evaluate(async () => {
@@ -415,6 +427,7 @@ try {
     await manager.locator('#destination-change').click();
     await manager.locator('#folder-name').fill(`未適用の名前 ${format}`);
     await manager.locator('#output-format').selectOption(format);
+    await setRemember(manager,false);
     await manager.locator('#choose-directory').click();
     await manager.waitForFunction(() => document.querySelector('#destination-directory').checked && !document.querySelector('#choose-directory').disabled);
     if (index === 0) {
@@ -500,6 +513,86 @@ try {
   await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回'));
   await manager.locator('#destination-change').click();assert.match(await manager.locator('#chosen-directory').textContent(),/UX 保存先 B/);await closeSettings(manager);
   checked('a lost settings acknowledgement preserves the committed handle and restores it after reload');
+
+  // The next-use memo is separate from pinned session/batch handles. Use a
+  // second real extension page to exercise stale drafts across IDB transactions.
+  const rememberSnapshot = page => page.evaluate(async () => {
+    const {getRememberDestination,getLastDestination,getDirectory}=await import('./directory-store.js');
+    const policy=await getRememberDestination(),last=await getLastDestination();
+    return {policy,last:last&&{destination:last.destination,name:last.handle?.name || null},
+      rawLast:Boolean(await getDirectory('last')),rawDestination:Boolean(await getDirectory('last-destination'))};
+  });
+  const assertRememberSetting = async (page, expected, message) => {
+    // Opening the dialog starts a real async IndexedDB policy read. Its
+    // disabled checkbox is a loading placeholder, not the applied policy.
+    await readyRemember(page);
+    assert.equal(await page.locator('#remember-destination').isChecked(),expected,message);
+  };
+  const staleSource=await context.newPage();await staleSource.goto(`${origin}/?remember=stale`);
+  const staleManager=await openWorkspace(staleSource);
+  await staleManager.locator('#destination-change').click();
+  await assertRememberSetting(staleManager,true);
+  await manager.locator('#destination-change').click();await setRemember(manager,false);
+  await closeSettings(manager,'#settings-done');
+  const forgotten=await rememberSnapshot(manager);
+  assert.equal(forgotten.policy.remember,false);assert.equal(forgotten.last,null);
+  assert.equal(forgotten.rawLast,false);assert.equal(forgotten.rawDestination,false);
+  assert.equal((await stateFor(manager)).saveSettings.destination,'directory','forgetting next-use leaves this workspace at its chosen directory');
+  await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回'));
+  assert.match(await manager.locator('#destination-summary').textContent(),/UX 保存先 B/,'same-workspace reload keeps its pinned handle after OFF');
+  await manager.locator('#destination-change').click();
+  await assertRememberSetting(manager,false);
+  await setRemember(manager,true);await closeSettings(manager);
+  assert.deepEqual(await rememberSnapshot(manager),forgotten,'cancelling ON leaves OFF and its memo unchanged');
+  await staleManager.evaluate(()=>{
+    const remove=IDBObjectStore.prototype.delete;window.__qaPolicyDelete=remove;let fail=true;
+    IDBObjectStore.prototype.delete=function(key){if(fail&&key==='last'){fail=false;throw new Error('Synthetic stale-apply failure');}return remove.call(this,key);};
+  });
+  await staleManager.locator('#output-format').selectOption('jpg');await staleManager.locator('#settings-done').click();
+  await staleManager.waitForFunction(()=>!document.querySelector('#settings-done').disabled && !document.querySelector('#settings-error').hidden);
+  assert.equal(await staleManager.locator('#save-settings').evaluate(dialog=>dialog.open),true);
+  await assertRememberSetting(staleManager,false,'failed format-only stale draft follows the refreshed OFF policy');
+  assert.deepEqual(await rememberSnapshot(manager),forgotten,'failed stale Apply preserves OFF and memo');
+  await staleManager.evaluate(()=>{IDBObjectStore.prototype.delete=window.__qaPolicyDelete;delete window.__qaPolicyDelete;});
+  await closeSettings(staleManager,'#settings-done');
+  assert.deepEqual(await rememberSnapshot(manager),forgotten,'format-only Apply from an old ON draft cannot resurrect OFF');
+  const offSource=await context.newPage();await offSource.goto(`${origin}/?remember=off`);
+  const offManager=await openWorkspace(offSource),offSettings=(await stateFor(offManager)).saveSettings;
+  assert.equal(offSettings.destination,'downloads');assert.equal(offSettings.directoryKey,undefined,'new workspace cannot inherit a forgotten folder');
+  await offManager.close();await offSource.close();
+  report.limits.push('Stale format-only Apply injects one IDB delete rejection before retry; real IDB transactions remain in use.');
+  checked('next-use OFF clears both memo entries, preserves reload, and survives failed stale format-only Apply plus retry');
+
+  await staleManager.locator('#destination-change').click();await setRemember(staleManager,true);
+  // Change the policy twice elsewhere. Its latest boolean is again OFF, but its
+  // revision proves that the first page's explicit ON draft is out of date.
+  await manager.locator('#destination-change').click();await setRemember(manager,true);await closeSettings(manager,'#settings-done');
+  await manager.locator('#destination-change').click();await setRemember(manager,false);await closeSettings(manager,'#settings-done');
+  const latestOff=await rememberSnapshot(manager);
+  await staleManager.locator('#settings-done').click();
+  await staleManager.waitForFunction(()=>!document.querySelector('#settings-done').disabled && !document.querySelector('#settings-error').hidden);
+  assert.equal(await staleManager.locator('#save-settings').evaluate(dialog=>dialog.open),true,'conflicting policy is not reported as applied');
+  assert.match(await staleManager.locator('#settings-error').textContent(),/別の作業で変更/);
+  assert.match(await staleManager.locator('#remember-destination-help').textContent(),/現在の次回用設定: OFF/);
+  assert.deepEqual(await rememberSnapshot(manager),latestOff,'explicit stale policy change preserves the latest OFF transaction');
+  await closeSettings(staleManager);await staleManager.close();await staleSource.close();
+  await manager.locator('#destination-change').click();await setRemember(manager,true);await closeSettings(manager,'#settings-done');
+  const rememberedAgain=await rememberSnapshot(manager);assert.equal(rememberedAgain.policy.remember,true);
+  assert.deepEqual(rememberedAgain.last,{destination:'directory',name:'UX 保存先 B'});
+  checked('explicit stale policy changes conflict even after an ON/OFF round trip; explicit latest ON remembers again');
+
+  await manager.evaluate(()=>{
+    const put=IDBObjectStore.prototype.put;window.__qaPolicyPut=put;
+    IDBObjectStore.prototype.put=function(value,key){if(key==='remember-destination')throw new Error('Synthetic policy write failure');return put.call(this,value,key);};
+  });
+  await manager.locator('#destination-change').click();await setRemember(manager,false);await manager.locator('#settings-done').click();
+  await manager.waitForFunction(()=>!document.querySelector('#settings-done').disabled && !document.querySelector('#settings-error').hidden);
+  assert.equal(await manager.locator('#save-settings').evaluate(dialog=>dialog.open),true);
+  assert.match(await manager.locator('#settings-error').textContent(),/記憶設定は適用できません/);
+  assert.deepEqual(await rememberSnapshot(manager),rememberedAgain,'failed OFF transaction preserves policy and both memo entries');
+  await manager.evaluate(()=>{IDBObjectStore.prototype.put=window.__qaPolicyPut;delete window.__qaPolicyPut;});await closeSettings(manager);
+  report.limits.push('The remember-policy failure case injects one IDB put rejection; real IndexedDB transactions and OPFS handles remain in use.');
+  checked('failed next-use policy persistence keeps the modal open and cannot claim the folder was forgotten');
 
   const semantics = await manager.locator('.image-select').evaluateAll(inputs => inputs.every(input => {
     const ids = (input.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
@@ -602,7 +695,7 @@ try {
   assert.equal(originalJob.mime, 'image/svg+xml');
   const originalDownload = await worker.evaluate(async id => (await chrome.downloads.search({ id }))[0], originalJob.downloadId);
   assert.equal(originalDownload.state, 'complete');
-  assert.equal(originalJob.actualFilename, originalDownload.filename, 'the job records Chrome\'s actual finalized filename');
+  assert.equal(originalJob.actualFilename, originalDownload.filename.split(/[\\/]/).pop(), 'the job records Chrome\'s actual finalized basename');
   assert.deepEqual(await readFile(originalDownload.filename), Buffer.from(originalSVG), 'original download preserves the complete SVG response bytes');
   report.downloads = [{ requested: originalJob.filename, actual: originalJob.actualFilename, typeKnown: originalJob.typeKnown, bytes: Buffer.byteLength(originalSVG) }];
   checked('P14: extensionless original Chrome download resolves SVG filename/MIME and preserves real saved bytes');

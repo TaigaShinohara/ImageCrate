@@ -1,5 +1,5 @@
 import { fileLabel, extensionOf, matchesImage, summarizeJobs, formatBytes, publicError, saveSettings, destinationLabel, permissionOrigins, requiresWorkspace, formatLabel } from './utils.js';
-import { getDirectory, putDirectory, deleteDirectory, getLastDestination, putLastDestination } from './directory-store.js';
+import { getDirectory, putDirectory, deleteDirectory, getLastDestination, putLastDestination, getRememberDestination } from './directory-store.js';
 import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
@@ -16,6 +16,7 @@ const hasDownloadId=job=>Number.isSafeInteger(job?.downloadId)&&job.downloadId>=
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
 let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
+let draftRemember=true, draftRememberPolicy=null, rememberLoading=false;
 let uiWrites=Promise.resolve(), pendingSelections=0, measureTimer, measureUpdates=new Map();
 let settings, directoryHandle = null, directoryPermission = 'prompt', managedRunning = false, managedController = null;
 let batchDirectoryHandle = null, batchDirectoryPermission = 'prompt';
@@ -236,16 +237,30 @@ function requestImageAccess(urls) {
   return origins.length ? chrome.permissions.request({origins}) : Promise.resolve(true);
 }
 function settingsError(message) {$('settings-error').textContent=message;$('settings-error').hidden=false;}
+async function readRememberPreference(generation, preserveDraft=false) {
+  rememberLoading=true;renderDestination();
+  try {
+    const policy=await getRememberDestination();
+    if(generation!==settingsGeneration || !draft)return;
+    draftRememberPolicy=policy;if(!preserveDraft)draftRemember=policy.remember;
+  } catch(e) {
+    if(generation===settingsGeneration && draft){draftRememberPolicy=null;settingsError(publicError(e));}
+  } finally {
+    if(generation===settingsGeneration && draft){rememberLoading=false;renderDestination();}
+  }
+}
 function openSettings() {
   if(!settings || !state || isBusy()) return;
   draft={...settings};draftHandle=directoryHandle;draftPermission=directoryPermission;settingsGeneration++;
+  draftRememberPolicy=null;draftRemember=true;rememberLoading=true;
   $('settings-description').textContent='保存する場所・まとめるフォルダ名・保存形式を指定できます。適用後に保存ボタンを押してください。';
   $('folder-name').value=draft.folderName;$('output-format').value=draft.format || 'original';$('settings-error').hidden=true;
   $('save-settings').showModal();renderDestination();
+  readRememberPreference(settingsGeneration);
 }
 function cancelSettings() {
   if(closingSettings)return;
-  settingsGeneration++;draft=null;draftHandle=null;$('save-settings').close();renderDestination();$('destination-change').focus();
+  settingsGeneration++;draft=null;draftHandle=null;draftRememberPolicy=null;rememberLoading=false;$('save-settings').close();renderDestination();$('destination-change').focus();
 }
 async function commitSettings(input,handle) {
   const candidate={...input};let preparedKey;
@@ -264,20 +279,24 @@ async function commitSettings(input,handle) {
   }
 }
 async function closeSettings() {
-  if(closingSettings || !draft)return;
-  const candidate={...draft},handle=draftHandle,permission=draftPermission;
+  if(closingSettings || !draft || rememberLoading || !draftRememberPolicy)return;
+  const candidate={...draft},handle=draftHandle,permission=draftPermission,rememberPolicy=draftRememberPolicy;
+  const rememberChange=draftRemember!==rememberPolicy.remember ? {remember:draftRemember,expectedRevision:rememberPolicy.revision} : {};
   if(candidate.destination==='directory' && !handle){settingsError('保存するフォルダを選んでください。');return;}
   closingSettings=true;renderDestination();$('settings-done').disabled=true;$('settings-done').textContent='設定を保存中…';
   const accept=async next=>{
     settings={...next.saveSettings};directoryHandle=handle;directoryPermission=permission;applyState(next);
-    try {await putLastDestination({handle,destination:settings.destination});}
-    catch {error(new Error('今回の設定は適用しましたが、次回の保存先を記憶できませんでした。'));}
-    draft=null;draftHandle=null;settingsGeneration++;$('save-settings').close();
+    try {await putLastDestination({handle,destination:settings.destination},rememberChange);}
+    catch(e) {throw new Error(`今回の保存設定は適用しましたが、次回用の記憶設定は適用できませんでした。${publicError(e)}`);}
+    draft=null;draftHandle=null;draftRememberPolicy=null;settingsGeneration++;$('save-settings').close();
   };
   try {
     await accept(await commitSettings(candidate,handle));
   } catch(e) {
     settingsError(publicError(e));
+    // Preserve only an explicit policy edit. An untouched stale ON checkbox
+    // must follow a newer OFF policy, including after a failed Apply/retry.
+    await readRememberPreference(settingsGeneration,Object.hasOwn(rememberChange,'remember'));
   }
   finally {closingSettings=false;$('settings-done').disabled=false;$('settings-done').textContent='設定を適用';renderDestination();updateSummary();if(!$('save-settings').open)$('destination-change').focus();}
 }
@@ -296,16 +315,21 @@ function renderDestination() {
   const resolved=saveSettings(draft,state.title),custom=draft.destination==='directory',converting=resolved.format!=='original';
   $('destination-preview').textContent=destinationLabel(resolved);
   $('destination-downloads').checked=!custom;$('destination-directory').checked=custom;
+  $('remember-destination').checked=draftRemember;
+  $('remember-destination-help').textContent=rememberLoading?'次回用の保存先設定を読み込んでいます…':!draftRememberPolicy?'次回用の保存先設定を読み込めませんでした。設定を開き直してください。':`現在の次回用設定: ${draftRememberPolicy.remember?'ON':'OFF'}。OFFで次回用の保存先を忘れます。現在の作業の再読み込み・中断分の再開に必要な参照は保持します。`;
+  $('remember-destination').setAttribute('aria-busy',String(rememberLoading));
   $('chosen-directory').textContent=draftHandle?`選択した「${draftHandle.name}」`:'フォルダを選んで保存';
   $('directory-status').textContent=!draftHandle?'保存するフォルダを選んでください。':draftPermission==='granted'?'このフォルダに保存できます。':'保存前にフォルダへの書き込み許可を確認してください。';
   $('directory-reconnect').hidden=!custom || !draftHandle || draftPermission==='granted';$('directory-details').hidden=!custom || converting;
   $('format-details').hidden=!converting;$('format-help').hidden=converting;
-  $('format-details').textContent=`アニメーションは最初の1コマの静止画になります。複雑なSVG・AVIFなど、安全に検査できない画像は変換せず、元形式で保存できます。${resolved.format==='jpg'?'JPEGの透明部分は白背景です。':'透明部分は保持します。'}画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
+  $('format-details').textContent=`アニメーションは最初の1コマの静止画になります。複雑なSVG・AVIFなど、安全に検査できない画像は変換せず、元形式で保存できます。${resolved.format==='jpg'?'JPEGの透明部分は白背景です。':'透明部分は保持します。'}変換は付属情報の完全な除去や匿名化を保証するものではありません。画像の配信元へのアクセス許可を確認する場合があります。処理中はこのタブを開いたままにしてください。`;
   $('folder-adjustment').hidden=!draft.folderName.trim() || resolved.folderName===draft.folderName;
   $('folder-adjustment').textContent=`作成する名前: ${resolved.folderName}`;
   const busy=closingSettings || requestPending;
   for(const control of $('save-settings').querySelectorAll('input,select,button'))control.disabled=busy;
   $('destination-directory').disabled=busy || !draftHandle;$('choose-directory').disabled=busy || !window.showDirectoryPicker;
+  $('remember-destination').disabled=busy || rememberLoading || !draftRememberPolicy;
+  $('settings-done').disabled=busy || rememberLoading || !draftRememberPolicy;
 }
 async function chooseDirectory() {
   if(closingSettings || requestPending || !draft)return;
@@ -479,6 +503,7 @@ $('directory-reconnect').addEventListener('click',reconnectDirectory);
 for(const mode of ['downloads','directory'])$(`destination-${mode}`).addEventListener('change',()=>{if(!draft)return;draft.destination=mode;draft.directoryName=draftHandle?.name || '';renderDestination();});
 $('folder-name').addEventListener('input',()=>{if(draft){draft.folderName=$('folder-name').value;renderDestination();}});
 $('output-format').addEventListener('change',()=>{if(draft){draft.format=$('output-format').value;renderDestination();}});
+$('remember-destination').addEventListener('change',()=>{if(draft && draftRememberPolicy){draftRemember=$('remember-destination').checked;renderDestination();}});
 $('folder-reset').addEventListener('click',()=>{if(draft){draft.folderName=state.title;$('folder-name').value=draft.folderName;renderDestination();$('folder-name').focus();}});
 window.addEventListener('beforeunload',event=>{if(managedRunning || requiresWorkspace(state?.batch) && summarizeJobs(state.jobs).active){event.preventDefault();event.returnValue='';}});
 $('source').addEventListener('click',()=>send('source').catch(error));$('scan').addEventListener('click',()=>scan(false));$('next-page').addEventListener('click',()=>scan(true));
