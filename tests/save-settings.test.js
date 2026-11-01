@@ -22,6 +22,28 @@ test('custom folders are labeled by the selected handle name without inventing a
   assert.equal(saveSettings({destination:'other'}).destination,'downloads');
 });
 
+test('folder previews remove leading dots and exposed spaces before reserved-name handling', () => {
+  const cases = [
+    ['. photos', 'photos'],
+    ['. con', '_con'],
+    ['... . photos', 'photos'],
+    [' . . con. ', '_con'],
+    ['.  . CON ', '_CON'],
+    ['. \t. CON ', '_. CON'],
+    ['. . aux.txt', '_aux.txt'],
+    ['．　ＣＯＮ', '_CON'],
+    ['. . ', 'ページ'],
+    ['my . photos', 'my . photos']
+  ];
+  for (const [input, expected] of cases) {
+    const settings = saveSettings({folderName:input}, 'ページ');
+    assert.equal(settings.folderName, expected, input);
+    assert.equal(sanitizePart(settings.folderName), expected, input);
+    const path = downloadName({url:'https://images.test/photo.jpg'}, settings.folderName, 0, 'images');
+    assert.equal(path.split('/')[1], expected, input);
+  }
+});
+
 test('optional access includes only concrete image hosts, with no query, path, wildcard host, or port', () => {
   assert.deepEqual(permissionOrigins(['https://cdn.test:444/a?token=secret','https://cdn.test/b','http://localhost:1234/x','data:image/png;base64,AA==','bad','https://*/*','https://*.example.test/a.png']),
     ['https://cdn.test/*','http://localhost/*']);
