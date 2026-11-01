@@ -2,6 +2,7 @@
 // downloads. Only picker / permission / one fetch failure decisions are mocked.
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {tagPrivacyMetadata,readPrivacyMetadata,SYNTHETIC_METADATA} from './helpers/privacy-metadata.mjs';
 
 const MIME={jpg:'image/jpeg',png:'image/png',webp:'image/webp'};
 function assertMagic(bytes,format,label) {
@@ -15,6 +16,27 @@ function assertMagic(bytes,format,label) {
 }
 function near(actual,expected,tolerance,label) {
   for(let index=0;index<4;index++)assert.ok(Math.abs(actual[index]-expected[index])<=tolerance,`${label}: channel ${index}, actual ${actual}, expected ${expected}`);
+}
+function assertFixtureMetadata(bytes,format,label,orientation=1) {
+  const metadata=readPrivacyMetadata(bytes,format);
+  assert.ok(metadata.exif.some(entry=>entry.artist===SYNTHETIC_METADATA.artist && entry.orientation===orientation
+    && entry.gps?.latitudeRef==='N' && entry.gps?.longitudeRef==='E'
+    && entry.gps.latitude.every(value=>value===0) && entry.gps.longitude.every(value=>value===0)),`${label}: valid synthetic EXIF Artist, GPS and orientation`);
+  if(format==='png')assert.deepEqual(metadata.text.find(entry=>entry.keyword===SYNTHETIC_METADATA.keyword),{keyword:SYNTHETIC_METADATA.keyword,value:SYNTHETIC_METADATA.marker},`${label}: named PNG text field`);
+  else assert.ok(metadata.xmp.some(entry=>entry.creators.includes(SYNTHETIC_METADATA.artist) && entry.descriptions.includes(SYNTHETIC_METADATA.marker)),`${label}: structured XMP creator/description`);
+  if(format==='jpg') {
+    assert.ok(metadata.iptc.some(entry=>entry.record===2 && entry.dataset===80 && entry.value===SYNTHETIC_METADATA.artist),`${label}: IPTC By-line dataset`);
+    assert.ok(metadata.iptc.some(entry=>entry.record===2 && entry.dataset===120 && entry.value===SYNTHETIC_METADATA.marker),`${label}: IPTC Caption dataset`);
+  }
+  return metadata;
+}
+function assertConvertedMetadata(bytes,format,label) {
+  const metadata=readPrivacyMetadata(bytes,format);
+  assert.equal(metadata.exif.some(entry=>Object.hasOwn(entry,'artist') || Object.hasOwn(entry,'gps')),false,`${label}: source EXIF Artist/GPS fields are absent`);
+  assert.equal(metadata.iptc.some(entry=>entry.record===2 && [80,120].includes(entry.dataset)),false,`${label}: source IPTC fields are absent`);
+  assert.equal(metadata.xmp.some(entry=>entry.creators.length || entry.descriptions.length),false,`${label}: source XMP fields are absent`);
+  assert.equal(metadata.text.some(entry=>entry.keyword===SYNTHETIC_METADATA.keyword),false,`${label}: source PNG text field is absent`);
+  assert.equal(Buffer.from(bytes).includes(Buffer.from(SYNTHETIC_METADATA.marker)),false,`${label}: synthetic metadata marker is absent`);
 }
 
 export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
@@ -49,7 +71,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
   // restoring the old session also restores its original selected folder.
   await manager.evaluate(async({id,batchId,directoryKey,prefix})=>{
     const {getDirectory,putDirectory}=await import('./directory-store.js');
-    for(const [name,key] of [['session',`session:${id}`],['last','last'],['last-destination','last-destination'],['applied',directoryKey],['batch',`batch:${batchId}`]]) {
+    for(const [name,key] of [['session',`session:${id}`],['last','last'],['last-destination','last-destination'],['remember-destination','remember-destination'],['applied',directoryKey],['batch',`batch:${batchId}`]]) {
       if(!key)continue;
       const handle=await getDirectory(key);if(handle)await putDirectory(prefix+name,handle);
     }
@@ -110,34 +132,8 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     const fixtures=await manager.evaluate(()=>{
       const canvas=document.createElement('canvas');canvas.width=16;canvas.height=12;
       const context=canvas.getContext('2d');context.fillStyle='#ff0000';context.fillRect(0,0,6,12);
-      // Put the sentinel inside a valid metadata segment/chunk. Trailing
-      // container bytes are deliberately rejected by the source preflight.
-      const marker=new TextEncoder().encode('SOURCE_METADATA_SENTINEL');
-      const join=(...parts)=>Uint8Array.from(parts.flatMap(part=>[...part]));
-      const be32=value=>[value>>>24,value>>>16,value>>>8,value];
-      const le32=value=>[value,value>>>8,value>>>16,value>>>24];
       const text=value=>new TextEncoder().encode(value);
-      const pngChunk=(type,data)=>{
-        const body=join(text(type),data);let crc=0xffffffff;
-        for(const byte of body){crc^=byte;for(let bit=0;bit<8;bit++)crc=crc&1?(crc>>>1)^0xedb88320:crc>>>1;}
-        return join(be32(data.length),body,be32((crc^0xffffffff)>>>0));
-      };
-      const taggedURL=type=>{
-        const source=Uint8Array.from(atob(canvas.toDataURL(type).split(',')[1]),character=>character.charCodeAt(0));let tagged;
-        if(type==='image/png'){
-          const metadata=pngChunk('tEXt',join(text('Comment\0'),marker));tagged=join(source.slice(0,-12),metadata,source.slice(-12));
-        }else if(type==='image/jpeg'){
-          const length=marker.length+2;tagged=join(source.slice(0,2),[255,239,length>>>8,length&255],marker,source.slice(2));
-        }else{
-          const xmp=text('<x:xmpmeta xmlns:x="adobe:ns:meta/">SOURCE_METADATA_SENTINEL</x:xmpmeta>');
-          const chunk=join(text('XMP '),le32(xmp.length),xmp,xmp.length&1?[0]:[]);let body=source.slice(12);
-          if(String.fromCharCode(...body.slice(0,4))==='VP8X'){body=body.slice();body[8]|=4;}
-          else body=join(text('VP8X'),le32(10),[0x14,0,0,0,15,0,0,11,0,0],body);
-          body=join(text('WEBP'),body,chunk);tagged=join(text('RIFF'),le32(body.length),body);
-        }
-        return `data:${type};base64,${btoa(String.fromCharCode(...tagged))}`;
-      };
-      const png=taggedURL('image/png'),jpg=taggedURL('image/jpeg'),webp=taggedURL('image/webp');
+      const png=canvas.toDataURL('image/png'),jpg=canvas.toDataURL('image/jpeg'),webp=canvas.toDataURL('image/webp');
       const svg='data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12"><rect width="6" height="12" fill="red"/></svg>');
       // Two 1×1 frames with a global red/blue palette and distinct LZW pixels.
       const gifBytes=[...new TextEncoder().encode('GIF89a'),1,0,1,0,128,0,0,255,0,0,0,0,255,
@@ -151,6 +147,15 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       const generalSVG='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(generalSVGText);
       return {png,jpg,webp,svg,generalSVG,generalSVGText,avif:`data:image/avif;base64,${btoa(String.fromCharCode(...avifBytes))}`,avifBytes,gif:`data:image/gif;base64,${btoa(String.fromCharCode(...gifBytes))}`,gifBytes,broken:'data:image/png;base64,bm90LWFuLWltYWdl'};
     });
+    const baseJpeg=Buffer.from(fixtures.jpg.split(',')[1],'base64');
+    for(const format of ['png','jpg','webp']) {
+      const bytes=tagPrivacyMetadata(Buffer.from(fixtures[format].split(',')[1],'base64'),format);
+      assertFixtureMetadata(bytes,format,`${format} source fixture`);
+      fixtures[format]=`data:${MIME[format]};base64,${Buffer.from(bytes).toString('base64')}`;
+    }
+    const orientedJpeg=tagPrivacyMetadata(baseJpeg,'jpg',{orientation:6});
+    assertFixtureMetadata(orientedJpeg,'jpg','clockwise source fixture',6);
+    fixtures.orientedJpg=`data:image/jpeg;base64,${Buffer.from(orientedJpeg).toString('base64')}`;
     const items=[
       {url:fixtures.png,width:16,height:12,type:'image',alt:'format-png'},
       {url:fixtures.svg,width:16,height:12,type:'image',alt:'format-svg'},
@@ -158,7 +163,9 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       {url:fixtures.broken,width:0,height:0,type:'image',alt:'format-broken'},
       {url:origin+'/red.svg',width:400,height:300,type:'image',alt:'format-permission'},
       {url:fixtures.avif,width:0,height:0,type:'image',alt:'format-unsupported-avif-container'},
-      {url:fixtures.generalSVG,width:0,height:0,type:'image',alt:'format-unsupported-general-svg'}
+      {url:fixtures.generalSVG,width:0,height:0,type:'image',alt:'format-unsupported-general-svg'},
+      {url:fixtures.jpg,width:16,height:12,type:'image',alt:'format-metadata-jpeg'},
+      {url:fixtures.webp,width:16,height:12,type:'image',alt:'format-metadata-webp'}
     ];
     await worker.evaluate(async({key,state,items})=>chrome.storage.session.set({[key]:{
       ...state,items,jobs:[],history:[],batch:null,notices:[],scanned:true,
@@ -191,26 +198,41 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     // Direct converter checks inspect the actual Blob MIME, encoded signature,
     // dimensions and pixels. The UI saves below inspect the resulting files too.
     for(const format of ['jpg','png','webp']) {
-      const converted=await convert(fixtures.png,format);
-      assert.equal(converted.type,MIME[format],`${format}: actual Blob MIME`);assertMagic(converted.bytes,format,format);
-      const image=await decode(converted.bytes);assert.deepEqual([image.width,image.height],[16,12],`${format}: dimensions preserved`);
-      near(image.red,[255,0,0,255],format==='jpg'?25:3,`${format}: red content retained`);
-      if(format==='jpg')near(image.transparent,[255,255,255,255],10,'JPEG flattens transparency to white');
-      else assert.equal(image.transparent[3],0,`${format}: transparency retained`);
-      if(format==='png')assert.equal(Buffer.from(converted.bytes).includes(Buffer.from('SOURCE_METADATA_SENTINEL')),false,'PNG→PNG re-encodes instead of copying metadata');
-      if(format!=='png') {
-        const sameFormat=await convert(fixtures[format],format);
-        assert.equal(sameFormat.type,MIME[format]);assertMagic(sameFormat.bytes,format,`${format}→${format}`);
-        assert.equal(Buffer.from(sameFormat.bytes).includes(Buffer.from('SOURCE_METADATA_SENTINEL')),false,`${format}→${format} re-encodes source metadata`);
-        const image=await decode(sameFormat.bytes);assert.deepEqual([image.width,image.height],[16,12]);
+      for(const source of ['png','jpg','webp']) {
+        const converted=await convert(fixtures[source],format),label=`${source}→${format}`;
+        assert.equal(converted.type,MIME[format],`${label}: actual Blob MIME`);assertMagic(converted.bytes,format,label);
+        assertConvertedMetadata(converted.bytes,format,label);
+        const image=await decode(converted.bytes);assert.deepEqual([image.width,image.height],[16,12],`${label}: dimensions preserved`);
+        near(image.red,[255,0,0,255],source==='jpg'||format==='jpg'?25:3,`${label}: red content retained`);
+        if(source==='jpg')near(image.transparent,[0,0,0,255],25,`${label}: opaque JPEG source content retained`);
+        else if(format==='jpg')near(image.transparent,[255,255,255,255],10,`${label}: JPEG flattens transparency to white`);
+        else assert.equal(image.transparent[3],0,`${label}: transparency retained`);
       }
       await settings({format,folderName:`形式_${format}`});
       const saved=await save(0);assert.equal(saved.batch.format,format);assert.equal(saved.batch.destination,'directory');
       const files=await directoryFiles(`形式_${format}`);assert.equal(files.length,1);assert.match(files[0].name,new RegExp(`\\.${format}$`));
       assertMagic(files[0].bytes,format,`${format} selected-folder file`);
+      assertConvertedMetadata(files[0].bytes,format,`${format} selected-folder file`);
       const actual=await decode(files[0].bytes);assert.deepEqual([actual.width,actual.height],[16,12]);
       if(format==='jpg')near(actual.transparent,[255,255,255,255],10,'saved JPEG has a white background');
       else assert.equal(actual.transparent[3],0,`saved ${format} preserves alpha`);
+    }
+    // Keep rotation separate from the normal-orientation privacy matrix: a
+    // valid EXIF 6 fixture must rotate dimensions and visible pixels together.
+    for(const format of ['jpg','png','webp']) {
+      const converted=await convert(fixtures.orientedJpg,format);
+      assertConvertedMetadata(converted.bytes,format,`EXIF 6→${format}`);
+      const image=await manager.evaluate(async bytes=>{
+        const bitmap=await createImageBitmap(new Blob([new Uint8Array(bytes)]));
+        try {
+          const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;
+          const context=canvas.getContext('2d',{willReadFrequently:true});context.drawImage(bitmap,0,0);
+          return {width:bitmap.width,height:bitmap.height,top:[...context.getImageData(6,2,1,1).data],bottom:[...context.getImageData(6,13,1,1).data]};
+        } finally {bitmap.close();}
+      },converted.bytes);
+      assert.deepEqual([image.width,image.height],[12,16],`${format}: EXIF 6 clockwise dimensions`);
+      near(image.top,[255,0,0,255],25,`${format}: EXIF 6 red band rotates to the top`);
+      near(image.bottom,[0,0,0,255],25,`${format}: EXIF 6 opaque JPEG background rotates with pixels`);
     }
     await reload();assert.equal(await manager.locator('.thumb img').count(),0,'reload clears embedded preview consent before later conversion URL ownership checks');await manager.locator('#destination-change').click();
     assert.equal(await manager.locator('#output-format').inputValue(),'webp','the selected output format survives workspace reload');
@@ -295,9 +317,37 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       assert.equal(blobURLs[0].type,MIME[format]);assert.equal(blobURLs[0].url,download.url);
       assert.equal(blobURLs[0].revoked,true,`${format}: the completed download releases its Blob URL`);
       const bytes=[...await readFile(download.filename)];assertMagic(bytes,format,`${format} actual Chrome download`);
+      assertConvertedMetadata(bytes,format,`${format} actual Chrome download`);
       const image=await decode(bytes);assert.deepEqual([image.width,image.height],[16,12]);
       if(format==='jpg')near(image.transparent,[255,255,255,255],10,'downloaded JPEG has white transparency');
       else assert.equal(image.transparent[3],0,`downloaded ${format} retains alpha`);
+    }
+    // The existing PNG converted-save cases plus these JPEG/WebP cases cover
+    // all nine source/encoder pairs through BOTH actual output destinations.
+    // Original saves are byte/structure preservation checks, not sanitization.
+    for(const destination of ['directory','downloads'])for(const [source,index] of [['png',0],['jpg',7],['webp',8]]) {
+      for(const format of source==='png'?['original']:['original','jpg','png','webp']) {
+        const folderName=`metadata_${source}_${format}_${destination}`;
+        await settings({format,destination,folderName});const saved=await save(index);
+        let bytes;
+        if(destination==='directory') {
+          const files=await directoryFiles(folderName);assert.equal(files.length,1,`${folderName}: exactly one output`);bytes=files[0].bytes;
+        } else {
+          const [download]=await manager.evaluate(id=>chrome.downloads.search({id}),saved.jobs[0].downloadId);
+          assert.equal(download.state,'complete',`${folderName}: actual Chrome completion`);
+          assert.ok(download.filename.startsWith(downloadFolder));bytes=[...await readFile(download.filename)];
+        }
+        const outputFormat=format==='original'?source:format;assertMagic(bytes,outputFormat,folderName);
+        if(format==='original') {
+          assert.deepEqual(Buffer.from(bytes),Buffer.from(fixtures[source].split(',')[1],'base64'),`${folderName}: original bytes preserved`);
+          assertFixtureMetadata(bytes,source,folderName);
+        } else assertConvertedMetadata(bytes,format,folderName);
+        const image=await decode(bytes);assert.deepEqual([image.width,image.height],[16,12],`${folderName}: output dimensions`);
+        near(image.red,[255,0,0,255],source==='jpg'||format==='jpg'?25:3,`${folderName}: image content retained`);
+        if(source==='jpg')near(image.transparent,[0,0,0,255],25,`${folderName}: opaque source remains opaque`);
+        else if(format==='jpg')near(image.transparent,[255,255,255,255],10,`${folderName}: JPEG white background`);
+        else assert.equal(image.transparent[3],0,`${folderName}: alpha retained`);
+      }
     }
     await settings({format:'png',destination:'downloads',folderName:'Chrome破損画像'});
     const downloadsBeforeBroken=await manager.evaluate(async()=>new Set((await chrome.downloads.search({})).map(download=>download.id)).size);
@@ -363,7 +413,7 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     // responsive-layout and 500-item tests. Restore their exact fixture state.
     await manager.evaluate(async({state,local,prefix,key})=>{
       const {getDirectory,putDirectory,deleteDirectory}=await import('./directory-store.js');
-      for(const [name,target] of [['session',`session:${state.id}`],['last','last'],['last-destination','last-destination'],['applied',state.saveSettings?.directoryKey],['batch',`batch:${state.batch?.id}`]]) {
+      for(const [name,target] of [['session',`session:${state.id}`],['last','last'],['last-destination','last-destination'],['remember-destination','remember-destination'],['applied',state.saveSettings?.directoryKey],['batch',`batch:${state.batch?.id}`]]) {
         if(!target)continue;
         const handle=await getDirectory(prefix+name);
         if(handle)await putDirectory(target,handle);else if(name!=='batch' || state.batch)await deleteDirectory(target);
