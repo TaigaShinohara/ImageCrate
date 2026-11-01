@@ -1,7 +1,7 @@
 export function sanitizePart(value, fallback = 'untitled') {
   const clean = String(value ?? '').normalize('NFKC')
     .replace(/[\x00-\x1f\x7f<>:"/\\|?*\u202a-\u202e\u2066-\u2069]/g, '_')
-    .replace(/\s+/g, ' ').trim().replace(/^\.+|[. ]+$/g, '');
+    .replace(/\s+/g, ' ').replace(/^[. ]+|[. ]+$/g, '');
   // Leave room for a file extension, sequence number and conflict suffix on
   // filesystems whose component limit is measured in UTF-8 bytes.
   const candidate = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(clean) ? `_${clean}` : clean;
