@@ -33,7 +33,7 @@
           <li><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>選んだ画像を保存</span></li>
         </ol>
         <p>元ページにある画像を探します。多いときは「続きの候補」へ進めます。元ページに画像を追加したら再スキャンしてください。</p>
-        <p>プレビューは自動で表示します。追加のアクセス許可が必要な配信元は、画像枠の「アクセスを許可して表示」から許可できます。許可しなくても画像の選択と元の形式での保存はできます。プレビューできない画像も、元形式で保存できます。</p>
+        <p>プレビューは自動で表示します。初回はChromeが画像の配信元へのアクセスをまとめて確認します。あとから必要になった許可も、一覧上部の配信元ごとのボタンから確認できます。許可しなくても画像の選択と元の形式での保存はできます。プレビューできない画像も、元形式で保存できます。</p>
         <p>保存先・画像をまとめるフォルダ名・保存形式は画面下の「変更」から指定できます。最初は元の形式のまま、Chromeのダウンロード先 / ImageCrate / ページ名に保存します。</p>
         <p>非表示にした選択画像も保存します。</p>
       </div>
@@ -81,6 +81,11 @@
       </div>
     </div>
     <a id="skip-save" class="skip-link" href="#save-heading">保存操作へ移動</a>
+    <section id="preview-access" class="preview-access" aria-labelledby="preview-access-heading" hidden>
+      <h3 id="preview-access-heading">プレビューのアクセス許可が必要です</h3>
+      <p class="preview-access-intro">許可すると、この配信元の画像をまとめて表示します。許可しなくても画像の選択と元の形式での保存はできます。</p>
+      <div id="preview-access-origins" class="preview-access-origins"></div>
+    </section>
     <div id="grid" class="grid" aria-label="画像一覧" aria-busy="false"></div>
     <div id="empty" class="empty" hidden></div>
     <div class="continuation"><button id="next-page" class="secondary" hidden>続きの候補</button><p id="continuation-hint" class="filter-hint" hidden>選択済みは残します。未選択の候補は次の取得結果へ切り替わります。</p></div>

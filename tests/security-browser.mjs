@@ -89,6 +89,7 @@ const server=createServer((request,response)=>{
   }
   response.setHeader('Content-Type','text/html; charset=utf-8');
   if(path==='/scope')return response.end(documentFor([origin+'/assets/a.svg',otherOrigin+'/assets/b.svg']));
+  if(path==='/cdn')return response.end(documentFor(Array.from({length:5},(_,index)=>otherOrigin+`/assets/cdn-${index}.svg`)));
   if(path==='/data')return response.end(documentFor([dataURL]));
   if(path==='/queue'||path==='/close')return response.end(documentFor(Array.from({length:6},(_,index)=>origin+`/assets/held.svg?case=${path.slice(1)}&i=${index}`)));
   const resource=({'/refused':'refused.svg','/active-tab':'active-tab.svg','/retry':'fail-once.svg','/cache':'cache.svg','/redirect':'redirect','/stream':'stream.png','/declared':'declared.png','/huge':'huge.png'})[path];
@@ -213,6 +214,44 @@ try{
   assert.deepEqual((await qa(scoped)).requests,[['http://127.0.0.1/*'],['http://localhost/*']]);
   assert.equal(await scoped.locator('.thumb img').evaluateAll(images=>images.every(image=>image.src.startsWith('blob:')&&image.naturalWidth<=384)),true);
   checked('visible host/scope explanation, Enter focus transfer, separate concrete-host permissions and generated-only bounded thumbnails');await scoped.close();
+
+  const cdnHits=()=>Array.from({length:5},(_,index)=>hits('localhost',`/assets/cdn-${index}.svg`)).reduce((sum,count)=>sum+count,0);
+  const cdnBefore=cdnHits(),cdn=await opened('/cdn',{blockedOrigins:['http://localhost/*']});
+  const waitForCDNPermission=()=>cdn.waitForFunction(()=>document.querySelectorAll('.card').length===5&&[...document.querySelectorAll('.card')].every(card=>card.querySelector('.preview-error')?.textContent.includes('許可')));
+  await waitForCDNPermission();
+  const summary=cdn.locator('#preview-access'),cdnGrant=summary.locator('.preview-access-grant');
+  assert.equal(await summary.isVisible(),true);assert.equal(await cdnGrant.count(),1,'five blocked CDN cards share one top-level permission action');
+  assert.match(await summary.locator('h3').innerText(),/プレビューのアクセス許可が必要/);
+  assert.equal(await summary.locator('.preview-access-source').innerText(),`配信元: ${otherOrigin}（プレビュー待ち5件）`);
+  assert.match(await summary.locator('.preview-access-scope').innerText(),/全パス.*全ポート/);assert.match(await summary.locator('.preview-access-scope').innerText(),/ログイン状態/);
+  for(const width of [1280,360]){
+    await cdn.setViewportSize({width,height:width===360?800:1000});
+    if(width===360)await summary.evaluate(panel=>panel.scrollIntoView({block:'start'}));else await summary.scrollIntoViewIfNeeded();
+    await cdn.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const geometry=await summary.evaluate(panel=>{const button=panel.querySelector('button').getBoundingClientRect();return {overflow:document.documentElement.scrollWidth>innerWidth,height:button.height,left:button.left,right:button.right,top:button.top,bottom:button.bottom,footerTop:document.querySelector('#footer').getBoundingClientRect().top,width:innerWidth,beforeGrid:panel.getBoundingClientRect().top<document.querySelector('#grid').getBoundingClientRect().top};});
+    assert.equal(geometry.overflow,false);assert.ok(geometry.height>=44&&geometry.left>=0&&geometry.right<=geometry.width);
+    assert.ok(geometry.top>=0&&geometry.bottom<=geometry.footerTop,'the shared permission action can be reached above the sticky save footer');assert.equal(geometry.beforeGrid,true);
+    await cdn.screenshot({path:join(output,`cdn-permission-${width}.png`)});
+  }
+  await cdn.setViewportSize({width:1280,height:1000});await cdn.locator('#query').fill('cdn-');await waitForCDNPermission();
+  assert.equal(await cdnGrant.count(),1,'filter rerender does not duplicate the host action');assert.equal(cdnHits(),cdnBefore);assert.deepEqual((await qa(cdn)).requests,[]);
+  await cdn.evaluate(()=>{__securityQA.denyRequest=true;});await cdnGrant.focus();await cdnGrant.press('Enter');
+  await cdn.waitForFunction(()=>document.querySelector('.preview-access-message')?.textContent.includes('許可されませんでした')&&!document.querySelector('.preview-access-grant').disabled);
+  assert.equal(await cdn.evaluate(()=>document.activeElement?.id),'gallery-heading','the shared action preserves focus at the gallery heading');
+  assert.equal(cdnHits(),cdnBefore);assert.deepEqual((await qa(cdn)).requests,[['http://localhost/*']],'denying the shared action makes one request and no media fetch');
+  await cdn.evaluate(()=>{
+    __securityQA.denyRequest=false;const original=chrome.permissions.request;globalThis.__cdnOriginalRequest=original;
+    chrome.permissions.request=options=>{const result=original(options);return new Promise((resolve,reject)=>{globalThis.__cdnResolvePermission=()=>Promise.resolve(result).then(resolve,reject);});};
+  });
+  await cdnGrant.click();
+  assert.equal(await cdn.locator('.card .preview-permission').evaluateAll(buttons=>buttons.every(button=>button.disabled)),true,'the shared pending request disables every equivalent card permission action');
+  await cdn.locator('.card .preview-permission').first().evaluate(button=>button.dispatchEvent(new MouseEvent('click',{bubbles:true})));
+  assert.deepEqual((await qa(cdn)).requests,[['http://localhost/*'],['http://localhost/*']],'a duplicate card event cannot issue another host request while the shared request is pending');
+  await cdn.evaluate(()=>{chrome.permissions.request=globalThis.__cdnOriginalRequest;globalThis.__cdnResolvePermission();});
+  await cdn.waitForFunction(()=>document.querySelectorAll('.thumb img').length===5&&[...document.querySelectorAll('.thumb img')].every(image=>image.complete&&image.naturalWidth>0&&image.src.startsWith('blob:')));
+  assert.equal(cdnHits(),cdnBefore+5);assert.equal(await summary.isVisible(),false);assert.equal(await cdn.locator('.image-select:checked').count(),0);
+  assert.deepEqual((await qa(cdn)).requests,[['http://localhost/*'],['http://localhost/*']]);
+  checked('five blocked CDN cards share one accessible host action; denial sends no media, duplicate card actions are suppressed, and one grant loads all five without selecting');await cdn.close();
 
   const fallbackBefore=hits('127.0.0.1','/assets/active-tab.svg');
   const fallback=await opened('/active-tab',{blockedOrigins:['http://127.0.0.1/*'],blockSourceAccess:false,expectBlocked:false});

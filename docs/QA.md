@@ -1,5 +1,19 @@
 # QA — v0.1
 
+## 別配信元CDNの初回プレビュー — 2026-11-02
+
+本人の新規CDN5枚の許可待ち報告を起点に、拡張起動時の具体配信元の一括要求と、一覧上部の配信元別許可操作を追加。前節のsame-origin成功を新規CDNの成功へ流用しない。
+
+- `npm test`: **343 PASS / 既存対象外1 SKIP**。stateless probeのsource/URL/要素/仕事量制限、worker側のorigin再検証、既存許可/exact-origin除外、callback合流順、拒否・API例外・timeout・navigation/close・重複/4枠・同時request制御を追加。`npm run check` / `git diff --check`: PASS。
+- Chrome for Testing116.0.5845.96・本番と同じmanifest権限・隔離profileで、実ツールバーから起動。未許可の別origin（127.0.0.1ページ→localhost）にある実WebP5枚で、具体CDNだけのnative許可promptが1回出ることを確認。許可後はカード操作なしに5枚を自動表示、選択0、一覧上部の許可案内も非表示。作業タブを閉じて元ページから実toolbarで開き直すと、requestを追加せず5枚を再表示した。主担当が画像を目視。元の実サイトにはテスト通信していない。
+- Chrome156.0.8078.80の `test:security`: **16項目PASS、pageerror 0**。同じCDN5枚に対する一覧上部の許可操作1個、再描画で重複なし、拒否後zero-fetch、top/cardの重複要求防止、1回の許可後に5枚自動表示/選択不変を確認。1280/360pxで横overflowなし・44px以上、スクロールでCTA全体がsticky保存footerより上へ到達するgeometryと画面を確認。取消等は既存の明記したAPI境界fixture。
+- 同Chromeの `test:browser`: PASS。選択・保存・再読み込み回復・保存優先/drain・実JPEG/PNG/WebP変換・download・metadata/データ保持・500候補を回帰。
+- 独立設計/コード審査で対象範囲の再現可能な未解決must-fixなし。callback直結要求、source identity、具体origin、期限切れ/移動後の破棄、slot保持とsummaryの寿命を確認。
+
+結果: `/private/tmp/imagecrate-cdn-security/`、native116: `/var/folders/6s/jk3mxwcn2x98rygsq4qz_mc80000gn/T/imagecrate-cdn-native-116-JDbVR9/report.json` と同階層の `five-automatic-previews.png`。
+
+未確認: 添付の実サイト自体、本人の操作感・実VoiceOver。現行Chrome156の別profileでnative-toolbar試験も起動したが、操作ツールが通常利用中のChromeを選択したため、そのprofileには操作せず試験用processだけを終了した。Chrome156のnative prompt表示は未確認で、自動試験のAPI境界成功と区別する。Chrome116は実native promptを確認済み。worker再起動をまたぐ未着手の軽量probe呼出数は厳密保証外（DESIGN参照）。
+
 ## プレビューの初期ON — 2026-11-02
 
 本人指定により、以下の過去記録にある「作業ページごとの同意」を廃止し、既存Chrome許可・元ページの一時アクセス・data画像で自動表示する。Chromeの追加許可がない別配信元だけ、実clickで要求する。
