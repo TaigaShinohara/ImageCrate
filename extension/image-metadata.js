@@ -5,7 +5,7 @@ const MAX_PARTS = 8192;
 const MAX_FRAMES = 64;
 const MAX_FRAME_PIXELS = 64_000_000;
 const MIME = {png:'image/png',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',bmp:'image/bmp',ico:'image/x-icon',svg:'image/svg+xml'};
-const failure = message => new Error(`画像を安全に確認できません（${message}）。元の形式で保存できます。`);
+const failure = message => new Error(`画像を安全に確認できません（${message}）。元の形式での保存を試せます。`);
 function bytesOf(value) {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);

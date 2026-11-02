@@ -97,8 +97,15 @@ export class Gallery {
       binding.button.hidden=!show;binding.button.disabled=!binding.host||!this.previews||binding.requesting||binding.pending||this.previewsPaused||binding.needsPermission&&this.permissionRequests.has(binding.host.key);
       binding.button.children[0].textContent=!binding.host?'プレビュー非対応':binding.needsPermission?'アクセスを許可して表示':'再試行';
       binding.button.setAttribute('aria-label',binding.host?`${binding.host.label} のプレビュー${binding.needsPermission?'へのアクセスを許可して表示':'を再試行'}`:'この画像はプレビューできません');
+      if(binding.needsPermission&&binding.details&&binding.host){
+        binding.button.setAttribute('aria-describedby',binding.details.id);
+        binding.button.title=`${binding.host.label} の画像を取得します。サイトの許可は同じホストの全パス・ポートに適用されます。`;
+      }else{
+        binding.button.removeAttribute('aria-describedby');
+        binding.button.title=binding.host?`${binding.host.label} の画像を再取得します。`:'この画像は安全にプレビューできません';
+      }
     }
-    if(binding.details)binding.details.hidden=!show||!binding.host;
+    if(binding.details)binding.details.hidden=!show||!binding.host||!binding.needsPermission;
   }
   updatePermissionSummary(){
     const panel=$('preview-access'),list=$('preview-access-origins');if(!panel||!list||!this.permissionURLs)return;
@@ -185,9 +192,7 @@ export class Gallery {
         details.id=`preview-details-${++this.previewSequence}`;details.replaceChildren();
         if(host)details.append(node('p','preview-source',host.isEmbedded?host.label:`配信元: ${host.label}`));
         if(host&&!host.isEmbedded)details.append(node('p','preview-scope','この配信元の全パス・全ポートが対象です。サイトのログイン状態を使って画像を取得します。この作業ページでは、同じ配信元のプレビューも表示します。'));
-        button.setAttribute('aria-describedby',details.id);
       }
-      button.title=host?.isEmbedded?'ページに埋め込まれた画像を読み込みます。':host?`${host.label} の画像を取得します。サイトの許可は同じホストの全パス・ポートに適用されます。`:'この画像は安全にプレビューできません';
       this.showPreviewConsent(binding,!host);
       button.onclick=event=>{
         event.preventDefault();event.stopPropagation();
@@ -219,7 +224,7 @@ export class Gallery {
       binding.handle=handle;binding.needsPermission=false;this.permissionURLs.delete(binding.item.url);this.updatePermissionSummary();
       const image=new Image();image.alt=binding.kind==='viewer'?((binding.item.alt||'').trim()||fileLabel(binding.item.url)):'';
       image.referrerPolicy='no-referrer';
-      image.onerror=()=>{if(binding.handle===handle){handle.release();binding.handle=null;binding.container.replaceChildren(node('span','preview-error','プレビューを表示できません。元形式の保存はできます。'));this.showPreviewConsent(binding,true);}};
+      image.onerror=()=>{if(binding.handle===handle){handle.release();binding.handle=null;binding.container.replaceChildren(node('span','preview-error','プレビューを表示できません。元形式での保存を試せます。'));this.showPreviewConsent(binding,true);}};
       image.src=handle.url;binding.container.replaceChildren(image);this.showPreviewConsent(binding,false);
       // The generated static image may be resized. Persist validated source
       // dimensions, never the thumbnail's naturalWidth/naturalHeight.
