@@ -1,5 +1,15 @@
 # QA — v0.1
 
+## 起動時の追加許可を自動要求しない — 2026-11-02
+
+本人の依頼に合わせ、下のCDN初回プレビューで追加した起動前probeと一括許可要求を削除。拡張アイコンから作業ページを直接開き、未許可画像は既存の明示的な表示操作から許可する。保存時に必要な配信元許可とmanifestは変更していない。
+
+- `npm test`: **337 PASS / 既存対象外1 SKIP**。実backgroundのtoolbarハンドラーで、未許可CDNがある条件の作業ページ作成・再利用と、起動前の権限照会・要求・DOM probeがすべて0回であることを確認。起動の連打・別タブ・同期/非同期失敗後の再操作も確認。以前のprobe専用テストは削除した処理に合わせて置換。
+- `npm run check` / `git diff --check`: PASS。独立コード審査で今回範囲の未解決must-fixなし。
+- 隔離Chrome156.0.8078.80の `test:security`: **18項目PASS、pageerror 0**。未許可/拒否後の取得ゼロ、一覧からの配信元別許可と5枚の表示、既存許可/元ページアクセス/dataの自動表示、元形式保存、取得/形式失敗の再試行を回帰。起動時promptゼロは実backgroundのAPI境界回帰で確認し、このブラウザ試験の作業ページ直開きを実toolbar確認と扱わない。許可取消は既存の必須host grantを使うAPI境界fixture。
+
+結果: `/private/tmp/imagecrate-no-startup-permission-security/security-report.json`。通常利用中のChromeでの拡張再読み込み・実toolbar・添付サイトの本人操作感、今回のChrome116・実VoiceOverは未確認。実OS pickerの確認は今回の変更に含めない。
+
 ## 取得・形式失敗と許可待ちの説明 — 2026-11-02
 
 本人回答「上段の項目だけ」により、本文の必要WebPは表示済みと確認。HTTP400や未知/未対応を広告・非画像と断定せず、取得/形式/表示失敗にまで出ていた許可範囲の説明だけを修正した。
