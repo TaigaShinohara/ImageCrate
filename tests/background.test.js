@@ -149,6 +149,67 @@ async function browser(t, options = {}) {
   };
 }
 
+test('preview access uses only exact collected same-origin candidates without mutating session or starting transfers',async t=>{
+  const h=await browser(t),url='https://source.test/photo.png?candidate=one';
+  h.state.items=[{url},{url:'https://source.test/photo.png?candidate=two'}];
+  h.state.selectedURLs=['https://source.test/retained.png'];
+  h.state.selectedItems=[{url:h.state.selectedURLs[0]}];h.persist();
+  await h.send({type:'hello'});
+  const before=structuredClone(Object.fromEntries(h.store));
+  for(const candidate of [url,h.state.selectedURLs[0]]) {
+    const result=await h.send({type:'preview-access',url:candidate});
+    assert.equal(result.ok,true,result.error);assert.equal(result.data,true);
+  }
+  for(const candidate of ['https://source.test/uncollected.png','https://source.test/photo.png?candidate=three']) {
+    const result=await h.send({type:'preview-access',url:candidate});
+    assert.equal(result.ok,true,result.error);assert.equal(result.data,false);
+  }
+  assert.deepEqual(Object.fromEntries(h.store),before,'availability checks do not create consent or durable grants');
+  assert.equal(h.scriptCalls.length,0);assert.equal(h.requested.length,0);
+});
+
+test('preview access rejects cross-origin and unsupported collected URLs including credentials',async t=>{
+  const h=await browser(t);
+  const urls=['http://source.test/photo.png','https://source.test:444/photo.png','https://sub.source.test/photo.png',
+    'https://elsewhere.test/photo.png','https://user:password@source.test/photo.png','file:///photo.png',
+    'data:image/png;base64,AA==','not a URL'];
+  h.state.items=urls.map(url=>({url}));h.persist();await h.send({type:'hello'});
+  for(const url of urls) {
+    const result=await h.send({type:'preview-access',url});
+    assert.equal(result.ok,true,result.error);assert.equal(result.data,false,url);
+  }
+  assert.equal((await h.send({type:'preview-access',url:null})).data,false);
+});
+
+test('preview access requires the live current workspace instance and a valid source scan',async t=>{
+  const h=await browser(t),url='https://source.test/photo.png';h.state.items=[{url}];h.persist();
+  assert.equal((await h.send({type:'preview-access',url})).ok,false,'hello must establish the current instance');
+  await h.send({type:'hello'});
+  assert.equal((await h.send({type:'preview-access',url},200)).ok,false,'another tab cannot use the workspace');
+  assert.equal((await h.send({type:'preview-access',url,instance:'old-page'})).ok,false,'a reloaded page cannot reuse the old instance');
+  const live=structuredClone(h.store.get('workspace:work'));
+  for(const patch of [{scanned:false},{scan:{invalidated:true}},{closed:true}]) {
+    h.store.set('workspace:work',{...structuredClone(live),...patch});
+    const result=await h.send({type:'preview-access',url});
+    if(patch.closed)assert.equal(result.ok,false);else {assert.equal(result.ok,true,result.error);assert.equal(result.data,false);}
+  }
+});
+
+test('preview access stops on source loading, navigation, missing metadata or closure and resumes after a new scan',async t=>{
+  const h=await browser(t),url='https://source.test/photo.png';h.state.items=[{url}];h.persist();await h.send({type:'hello'});
+  for(const source of [{id:1,url:'https://source.test/',status:'loading'},
+    {id:1,url:'https://source.test/another-page'}, {id:1,url:'https://elsewhere.test/'}, {id:1}]) {
+    h.tabs.set(1,source);
+    const result=await h.send({type:'preview-access',url});assert.equal(result.ok,true,result.error);assert.equal(result.data,false);
+  }
+  h.tabs.delete(1);assert.equal((await h.send({type:'preview-access',url})).data,false);
+  h.tabs.set(1,{id:1,url:'https://source.test/',status:'complete'});
+  h.updated.emit(1,{status:'loading'},h.tabs.get(1));
+  assert.equal((await h.send({type:'preview-access',url})).data,false,'navigation events invalidate the old scan even after a URL returns');
+  h.scriptResults.push({items:[{url}],notices:[]});assert.equal((await h.send({type:'scan'})).ok,true);
+  assert.equal((await h.send({type:'preview-access',url})).data,true,'a fresh source scan restores availability');
+});
+
 test('worker startup rewrites legacy jobs and history without resetting operational state',async t=>{
   const h=await browser(t),url='https://source.test/photo?signature=synthetic';
   const legacy={...structuredClone(h.state),revision:19,selectionRevision:7,url:'https://source.test/page?fixture=1#section',title:'Synthetic source',

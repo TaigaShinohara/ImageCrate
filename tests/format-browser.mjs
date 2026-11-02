@@ -173,16 +173,14 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
     }}),{key,state:original,items});
     await reload();
     assert.equal(await manager.locator('.image-select:checked').count(),0,'format fixtures start unselected');
-    assert.equal(await manager.locator('.thumb img').count(),0,'reloaded format workspace requires fresh app preview consent');
-    await manager.locator('.card .preview-permission:visible').first().click();
     await manager.waitForFunction(()=>{const image=document.querySelector('.card .thumb img');return image?.complete&&image.naturalWidth===16&&image.src.startsWith('blob:');});
     const unsupported=manager.locator('.card').nth(5);await unsupported.scrollIntoViewIfNeeded();
     await manager.waitForFunction(()=>{const card=document.querySelectorAll('.card')[5];return /未知|未対応/.test(card?.querySelector('.preview-error')?.textContent||'');});
-    assert.equal(await unsupported.locator('img').count(),0,'unsupported AVIF container stays a placeholder after explicit preview consent');
+    assert.equal(await unsupported.locator('img').count(),0,'unsupported AVIF container stays a placeholder after automatic preview inspection');
     const generalSVGCard=manager.locator('.card').nth(6);await generalSVGCard.scrollIntoViewIfNeeded();
     await manager.waitForFunction(()=>{const card=document.querySelectorAll('.card')[6];return /未対応/.test(card?.querySelector('.preview-error')?.textContent||'');});
     assert.equal(await generalSVGCard.locator('img').count(),0,'general SVG outside the bounded rectangle language is never sent to an image element');
-    assert.equal(await manager.locator('.image-select:checked').count(),0,'preview consent keeps original-save selection independent');
+    assert.equal(await manager.locator('.image-select:checked').count(),0,'automatic previews keep original-save selection independent');
     await noTransientResources();
     await manager.locator('#destination-change').click();
     assert.deepEqual(await manager.locator('#output-format option').evaluateAll(options=>options.map(option=>option.value)),['original','jpg','png','webp'],'only supported original/JPEG/PNG/WebP output choices are exposed');
@@ -234,7 +232,9 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       near(image.top,[255,0,0,255],25,`${format}: EXIF 6 red band rotates to the top`);
       near(image.bottom,[0,0,0,255],25,`${format}: EXIF 6 opaque JPEG background rotates with pixels`);
     }
-    await reload();assert.equal(await manager.locator('.thumb img').count(),0,'reload clears embedded preview consent before later conversion URL ownership checks');await manager.locator('#destination-change').click();
+    await reload();await manager.locator('.card').first().scrollIntoViewIfNeeded();
+    await manager.waitForFunction(()=>{const image=document.querySelector('.card .thumb img');return image?.complete&&image.naturalWidth===16&&image.src.startsWith('blob:');});
+    await manager.locator('#destination-change').click();
     assert.equal(await manager.locator('#output-format').inputValue(),'webp','the selected output format survives workspace reload');
     await manager.locator('#settings-done').click();await manager.waitForFunction(()=>!document.querySelector('#save-settings').open);
     await settings({format:'png',folderName:'SVGラスタ'});await save(1);
@@ -312,8 +312,8 @@ export async function runFormatChecks({manager,worker,origin,downloadFolder}) {
       assert.equal(download.state,'complete');assert.ok(download.filename.startsWith(downloadFolder));
       assert.equal(download.mime,MIME[format],`${format}: Chrome sees the actual encoded MIME`);
       await manager.waitForFunction(url=>window.__qaFormatBlobURLs.some(entry=>entry.url===url && entry.revoked),download.url);
-      const blobURLs=await manager.evaluate(()=>window.__qaFormatBlobURLs);
-      assert.equal(blobURLs.length,1,`${format}: with preview consent unset, conversion creates only its owned download Blob URL`);
+      const blobURLs=await manager.evaluate(url=>window.__qaFormatBlobURLs.filter(entry=>entry.url===url),download.url);
+      assert.equal(blobURLs.length,1,`${format}: conversion owns exactly one URL for its accepted download, independently of automatic preview URLs`);
       assert.equal(blobURLs[0].type,MIME[format]);assert.equal(blobURLs[0].url,download.url);
       assert.equal(blobURLs[0].revoked,true,`${format}: the completed download releases its Blob URL`);
       const bytes=[...await readFile(download.filename)];assertMagic(bytes,format,`${format} actual Chrome download`);
