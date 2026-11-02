@@ -873,6 +873,36 @@ test('native download ID zero participates in observation, alarms and Stop exact
   assert.equal(stopped.data.batch.transferBudget.consumedBytes,11);assert.equal(state.jobs[0].downloadId,0);
 });
 
+test('toolbar opens and reuses a workspace without probing or requesting access to ungranted image hosts',async t=>{
+  const h=await browser(t),source={...h.tabs.get(1),status:'complete'};
+  h.store.delete('workspace:work');
+  const permissionQueries=[],permissionRequests=[],badges=[];
+  h.chrome.permissions={
+    getAll(callback){permissionQueries.push(true);callback({origins:[]});},
+    request(request,callback){permissionRequests.push(request);callback(false);},
+  };
+  h.chrome.scripting.executeScript=(request,callback)=>{
+    h.scriptCalls.push(request);
+    const result=[{frameId:0,documentId:'toolbar-source',result:{sourceURL:source.url,origins:['https://ungranted-cdn.test']}}];
+    callback?.(result);return Promise.resolve(result);
+  };
+  h.chrome.action.setBadgeText=async value=>{badges.push(value);};
+
+  h.chrome.action.onClicked.emit(source);
+  await eventually(()=>badges.length===1,'the toolbar opens a usable workspace without a permission response');
+  assert.equal(h.tabCreates.length,1);
+  const workspace=h.tabCreates[0];
+  assert.match(workspace.url,/^chrome-extension:\/\/test\/workspace\.html\?id=/);
+  assert.equal(h.tabs.get(workspace.id).active,true);
+
+  h.chrome.action.onClicked.emit(source);
+  await eventually(()=>badges.length===2,'a later toolbar click reuses the existing workspace');
+  assert.equal(h.tabCreates.length,1);
+  assert.deepEqual(permissionQueries,[],'startup does not inspect persistent grants');
+  assert.deepEqual(permissionRequests,[],'startup never asks for image host access');
+  assert.deepEqual(h.scriptCalls,[],'opening does not run a pre-workspace DOM probe');
+});
+
 test('closed active native batches still occupy the four-workspace limit while inactive cleanup tombstones do not',async t=>{
   const h=await browser(t);h.store.delete('workspace:work');
   for(let index=0;index<4;index++)h.store.set(`workspace:busy-${index}`,{id:`busy-${index}`,closed:true,items:[],notices:[],
