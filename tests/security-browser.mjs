@@ -69,6 +69,8 @@ const server=createServer((request,response)=>{
     const expectedCookie=hostname==='127.0.0.1'?'imagecrate_qa_scope_a=synthetic-a-only':'imagecrate_qa_scope_b=synthetic-b-only';
     requestObservations.push({host:hostname,path,syntheticCookieReceived:Boolean(request.headers.cookie?.split(';').some(part=>part.trim()===expectedCookie)),refererPresent:Boolean(request.headers.referer)});
     if(path==='/assets/fail-once.svg'&&hits(hostname,path)===1){response.statusCode=503;return response.end('synthetic first request failure');}
+    if(path==='/assets/bad-request.bin'){response.statusCode=400;return response.end('synthetic 400 response');}
+    if(path==='/assets/unrecognized.bin'){response.setHeader('Content-Type','application/octet-stream');return response.end('synthetic unrecognized bytes');}
     if(path==='/assets/redirect'){
       response.writeHead(302,{Location:otherOrigin+'/assets/redirect-target.svg'});return response.end();
     }
@@ -92,7 +94,7 @@ const server=createServer((request,response)=>{
   if(path==='/cdn')return response.end(documentFor(Array.from({length:5},(_,index)=>otherOrigin+`/assets/cdn-${index}.svg`)));
   if(path==='/data')return response.end(documentFor([dataURL]));
   if(path==='/queue'||path==='/close')return response.end(documentFor(Array.from({length:6},(_,index)=>origin+`/assets/held.svg?case=${path.slice(1)}&i=${index}`)));
-  const resource=({'/refused':'refused.svg','/active-tab':'active-tab.svg','/retry':'fail-once.svg','/cache':'cache.svg','/redirect':'redirect','/stream':'stream.png','/declared':'declared.png','/huge':'huge.png'})[path];
+  const resource=({'/refused':'refused.svg','/active-tab':'active-tab.svg','/retry':'fail-once.svg','/bad-request':'bad-request.bin','/unrecognized':'unrecognized.bin','/cache':'cache.svg','/redirect':'redirect','/stream':'stream.png','/declared':'declared.png','/huge':'huge.png'})[path];
   response.end(documentFor(resource?[origin+'/assets/'+resource]:[]));
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -301,10 +303,27 @@ try{
   const retryBefore=hits('127.0.0.1','/assets/fail-once.svg'),retried=await opened('/retry');
   await retried.waitForFunction(()=>document.querySelector('.preview-error')?.textContent.includes('取得'));
   const retryButton=retried.locator('.preview-permission');await retryButton.waitFor({state:'visible'});assert.equal(await retryButton.innerText(),'再試行');
+  assert.equal(await retried.locator('.preview-details').isVisible(),false,'HTTP errors do not display host permission scope');
+  assert.equal(await retryButton.getAttribute('aria-describedby'),null,'hidden permission scope is not retained as the retry description');
+  assert.doesNotMatch(await retryButton.getAttribute('title'),/全パス|全ポート|サイトの許可/);
   assert.deepEqual((await qa(retried)).requests,[],'a failed permitted preview never requests host access');
   await retryButton.click();await retried.waitForFunction(()=>{const image=document.querySelector('.thumb img');return image?.complete&&image.naturalWidth>0;});
   assert.equal(hits('127.0.0.1','/assets/fail-once.svg'),retryBefore+2);assert.deepEqual((await qa(retried)).requests,[],'retry reuses existing access without a permission prompt');
   checked('a failed automatic preview can retry with existing access and no new Chrome permission request');await retried.close();
+
+  for(const [path,pattern]of [['/bad-request',/HTTP 400/],['/unrecognized',/未知・未対応/]]){
+    const failed=await opened(path);await failed.waitForFunction(pattern=>new RegExp(pattern).test(document.querySelector('.preview-error')?.textContent||''),pattern.source);
+    const retry=failed.locator('.preview-permission');await retry.waitFor({state:'visible'});assert.equal(await retry.innerText(),'再試行');assert.equal(await retry.isEnabled(),true);
+    assert.equal(await failed.locator('.preview-details').isVisible(),false);assert.equal(await retry.getAttribute('aria-describedby'),null);assert.doesNotMatch(await retry.getAttribute('title'),/全パス|全ポート|サイトの許可/);
+    assert.equal(await failed.locator('.card').count(),1,'a failed candidate is retained rather than classified as advertising or removed');
+    assert.deepEqual((await qa(failed)).requests,[]);assert.equal((await qa(failed)).workersCreated,0);
+    await failed.locator('.image-select').check();assert.equal(await failed.locator('.image-select').isChecked(),true);
+    if(path==='/unrecognized'){
+      assert.match(await failed.locator('.preview-error').innerText(),/保存を試せます/);
+      await failed.screenshot({path:join(output,'unrecognized-preview.png')});
+    }
+    checked(`${path}: retrieval/format failures retain selection and retry without permission guidance or new host requests`);await failed.close();
+  }
 
   const targetBefore=hits('localhost','/assets/redirect-target.svg'),redirected=await opened('/redirect');
   await redirected.waitForFunction(()=>/取得できません|取得に失敗|Failed to fetch/.test(document.querySelector('.preview-error')?.textContent||''));

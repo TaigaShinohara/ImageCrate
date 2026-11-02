@@ -1,5 +1,15 @@
 # QA — v0.1
 
+## 取得・形式失敗と許可待ちの説明 — 2026-11-02
+
+本人回答「上段の項目だけ」により、本文の必要WebPは表示済みと確認。HTTP400や未知/未対応を広告・非画像と断定せず、取得/形式/表示失敗にまで出ていた許可範囲の説明だけを修正した。
+
+- `npm test`: **343 PASS / 既存対象外1 SKIP**。`npm run check` / `git diff --check`: PASS。
+- 隔離Chrome156.0.8078.80の `test:security`: **18項目PASS、pageerror 0**。合成HTTP400/503・未知containerで、許可説明非表示、aria-describedby除去、hover titleに許可範囲なし、再試行可能、候補/選択保持、新しい権限要求ゼロを確認。503は実再試行で成功。未許可側は既存fixtureで説明・参照・titleの復帰を確認し、CDN5枚一括表示・取消・資源上限の既存回帰も通過。
+- 「元形式で保存できます」は形式検査/画像表示失敗の文脈で「保存を試せます」へ修正し、保存成功を保証しない。独立設計/コード審査でUX-MIX-01（hidden説明のaria/title残存）を解消、対象範囲の新規must-fixなし。取得/decoder/候補分類/保存処理は変更していない。
+
+結果: `/private/tmp/imagecrate-error-guidance-security/security-report.json` と `unrecognized-preview.png`。主担当が合成の失敗画面を目視。実サイトの広告配信元へテスト通信していない。HTTP400・形式未対応そのものを直した結果ではなく、状態の伝え方の修正。今回のChrome116・実VoiceOver・本人の修正後の理解/操作感は未確認。
+
 ## 別配信元CDNの初回プレビュー — 2026-11-02
 
 本人の新規CDN5枚の許可待ち報告を起点に、拡張起動時の具体配信元の一括要求と、一覧上部の配信元別許可操作を追加。前節のsame-origin成功を新規CDNの成功へ流用しない。

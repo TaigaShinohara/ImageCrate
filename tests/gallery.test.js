@@ -195,7 +195,7 @@ test('render publishes the rebuilt selected list after cards and preview control
   const makeNode=tag=>({
     tagName:tag.toUpperCase(),children:[],dataset:{},attributes:{},className:'',hidden:false,disabled:false,value:'',
     append(...children){this.children.push(...children);},replaceChildren(...children){this.children=[...children];},
-    setAttribute(name,value){this.attributes[name]=String(value);},addEventListener(){},closest(){return null;},
+    setAttribute(name,value){this.attributes[name]=String(value);},removeAttribute(name){delete this.attributes[name];},addEventListener(){},closest(){return null;},
     focus(){globalThis.document.activeElement=this;},scrollIntoView(){},
   });
   const descendants=function*(node){for(const child of node.children){yield child;yield* descendants(child);}};
