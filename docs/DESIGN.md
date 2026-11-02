@@ -1,5 +1,17 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## 別配信元CDNの初回プレビュー — 2026-11-02
+
+初期ONの追試で、同じCDNの画像5枚が追加許可待ちになるという本人報告を受けた。前節の成功は既存許可・同一origin・dataに限定され、新規CDNで手動操作が残る点を解消していなかった。今回の対象は、元ページと異なる配信元を含む初回の表示開始と、その許可導線。
+
+拡張アイコンを押した操作から、小さなstateless probeでHTML imgのcurrentSrc/src/遅延属性の具体originを調べ、既存許可と元ページのexact originを除いた配信元をChromeへ1回で要求する。元ページのURL確認にbaseURIを使わず、候補URL解決だけに使う。Chrome116ではPromise継続へgestureが伝わらないため、actionから直接発行したexecuteScript/getAllのnative callback内で要求し、その後に作業ページを開く。全サイト常時host権限や直接の遠隔Image表示は追加しない。初回のChrome確認自体は省略しない。
+
+probeはcollectのregistry/cursor/observerへ触れず、取得/codecも行わない。最大12000要素・500 URL試行・128 origin・131072文字・25ms目標、同一tab1件・worker内4件の軽量別枠とする。5秒待ちでUIへ戻しても未settle枠をcallback終端/元tab閉鎖まで保持する。worker再起動をまたぐブラウザ内未着手probeの厳密上限は保証しない。既存fullscanの永続flight・予算・画像取得上限は変えない。この限定した読み取りを、gestureを消す非同期予約の前置きが必要な本収集とは分ける。
+
+拒否・API失敗・probe対象外のCSS/srcset/frameや後から発見したCDNは、一覧上部に配信元ごとの1つの許可操作を示す。確認できた未許可URLだけを集約し、無関係の配信元まで要求しない。再描画/scroll/reloadで自動再要求せず、許可後に同じ配信元の画像をまとめて表示する。保存・選択・変換は既存のまま。
+
+通常変更として主担当がtoolbar/probeを設計し、独立担当 `cdn_permission_design` が目的/周辺、gesture・scope・期限・失効・失敗復帰の条件を審査。Chrome116の実toolbarで1-hop callbackのnative許可とgrant成功を先に確認した。条件を反映したv1の実装開始に未解決設計must-fixなし。主担当ディレクターが実装開始を承認し、galleryの集約操作は別担当が具体化。最終合否はCDN5枚の初回prompt1→自動5枚・次回prompt0、拒否・古い結果/重複・保存回帰と独立コード審査で確認する。本人の実サイトでの結果は別に扱う。
+
 ## プレビューの初期ON — 2026-11-02
 
 本人の「プレビューは基本最初からオンでいいよ」を現行仕様として、下の作業ページごとの同意契約を更新する。画像を開いて見比べる最初の行為から、毎回の表示操作を除く。既存Chrome許可・元ページの一時activeTab・埋め込みdata画像で可視画像を自動表示し、追加許可が必要な配信元にだけ操作を残す。全サイトの常時host許可や自動permissions.requestは追加しない。

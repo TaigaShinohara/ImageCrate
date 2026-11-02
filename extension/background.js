@@ -1,4 +1,5 @@
 import { collect } from './collector.js';
+import { createPreviewStartup } from './preview-startup.js';
 import { allowedURL, mediaType, mergeItems, downloadName, summarizeJobs, publicError, saveSettings, requiresWorkspace, isDetectedImageFormat } from './utils.js';
 import { pruneDirectories } from './directory-store.js';
 import { extensionForMime } from './image-format.js';
@@ -186,12 +187,11 @@ export async function openWorkspace(tab) {
     return id;
   });
 }
-chrome.action.onClicked.addListener(tab => {
-  openWorkspace(tab).then(() => chrome.action.setBadgeText({text:''})).catch(async error => {
+const previewStartup=createPreviewStartup({onOpen:tab=>openWorkspace(tab).then(()=>chrome.action.setBadgeText({text:''})),onError:async error=>{
     await chrome.action.setBadgeText({text:'!'});
     await chrome.action.setTitle({title:publicError(error)});
-  });
-});
+}});
+chrome.action.onClicked.addListener(tab=>previewStartup.open(tab));
 
 const sourceFlights = async () => (await chrome.storage.session.get(SOURCE_FLIGHTS_KEY))[SOURCE_FLIGHTS_KEY] || {};
 async function releaseSourceFlight(request) {

@@ -16,6 +16,10 @@
 
 2026-11-02の本人指定で作業ページごとの再同意を廃止しました。Chromeに既存の配信元許可があれば、新しい作業ページでも自動取得します。埋め込みdata画像も自動で端末内処理します。追加許可が必要な場合は、取得先のscheme・hostname・portと範囲を表示してから実click内で要求します。Chromeのhost許可は、同じscheme・ホストの**全パス・ポート**に及びます。URLごと・ポートごとだけの許可ではありません。
 
+別originのCDNでカードの許可待ちが残る本人追試を受け、拡張アイコンの操作から初回の具体配信元をまとめて要求する。HTML imgのcurrentSrc/src/遅延属性を調べるstateless probeと、既存許可のgetAllをactionから直接callback形式で呼ぶ。source URLの完全一致、HTTP(S)、認証情報とwildcardなし、最大128具体originをworker側でも再検査し、元ページのexact originと既存許可を除く。Chrome116のgestureはnative callback内で使い、Promise/await継続から要求しない。通常の表示更新からの自動再要求や全サイト常時権限は追加しない。
+
+この軽量probeはcollectの永続flight・registry/cursorから独立し、最大12000要素・500 URL試行・131072文字・128 origin・25ms目標。同じtab1件・worker内4件、5秒経過後も未settle枠はcallback終端/元tab閉鎖まで保持する。navigation/close/timeout/既存permission dialog中の遅延結果から新しい許可要求を出さない。worker再起動をまたぐブラウザ内未着手probeの厳密数は保証しない。CSS/srcset/frame等から後で見つかる配信元は一覧上部のhost別操作から許可する。本収集・画像取得・codecの資源上限は不変。
+
 activeTab由来の一時アクセスは`permissions.contains()`と別に確認します。Chrome116では[通常の許可照会](https://raw.githubusercontent.com/chromium/chromium/116.0.5845.96/chrome/browser/extensions/api/permissions/permissions_api.cc)と[tab固有の一時許可](https://raw.githubusercontent.com/chromium/chromium/116.0.5845.96/chrome/browser/extensions/active_tab_permission_granter.cc)が分かれています。workerは現在のworkspace instance、正確な収集済み候補、有効なscan、HTTP(S)・認証情報を含まないURL、元ページとの同一origin、生存する元ページのURL一致・非loadingを検証します。fetch/cache/生成後にも同じ利用可否を再確認し、実際の取得権限はChromeが適用します。元ページの移動・閉鎖で旧プレビューを失効させます。Chromeの配信元許可取消では即時に生成画像/cache/処理中jobを失効させ、取消対象の配信元を一時アクセスへ切り替えて再取得しません。再許可はblocked previewの自動復帰に使います。
 
 プレビュー、変換、選択フォルダへの取得は次の方針を共通で使います。

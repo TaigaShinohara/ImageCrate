@@ -94,6 +94,15 @@ body[data-loading="true"] #scan .icon { animation: spin 1.4s linear infinite; }
 .selection-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin-left: auto; }
 .selection-tools > button { padding: 8px 10px; font-size: 12px; }
 .selection-tools .icon { width: 17px; height: 17px; }
+.preview-access { margin-bottom: 18px; padding: 16px; border: 1px solid #bcb5ed; border-radius: 12px; background: #f5f3ff; }
+.preview-access h3 { font-size: 15px; }
+.preview-access-intro { margin-top: 5px; color: var(--muted); font-size: 12px; }
+.preview-access-origins { display: grid; gap: 12px; margin-top: 12px; }
+.preview-access-item { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.preview-access-info { flex: 1 1 280px; min-width: 0; overflow-wrap: anywhere; }
+.preview-access-source { font-size: 13px; font-weight: 600; }
+.preview-access-scope, .preview-access-message { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.preview-access-grant { max-width: 100%; color: var(--accent); white-space: normal; overflow-wrap: anywhere; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 16px; }
 .card { position: relative; display: flex; flex-direction: column; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); cursor: pointer; transition: border-color 150ms, box-shadow 150ms; }
 .card:hover { border-color: #b5adE6; box-shadow: 0 4px 16px #282a480b; }

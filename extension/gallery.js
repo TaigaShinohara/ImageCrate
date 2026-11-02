@@ -29,6 +29,7 @@ export class Gallery {
     Object.assign(this,{getState,getSelected,onSelect,onView,onMeasure,onRender,onError,status,previews});
     this.visible=[];this.measured=new Map();this.mode='all';this.lastURL='';this.viewerURLs=[];this.viewerIndex=0;
     this.previewBindings=new Set();this.previewSequence=0;
+    this.permissionURLs=new Map();this.permissionRows=new Map();this.permissionRequests=new Set();this.permissionMessages=new Map();
     this.previewObserver=typeof IntersectionObserver==='function'?new IntersectionObserver(entries=>{
       for(const entry of entries){const binding=[...this.previewBindings].find(value=>value.container===entry.target);if(!binding)continue;
         binding.visible=entry.isIntersecting;if(binding.visible)this.loadPreview(binding);else this.cancelPreview(binding);
@@ -93,11 +94,72 @@ export class Gallery {
   }
   showPreviewConsent(binding,show){
     if(binding.button){
-      binding.button.hidden=!show;binding.button.disabled=!binding.host||!this.previews||binding.requesting||binding.pending;
+      binding.button.hidden=!show;binding.button.disabled=!binding.host||!this.previews||binding.requesting||binding.pending||this.previewsPaused||binding.needsPermission&&this.permissionRequests.has(binding.host.key);
       binding.button.children[0].textContent=!binding.host?'プレビュー非対応':binding.needsPermission?'アクセスを許可して表示':'再試行';
       binding.button.setAttribute('aria-label',binding.host?`${binding.host.label} のプレビュー${binding.needsPermission?'へのアクセスを許可して表示':'を再試行'}`:'この画像はプレビューできません');
     }
     if(binding.details)binding.details.hidden=!show||!binding.host;
+  }
+  updatePermissionSummary(){
+    const panel=$('preview-access'),list=$('preview-access-origins');if(!panel||!list||!this.permissionURLs)return;
+    const retained=new Set(candidateCatalog(this.getState()).map(item=>item.url)),groups=new Map();
+    for(const [url,host]of this.permissionURLs){
+      if(!retained.has(url)){this.permissionURLs.delete(url);continue;}
+      let group=groups.get(host.key);if(!group){group={host,url,origins:new Set(),count:0};groups.set(host.key,group);}
+      group.origins.add(previewHost(url).label);group.count++;
+    }
+    for(const [key,row]of this.permissionRows)if(!groups.has(key)){
+      if(row.element.contains(document.activeElement))$('gallery-heading').focus({preventScroll:true});
+      row.element.remove();this.permissionRows.delete(key);this.permissionMessages.delete(key);
+    }
+    for(const [key,group]of groups){
+      let row=this.permissionRows.get(key);
+      if(!row){
+        const element=node('div','preview-access-item'),info=node('div','preview-access-info');element.dataset.host=key;
+        const source=node('p','preview-access-source'),scope=node('p','preview-access-scope'),message=node('p','preview-access-message');
+        scope.id=`preview-access-scope-${++this.previewSequence}`;message.setAttribute('role','status');
+        scope.textContent='この配信元の全パス・全ポートへのアクセスが対象です。サイトのログイン状態を使って画像を取得します。';
+        const button=node('button','secondary preview-access-grant','この配信元の画像を表示');button.type='button';button.dataset.host=key;
+        button.setAttribute('aria-describedby',scope.id);info.append(source,scope,message);element.append(info,button);list.append(element);
+        row={element,source,message,button};this.permissionRows.set(key,row);
+      }
+      const origins=[...group.origins].join('、');
+      row.source.textContent=`配信元: ${origins}（プレビュー待ち${group.count}件）`;
+      row.button.setAttribute('aria-label',`${origins} の画像を表示`);
+      row.button.disabled=this.previewsPaused||this.busy||this.permissionRequests.has(key);
+      row.button.onclick=()=>{void this.requestHostPreviews(group.url,row.button);};
+      const message=this.permissionRequests.has(key)?'Chromeのアクセス許可を確認しています…':this.permissionMessages.get(key)||'';
+      if(row.message.textContent!==message)row.message.textContent=message;
+      row.message.hidden=!message;
+    }
+    panel.hidden=this.previewsPaused||groups.size===0;
+  }
+  requestHostPreviews(url,button){
+    const host=previewHost(url);if(this.previewsPaused||this.permissionRequests.has(host.key))return Promise.resolve(false);
+    this.permissionRequests.add(host.key);this.permissionMessages.delete(host.key);
+    // Keep the native permission request in the real click, before any await.
+    let permission;try{permission=this.previews.grantHost(url);}catch(error){permission=Promise.reject(error);}
+    if(document.activeElement===button){
+      const target=button.closest('.card')?.querySelector('.image-select:not(:disabled)')
+        ||(button.closest('#preview-stage')?(!$('preview-select').disabled?$('preview-select'):$('preview-close')):$('gallery-heading'));
+      target.focus({preventScroll:true});
+    }
+    this.updatePermissionSummary();
+    for(const binding of this.previewBindings)if(binding.host?.key===host.key)this.showPreviewConsent(binding,!binding.handle&&!binding.pending);
+    return Promise.resolve(permission).then(allowed=>{
+      if(!allowed){this.permissionMessages.set(host.key,'許可されませんでした。もう一度試すか、元の形式で保存できます。');return false;}
+      for(const [candidateURL,candidateHost]of this.permissionURLs)if(candidateHost.key===host.key)this.permissionURLs.delete(candidateURL);
+      this.permissionMessages.delete(host.key);
+      for(const binding of this.previewBindings)if(binding.host?.key===host.key){
+        binding.needsPermission=false;
+        if(binding.visible){this.cancelPreview(binding);this.loadPreview(binding);}
+      }
+      return true;
+    },()=>{this.permissionMessages.set(host.key,'アクセス許可を確認できませんでした。もう一度試せます。');return false;})
+      .finally(()=>{
+        this.permissionRequests.delete(host.key);this.updatePermissionSummary();
+        for(const binding of this.previewBindings)if(binding.host?.key===host.key)this.showPreviewConsent(binding,!binding.handle&&!binding.pending);
+      });
   }
   clearPreviews(kind){
     for(const binding of [...this.previewBindings])if(!kind || binding.kind===kind){
@@ -107,7 +169,7 @@ export class Gallery {
   refreshPreviews(){
     for(const binding of this.previewBindings){this.cancelPreview(binding);if(binding.visible)this.loadPreview(binding);}
   }
-  suspendPreviews(){this.previewsPaused=true;this.clearPreviews();this.previews?.invalidate();}
+  suspendPreviews(){this.previewsPaused=true;this.clearPreviews();this.previews?.invalidate();this.updatePermissionSummary();}
   resumePreviews(){
     this.previewsPaused=false;this.render();
     if($('image-preview').open&&this.viewerURL)this.showViewer(this.viewerURL);
@@ -129,8 +191,8 @@ export class Gallery {
       this.showPreviewConsent(binding,!host);
       button.onclick=event=>{
         event.preventDefault();event.stopPropagation();
-        // permissions.request must run in this real click, before any await.
-        const permission=binding.needsPermission?this.previews?.grantHost(item.url):this.previews?.retry(item.url);
+        if(binding.needsPermission){void this.requestHostPreviews(item.url,button);return;}
+        const permission=this.previews?.retry(item.url);
         if(document.activeElement===button){
           const target=kind==='viewer'?(!$('preview-select').disabled?$('preview-select'):$('preview-close'))
             :button.closest('.card')?.querySelector('.image-select:not(:disabled), .preview-open:not(:disabled)')||$('gallery-heading');
@@ -154,7 +216,7 @@ export class Gallery {
     this.showPreviewConsent(binding,false);binding.container.replaceChildren(node('span','preview-error','プレビューを読み込み中…'));
     this.previews.load(binding.item.url,{kind:binding.kind,signal:controller.signal}).then(handle=>{
       if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding) || binding.container.isConnected===false){handle.release();return;}
-      binding.handle=handle;binding.needsPermission=false;
+      binding.handle=handle;binding.needsPermission=false;this.permissionURLs.delete(binding.item.url);this.updatePermissionSummary();
       const image=new Image();image.alt=binding.kind==='viewer'?((binding.item.alt||'').trim()||fileLabel(binding.item.url)):'';
       image.referrerPolicy='no-referrer';
       image.onerror=()=>{if(binding.handle===handle){handle.release();binding.handle=null;binding.container.replaceChildren(node('span','preview-error','プレビューを表示できません。元形式の保存はできます。'));this.showPreviewConsent(binding,true);}};
@@ -166,7 +228,8 @@ export class Gallery {
       if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding))return;
       binding.container.replaceChildren(node('span','preview-error',publicError(error)));
       binding.needsPermission=error?.code==='PREVIEW_PERMISSION_REQUIRED';
-      this.showPreviewConsent(binding,true);
+      if(binding.needsPermission)this.permissionURLs.set(binding.item.url,binding.host);else this.permissionURLs.delete(binding.item.url);
+      this.updatePermissionSummary();this.showPreviewConsent(binding,true);
     }).finally(()=>{if(generation===binding.generation){binding.pending=false;this.showPreviewConsent(binding,!binding.handle);}});
   }
   item(url) {return candidateCatalog(this.getState()).find(i=>i.url===url);}
@@ -191,7 +254,7 @@ export class Gallery {
   setBusy(busy=false) {
     this.busy=busy;
     for(const input of document.querySelectorAll('.image-select'))input.disabled=busy;
-    $('preview-select').disabled=busy;
+    $('preview-select').disabled=busy;this.updatePermissionSummary();
   }
   focusSave() {($('save').disabled?$('save-heading'):$('save')).focus();}
   restoreFocus(url,role='select',index=0) {
