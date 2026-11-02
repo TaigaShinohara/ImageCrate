@@ -1,5 +1,13 @@
 # QA — v0.1
 
+## Liquid Glassアイコン — 2026-11-02
+
+- 内蔵画像生成ツールで原本を作成し、1024pxと16／32／48／64／128pxのRGBA PNGを書き出した。manifestの拡張・actionアイコン、作業画面のヘッダー、faviconへローカル画像を設定。権限・CSP・外部通信の変更なし。
+- 最新main（起動時の追加許可要求削除を含む）で`npm test`: 337 PASS / 1既存対象外SKIP。`npm run check` / `git diff --check`: PASS。
+- 隔離Chrome 156.0.8078.80で正本manifestのコピーを読込。manifestの参照、ヘッダー38 CSS px／原画像128px、16／32px faviconの実decode、1280／360px幅の横overflowなし、pageerror 0、CSP違反0を確認した。作業画面はsessionなしで直接開いたため、既存の「作業情報が見つかりません」状態での表示確認。
+- 明暗背景の16／32／48／64／128px比較と360px画面を主担当が目視。独立担当がローカル参照・寸法・装飾画像の空alt・権限不変を点検し、修正必須の指摘なし。結果と画面は `/private/tmp/imagecrate-icon-qa/`。
+- 通常Chromeへの再読み込み、実toolbarでの見え方と本人の採否は未確認。既存の保存処理やOS pickerの実操作をこの検証で確認したとは扱わない。
+
 ## 起動時の追加許可を自動要求しない — 2026-11-02
 
 本人の依頼に合わせ、下のCDN初回プレビューで追加した起動前probeと一括許可要求を削除。拡張アイコンから作業ページを直接開き、未許可画像は既存の明示的な表示操作から許可する。保存時に必要な配信元許可とmanifestは変更していない。
@@ -9,6 +17,7 @@
 - 隔離Chrome156.0.8078.80の `test:security`: **18項目PASS、pageerror 0**。未許可/拒否後の取得ゼロ、一覧からの配信元別許可と5枚の表示、既存許可/元ページアクセス/dataの自動表示、元形式保存、取得/形式失敗の再試行を回帰。起動時promptゼロは実backgroundのAPI境界回帰で確認し、このブラウザ試験の作業ページ直開きを実toolbar確認と扱わない。許可取消は既存の必須host grantを使うAPI境界fixture。
 
 結果: `/private/tmp/imagecrate-no-startup-permission-security/security-report.json`。通常利用中のChromeでの拡張再読み込み・実toolbar・添付サイトの本人操作感、今回のChrome116・実VoiceOverは未確認。実OS pickerの確認は今回の変更に含めない。
+
 
 ## 取得・形式失敗と許可待ちの説明 — 2026-11-02
 
