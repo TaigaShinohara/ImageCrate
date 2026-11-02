@@ -119,8 +119,6 @@ try {
     manager.__previewRequests=[];manager.on('request',request=>{if(request.url().startsWith(origin))manager.__previewRequests.push(request.url());});
     await manager.waitForLoadState('domcontentloaded');
     await manager.waitForFunction(() => document.querySelector('#message')?.textContent.includes('候補を取得'));
-    assert.equal(await manager.locator('.thumb img').count(),0,'each new workspace requires its own app preview consent');
-    assert.deepEqual(manager.__previewRequests,[],'existing Chrome host permission does not permit a new workspace to fetch previews automatically');
     return manager;
   };
   const stateFor = manager => worker.evaluate(async url => {
@@ -207,8 +205,16 @@ try {
   checked('DOM mutation invalidates continuation while preserving the old page and selection');
   await pagedManager.close();
 
-  // Advertising heuristics remain reversible and operate before any media
-  // request. Verified preview metadata is applied only on explicit refresh.
+  // Hold only synthetic ad-preview fetch responses so source-only heuristic
+  // decisions can be checked before automatic preview inspection completes.
+  let releaseAdPreviews;const adPreviewGate=new Promise(resolve=>{releaseAdPreviews=resolve;});
+  let adPreviewsHeld=true;
+  const holdAdPreviews=async route=>{
+    if(route.request().resourceType()==='fetch'&&adPreviewsHeld)await adPreviewGate;
+    try{await route.continue();}catch(error){if(!/already handled|closed|canceled|Invalid InterceptionId/i.test(error.message))throw error;}
+  };
+  await context.route(url=>url.origin===origin&&url.pathname.startsWith('/ad-'),holdAdPreviews);
+  report.limits.push('Synthetic advertising-preview responses are temporarily held at the route boundary to test source-only heuristic decisions before automatic inspection.');
   await source.goto(`${origin}/ad-filter`);
   await source.waitForFunction(() => [...document.images].filter(image => image.currentSrc).every(image => image.complete && image.naturalWidth));
   const adManager = await openWorkspace(source);
@@ -228,7 +234,7 @@ try {
   assert.equal(await adManager.locator('#filter-count').textContent(), '1');
   assert.match(await adManager.locator('#selection').textContent(), /非表示2件/);
   assert.match(await adManager.locator('#selection-hint').textContent(), /非表示の画像も保存/);
-  assert.deepEqual(adManager.__previewRequests, [], 'turning on the heuristic never fetches images');
+  assert.equal((await stateFor(adManager)).items.some(item=>item.detectedFormat),false,'source-only heuristic decisions do not depend on completed automatic previews');
   await adManager.locator('#view-selected').click();
   assert.equal(await adManager.locator('.card').count(), 2, 'selected view exposes both excluded selections');
   await waitState(adManager, { 'ui.view': 'selected', 'ui.excludeAdLike': true });
@@ -244,7 +250,7 @@ try {
   await freshAdManager.close(); await freshAdSource.close();
   checked('advertising heuristic toggles with Space, groups one chip, retains hidden selections and restores only the current workspace');
 
-  await adCard('ad-disguised.gif').locator('.preview-permission').click();
+  adPreviewsHeld=false;releaseAdPreviews();
   await pollSession(adManager, state => state.items.some(item => item.url.endsWith('/ad-disguised.gif') && item.detectedFormat === 'png'));
   await adManager.locator('#view-all').click();
   assert.equal(await adCard('ad-disguised.gif').count(), 1, 'verified PNG overrides the GIF URL hint');
@@ -300,7 +306,8 @@ try {
   await manager.locator('#width').fill('1000');
   assert.equal(await manager.locator(`.card[data-url="${origin}/held-high.svg"]`).count(), 1, 'unknown dimensions remain visible under a minimum width');
   assert.equal(await manager.locator('#dimension-note').isVisible(), true);
-  await manager.locator(`.card[data-url="${origin}/held-high.svg"] .preview-permission`).click();
+  await manager.waitForFunction(()=>document.querySelector('.thumb img')?.src.startsWith('blob:'));
+  assert.ok(manager.__previewRequests.length>0,'permitted visible images load automatically in a new workspace');
   releaseHigh = true;
   for (const response of held) response.end(svg(1800, 1200));
   held.clear();
@@ -604,8 +611,7 @@ try {
   assert.equal(await manager.locator('#grid').getAttribute('aria-busy'), 'false');
   checked('native selection controls retain names, dimensions/status descriptions and labeled dialogs');
 
-  assert.equal(await manager.locator('.thumb img').count(),0,'workspace reload does not restore app preview consent');
-  await manager.locator('.card .preview-permission:visible').first().click();
+  await manager.locator('.card').first().scrollIntoViewIfNeeded();
   await manager.waitForFunction(()=>{const image=document.querySelector('.thumb img');return image?.complete&&image.src.startsWith('blob:');});
 
   // Geometry is objective coverage. Screenshots are retained for separate visual review.

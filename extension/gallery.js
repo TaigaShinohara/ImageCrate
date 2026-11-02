@@ -88,11 +88,15 @@ export class Gallery {
   cancelPreview(binding){
     binding.generation++;binding.controller?.abort();binding.controller=null;binding.pending=false;
     binding.handle?.release();binding.handle=null;
-    binding.container.replaceChildren(node('span','preview-error','下のボタンでプレビューを表示できます'));
-    this.showPreviewConsent(binding,true);
+    binding.container.replaceChildren(node('span','preview-error',binding.host?'プレビューを読み込みます…':'この画像はプレビューに対応していません。'));
+    this.showPreviewConsent(binding,false);
   }
   showPreviewConsent(binding,show){
-    if(binding.button){binding.button.hidden=!show;binding.button.disabled=!binding.host||!this.previews||binding.requesting||binding.pending;}
+    if(binding.button){
+      binding.button.hidden=!show;binding.button.disabled=!binding.host||!this.previews||binding.requesting||binding.pending;
+      binding.button.children[0].textContent=!binding.host?'プレビュー非対応':binding.needsPermission?'アクセスを許可して表示':'再試行';
+      binding.button.setAttribute('aria-label',binding.host?`${binding.host.label} のプレビュー${binding.needsPermission?'へのアクセスを許可して表示':'を再試行'}`:'この画像はプレビューできません');
+    }
     if(binding.details)binding.details.hidden=!show||!binding.host;
   }
   clearPreviews(kind){
@@ -103,14 +107,18 @@ export class Gallery {
   refreshPreviews(){
     for(const binding of this.previewBindings){this.cancelPreview(binding);if(binding.visible)this.loadPreview(binding);}
   }
-  suspendPreviews(){this.clearPreviews();this.previews?.invalidate();}
+  suspendPreviews(){this.previewsPaused=true;this.clearPreviews();this.previews?.invalidate();}
+  resumePreviews(){
+    this.previewsPaused=false;this.render();
+    if($('image-preview').open&&this.viewerURL)this.showViewer(this.viewerURL);
+  }
   bindPreview(item,container,kind,button,details){
     let host;try{host=previewHost(item.url);}catch{}
-    const binding={item,container,kind,button,details,host,visible:kind==='viewer'||!this.previewObserver,generation:0,pending:false,requesting:false,handle:null,controller:null};
-    this.previewBindings.add(binding);container.replaceChildren(node('span','preview-error','下のボタンでプレビューを表示できます'));
+    const binding={item,container,kind,button,details,host,visible:kind==='viewer'||!this.previewObserver,generation:0,pending:false,requesting:false,needsPermission:false,handle:null,controller:null};
+    this.previewBindings.add(binding);container.replaceChildren(node('span','preview-error',host?'プレビューを読み込みます…':'この画像はプレビューに対応していません。'));
     if(button){
-      button.replaceChildren(node('span','',host?'プレビューを表示':'プレビュー非対応'));
-      button.setAttribute('aria-label',host?.isEmbedded?'埋め込み画像のプレビューを表示':host?`${host.label} のプレビューを表示`:'この画像はプレビューできません');
+      button.replaceChildren(node('span','',host?'再試行':'プレビュー非対応'));
+      button.setAttribute('aria-label',host?`${host.label} のプレビューを再試行`:'この画像はプレビューできません');
       if(details){
         details.id=`preview-details-${++this.previewSequence}`;details.replaceChildren();
         if(host)details.append(node('p','preview-source',host.isEmbedded?host.label:`配信元: ${host.label}`));
@@ -118,35 +126,35 @@ export class Gallery {
         button.setAttribute('aria-describedby',details.id);
       }
       button.title=host?.isEmbedded?'ページに埋め込まれた画像を読み込みます。':host?`${host.label} の画像を取得します。サイトの許可は同じホストの全パス・ポートに適用されます。`:'この画像は安全にプレビューできません';
-      this.showPreviewConsent(binding,true);
+      this.showPreviewConsent(binding,!host);
       button.onclick=event=>{
         event.preventDefault();event.stopPropagation();
         // permissions.request must run in this real click, before any await.
-        const permission=this.previews?.grantHost(item.url);
+        const permission=binding.needsPermission?this.previews?.grantHost(item.url):this.previews?.retry(item.url);
         if(document.activeElement===button){
           const target=kind==='viewer'?(!$('preview-select').disabled?$('preview-select'):$('preview-close'))
             :button.closest('.card')?.querySelector('.image-select:not(:disabled), .preview-open:not(:disabled)')||$('gallery-heading');
           target.focus({preventScroll:true});
         }
         binding.requesting=true;button.disabled=true;
-        container.replaceChildren(node('span','preview-error','配信元の許可を確認しています…'));
+        container.replaceChildren(node('span','preview-error',binding.needsPermission?'配信元の許可を確認しています…':'プレビューを読み込み中…'));
         Promise.resolve(permission).then(allowed=>{
           if(!allowed){container.replaceChildren(node('span','preview-error','プレビューは許可されませんでした。選択と元形式の保存はできます。'));return;}
           for(const candidate of this.previewBindings)if(candidate.host?.key===host?.key && candidate.visible){this.cancelPreview(candidate);this.loadPreview(candidate);}
         },()=>{container.replaceChildren(node('span','preview-error','プレビューを許可できませんでした。選択と元形式の保存はできます。'));})
-          .finally(()=>{binding.requesting=false;this.showPreviewConsent(binding,!binding.handle);});
+          .finally(()=>{binding.requesting=false;this.showPreviewConsent(binding,!binding.handle&&!binding.pending);});
       };
     }
     if(this.previewObserver && kind==='thumbnail')this.previewObserver.observe(container);
     else this.loadPreview(binding);
   }
   loadPreview(binding){
-    if(!this.previews || !binding.host || !binding.visible || binding.pending || binding.handle)return;
+    if(this.previewsPaused || !this.previews || !binding.host || !binding.visible || binding.pending || binding.handle)return;
     const generation=++binding.generation,controller=new AbortController();binding.controller=controller;binding.pending=true;
-    this.showPreviewConsent(binding,true);binding.container.replaceChildren(node('span','preview-error','プレビューを読み込み中…'));
+    this.showPreviewConsent(binding,false);binding.container.replaceChildren(node('span','preview-error','プレビューを読み込み中…'));
     this.previews.load(binding.item.url,{kind:binding.kind,signal:controller.signal}).then(handle=>{
       if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding) || binding.container.isConnected===false){handle.release();return;}
-      binding.handle=handle;
+      binding.handle=handle;binding.needsPermission=false;
       const image=new Image();image.alt=binding.kind==='viewer'?((binding.item.alt||'').trim()||fileLabel(binding.item.url)):'';
       image.referrerPolicy='no-referrer';
       image.onerror=()=>{if(binding.handle===handle){handle.release();binding.handle=null;binding.container.replaceChildren(node('span','preview-error','プレビューを表示できません。元形式の保存はできます。'));this.showPreviewConsent(binding,true);}};
@@ -157,6 +165,7 @@ export class Gallery {
     },error=>{
       if(controller.signal.aborted || generation!==binding.generation || !this.previewBindings.has(binding))return;
       binding.container.replaceChildren(node('span','preview-error',publicError(error)));
+      binding.needsPermission=error?.code==='PREVIEW_PERMISSION_REQUIRED';
       this.showPreviewConsent(binding,true);
     }).finally(()=>{if(generation===binding.generation){binding.pending=false;this.showPreviewConsent(binding,!binding.handle);}});
   }

@@ -16,21 +16,21 @@ function locks(){
 }
 function resource(){const state={};const lock=locks();const storage={async get(key){return {[key]:structuredClone(state[key])};},async set(next){Object.assign(state,structuredClone(next));}};return{coordinator:createImageResourceCoordinator({storage,locks:lock}),locks:lock,state};}
 function harness(options={}){
-  const resources=options.resources??resource(),listeners=new Set(),allowed=new Set();let requests=0,fetches=0,decodes=0,created=0;
+  const resources=options.resources??resource(),listeners=new Set(),addedListeners=new Set(),allowed=new Set();let requests=0,fetches=0,decodes=0,created=0;
   const urls=[],revoked=[];
-  const permissions={async request({origins}){requests++;if(options.deny)return false;for(const origin of origins)allowed.add(origin);return true;},async contains({origins}){return origins.every(origin=>allowed.has(origin));},onRemoved:{addListener(fn){listeners.add(fn);},removeListener(fn){listeners.delete(fn);}}};
+  const permissions={async request({origins}){requests++;if(options.deny)return false;for(const origin of origins)allowed.add(origin);return true;},async contains({origins}){return origins.every(origin=>allowed.has(origin));},onRemoved:{addListener(fn){listeners.add(fn);},removeListener(fn){listeners.delete(fn);}},onAdded:{addListener(fn){addedListeners.add(fn);},removeListener(fn){addedListeners.delete(fn);}}};
   const controller=createPreviewController({ownerId:options.owner??'workspace-a',permissions,coordinator:resources.coordinator,
+    sourceAccess:options.sourceAccess,
     inspectImpl:options.inspect,fetchImpl:async(url,opts)=>{fetches++;if(options.fetch)return options.fetch(url,opts);return response();},
     decodeImpl:async(blob,metadata,opts)=>{decodes++;if(options.decode)return options.decode(blob,metadata,opts);return{blob:new Blob(['static'],{type:'image/png'}),width:metadata.width,height:metadata.height,displayWidth:metadata.width,displayHeight:metadata.height};},
     createObjectURL(blob){const url=`blob:static-${++created}`;urls.push({url,blob});return url;},revokeObjectURL(url){revoked.push(url);},onInvalidate:options.onInvalidate});
-  return{controller,permissions,allowed,resources,urls,revoked,get fetches(){return fetches;},get requests(){return requests;},get decodes(){return decodes;},remove(){allowed.clear();for(const listener of listeners)listener({origins:['https://images.test/*']});}};
+  return{controller,permissions,allowed,resources,urls,revoked,get fetches(){return fetches;},get requests(){return requests;},get decodes(){return decodes;},remove(origins=['https://images.test/*']){allowed.clear();for(const listener of listeners)listener({origins});},add(){allowed.add('https://images.test/*');for(const listener of addedListeners)listener({origins:['https://images.test/*']});}};
 }
 
-test('new workspace and saved Chrome permission never fetch before its clicked app consent',async()=>{
+test('saved Chrome permission automatically previews without another workspace consent or request',async()=>{
   const h=harness();h.allowed.add('https://images.test/*');
-  await assert.rejects(h.controller.load('https://images.test/a'),/許可/);assert.equal(h.fetches,0);assert.equal(h.decodes,0);
-  await h.controller.grantHost('https://images.test/a');const result=await h.controller.load('https://images.test/a');
-  assert.equal(h.requests,1);assert.equal(h.fetches,1);assert.equal(result.width,40);assert.equal(result.detectedFormat,'svg');assert.match(result.url,/^blob:static/);assert.equal(h.urls[0].blob.type,'image/png');
+  const result=await h.controller.load('https://images.test/a');
+  assert.equal(h.requests,0);assert.equal(h.fetches,1);assert.equal(result.width,40);assert.equal(result.detectedFormat,'svg');assert.match(result.url,/^blob:static/);assert.equal(h.urls[0].blob.type,'image/png');
   result.release();await h.controller.dispose();assert.deepEqual(h.revoked,['blob:static-1']);
 });
 
@@ -39,9 +39,86 @@ test('refused consent and a different host make zero remote requests; native dow
   const h=harness();await h.controller.grantHost('https://images.test/a');await assert.rejects(h.controller.load('https://other.test/a'));assert.equal(h.fetches,0);await h.controller.dispose();
 });
 
-test('permission is checked at execution and removal invalidates displayed/cache state and consent',async()=>{
+test('missing access never fetches, requests permissions, or notifies a render loop',async()=>{
+  let invalidations=0;const h=harness({onInvalidate:()=>invalidations++});
+  for(let i=0;i<8;i++)await assert.rejects(h.controller.load('https://images.test/a'),{code:'PREVIEW_PERMISSION_REQUIRED'});
+  assert.equal(invalidations,0);assert.equal(h.fetches,0);assert.equal(h.requests,0);await h.controller.dispose();
+});
+
+test('preview drain waits for actual asynchronous fetch lease release before a save takes the slots',async()=>{
+  const resources=resource(),releasing=deferred(),released=deferred(),started=deferred();
+  const reserve=resources.coordinator.reserve.bind(resources.coordinator);
+  resources.coordinator.reserve=async(owner,amounts)=>{
+    const lease=await reserve(owner,amounts);
+    return amounts.fetches?{...lease,release(){releasing.resolve();return released.promise.then(()=>lease.release());}}:lease;
+  };
+  const h=harness({resources,fetch:(_url,options)=>{started.resolve();return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));}});
+  h.allowed.add('https://images.test/*');const loading=h.controller.load('https://images.test/a');loading.catch(()=>{});await started.promise;
+  h.controller.invalidate();let drained=false;const draining=h.controller.drain().then(()=>{drained=true;});await releasing.promise;await turn();
+  assert.equal(drained,false,'UI cancellation does not finish an outstanding native release');
+  assert.ok(Object.values(await resources.coordinator.snapshot()).some(record=>record.fetches===1));
+  released.resolve();await draining;await assert.rejects(loading,{name:'AbortError'});
+  assert.deepEqual(await resources.coordinator.snapshot(),{});await h.controller.dispose();
+});
+
+test('preview drain retains a pending ledger acquisition and its late asynchronous release',async()=>{
+  const acquiring=deferred(),releasing=deferred(),released=deferred(),started=deferred();
+  const resources={coordinator:{reserve(){started.resolve();return acquiring.promise;},async releaseOwner(){}}};
+  const h=harness({resources});h.allowed.add('https://images.test/*');const loading=h.controller.load('https://images.test/a');loading.catch(()=>{});await started.promise;
+  h.controller.invalidate();await assert.rejects(loading,{name:'AbortError'});let drained=false;const draining=h.controller.drain().then(()=>{drained=true;});
+  await turn();assert.equal(drained,false,'aborted ledger wait still owns a possible future reservation');
+  acquiring.resolve({release(){releasing.resolve();return released.promise;}});await releasing.promise;await turn();assert.equal(drained,false,'late grants must finish releasing before save can reserve');
+  released.resolve();await draining;assert.equal(h.fetches,0);await h.controller.dispose();
+});
+
+test('live source access is rechecked for execution, generated output, and cache hits',async()=>{
+  let sourceLive=true,checks=0;const h=harness({sourceAccess:async url=>{checks++;return sourceLive&&url==='https://images.test/a';}});
+  const shown=await h.controller.load('https://images.test/a');assert.ok(checks>=3);assert.equal(h.requests,0);
+  const cached=await h.controller.load('https://images.test/a');assert.equal(h.fetches,1);cached.release();
+  sourceLive=false;h.controller.invalidate();assert.deepEqual(h.revoked,[shown.url]);
+  await assert.rejects(h.controller.load('https://images.test/a'),{code:'PREVIEW_PERMISSION_REQUIRED'});assert.equal(h.fetches,1);
+  shown.release();await h.controller.dispose();
+});
+
+test('a host grant added elsewhere wakes blocked previews without requesting it again',async()=>{
+  let h;const updates=[];h=harness({onInvalidate:()=>updates.push(h.controller.load('https://images.test/a'))});
+  await assert.rejects(h.controller.load('https://images.test/a'),{code:'PREVIEW_PERMISSION_REQUIRED'});
+  h.add();await turn();assert.equal(updates.length,1);const shown=await updates[0];assert.equal(h.requests,0);assert.equal(h.fetches,1);
+  h.add();await turn();assert.equal(updates.length,1,'already displaying hosts are not restarted by a grant event');shown.release();await h.controller.dispose();
+});
+
+test('source access to one port does not forget a blocked candidate on another port of the same host',async()=>{
+  let notifications=0;const h=harness({sourceAccess:async url=>url==='https://images.test:8443/a',onInvalidate:()=>notifications++});
+  await assert.rejects(h.controller.load('https://images.test:9443/b'),{code:'PREVIEW_PERMISSION_REQUIRED'});
+  const source=await h.controller.load('https://images.test:8443/a');h.add();await turn();assert.equal(notifications,1);
+  const other=await h.controller.load('https://images.test:9443/b');assert.equal(h.requests,0);source.release();other.release();await h.controller.dispose();
+});
+
+test('a Chrome grant during an initial source check supersedes its delayed denial',async()=>{
+  const checking=deferred(),started=deferred();const h=harness({sourceAccess:()=>{started.resolve();return checking.promise;}});
+  const loading=h.controller.load('https://images.test/a');await started.promise;h.add();checking.resolve(false);
+  const shown=await loading;assert.equal(h.fetches,1);assert.equal(h.requests,0);shown.release();await h.controller.dispose();
+});
+
+test('retrying a permitted failed image clears its error without another Chrome permission request',async()=>{
+  let valid=false;const h=harness({fetch:async()=>valid?response():new Response('broken',{headers:{'content-type':'image/png'}})});h.allowed.add('https://images.test/*');
+  await assert.rejects(h.controller.load('https://images.test/a'));valid=true;h.controller.retry('https://images.test/a');
+  const shown=await h.controller.load('https://images.test/a');assert.equal(h.fetches,2);assert.equal(h.requests,0);shown.release();await h.controller.dispose();
+});
+
+test('revoked matching hosts cannot fall back to activeTab, while unrelated source hosts keep access',async()=>{
+  for(const origins of [['https://images.test/*'],['*://*.test/*'],['<all_urls>']]){
+    const h=harness({sourceAccess:async()=>true});const shown=await h.controller.load('https://images.test/a');h.remove(origins);
+    await assert.rejects(h.controller.load('https://images.test/a'),{code:'PREVIEW_PERMISSION_REQUIRED'});assert.equal(h.fetches,1);
+    h.add();const restored=await h.controller.load('https://images.test/a');assert.equal(h.fetches,2);shown.release();restored.release();await h.controller.dispose();
+  }
+  const h=harness({sourceAccess:async()=>true});const first=await h.controller.load('https://images.test/a');h.remove(['https://other.test/*']);
+  const unchanged=await h.controller.load('https://images.test/a');assert.equal(h.fetches,2);first.release();unchanged.release();await h.controller.dispose();
+});
+
+test('permission is checked at execution and removal invalidates automatically displayed/cache state',async()=>{
   const h=harness();await h.controller.grantHost('https://images.test/a');const result=await h.controller.load('https://images.test/a');
-  h.remove();await turn();assert.equal(h.controller.stats().cacheEntries,0);assert.equal(h.controller.stats().consentedHosts,0);assert.deepEqual(h.revoked,[result.url]);
+  h.remove();await turn();assert.equal(h.controller.stats().cacheEntries,0);assert.equal(h.controller.stats().trackedHosts,1);assert.deepEqual(h.revoked,[result.url]);
   await assert.rejects(h.controller.load('https://images.test/a'));assert.equal(h.fetches,1);result.release();await h.controller.dispose();
 });
 
@@ -185,9 +262,9 @@ test('cache survives repeated view consumer releases, while cached async permiss
   const checking=deferred();h.permissions.contains=()=>checking.promise;const controller=new AbortController(),loading=h.controller.load('https://images.test/a',{signal:controller.signal});loading.catch(()=>{});await turn();controller.abort();checking.resolve(true);await assert.rejects(loading,{name:'AbortError'});assert.equal(h.urls.length,20);await h.controller.dispose();
 });
 
-test('bounded embedded image consent is local and never requests Chrome host permission',async()=>{
+test('bounded embedded image automatically previews locally without Chrome host permission',async()=>{
   const h=harness({fetch:async url=>{assert.match(url,/^data:image\/svg\+xml;/);return response();}}),url='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
-  await assert.rejects(h.controller.load(url),/許可/);assert.equal(h.fetches,0);assert.equal(await h.controller.grantHost(url),true);const result=await h.controller.load(url);assert.equal(h.requests,0);assert.equal(h.fetches,1);assert.equal(h.decodes,1);result.release();
+  const result=await h.controller.load(url);assert.equal(h.requests,0);assert.equal(h.fetches,1);assert.equal(h.decodes,1);result.release();
   await assert.rejects(h.controller.grantHost('data:text/html,<img>'));await assert.rejects(h.controller.grantHost('data:image/png;base64,'+'A'.repeat(131072)));await h.controller.dispose();
 });
 

@@ -17,16 +17,23 @@ const workspacePath=join(extension,'workspace.js');await writeFile(workspacePath
 const manifest=JSON.parse(await readFile(join(extension,'manifest.json'),'utf8'));
 manifest.host_permissions=['http://127.0.0.1/*'];await writeFile(join(extension,'manifest.json'),JSON.stringify(manifest));
 let clip=Buffer.alloc(0), failedOnce=true, slowDirectoryWrites=false;
+const slowRequests=[],priorityPreviewResponses=[];let holdPriorityPreviews=false;
 const fixture=`<!doctype html><html lang="ja"><title>Synthetic media fixture</title><body><h1>Local fixture</h1><img src="/red.svg" alt="赤" width="320" height="200"><img src="/blue.svg" alt="青" width="400" height="300"><img src="/red.svg"><div style="background-image:url('/green.svg');width:100px;height:100px"></div><picture><source srcset="/red.svg 1x, /blue.svg 2x"><img src="/red.svg"></picture><div id="shadow"></div><iframe src="/frame"></iframe><video controls src="/clip.webm" width="320" height="180"></video><a href="/stream.m3u8">stream</a><script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<img src="/shadow.svg">';</script></body></html>`;
 const server=createServer((req,res)=>{
   if(req.url==='/frame') {res.setHeader('Content-Type','text/html');return res.end('<img src="/frame.svg">');}
   if(req.url.startsWith('/clip.webm')) {res.setHeader('Content-Type','video/webm');return res.end(clip);}
   if(req.url.startsWith('/stream.m3u8')) {res.setHeader('Content-Type','application/vnd.apple.mpegurl');return res.end('#EXTM3U\n');}
   if(req.url.startsWith('/fail.svg') && failedOnce) {res.statusCode=403;return res.end('blocked');}
-  if(req.url==='/red.svg' && slowDirectoryWrites && req.headers['sec-fetch-dest']==='empty') {
+  if(holdPriorityPreviews&&req.headers['sec-fetch-dest']==='empty'&&/\.svg(?:\?|$)/.test(req.url)){
+    const record={response:res,closed:false};priorityPreviewResponses.push(record);
     res.setHeader('Content-Type','image/svg+xml');res.write('<svg xmlns="http://www.w3.org/2000/svg">');
-    const timer=setTimeout(()=>res.end('<rect width="4" height="4"/></svg>'),10000);
-    res.on('close',()=>clearTimeout(timer));return;
+    res.on('close',()=>{record.closed=true;});return;
+  }
+  if(req.url==='/red.svg' && slowDirectoryWrites && req.headers['sec-fetch-dest']==='empty') {
+    const request={started:Date.now(),closed:false,finished:false};slowRequests.push(request);
+    res.setHeader('Content-Type','image/svg+xml');res.write('<svg xmlns="http://www.w3.org/2000/svg">');
+    const timer=setTimeout(()=>{request.finished=true;res.end('<rect width="4" height="4"/></svg>');},10000);
+    res.on('close',()=>{request.closed=true;clearTimeout(timer);});return;
   }
   if(req.url.endsWith('.svg')) {res.setHeader('Content-Type','image/svg+xml');return res.end(`<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="${req.url.includes('blue')?'#566ac4':req.url.includes('green')?'#58a884':'#e8987e'}"/></svg>`);}
   res.setHeader('Content-Type','text/html');res.end(fixture);
@@ -90,13 +97,11 @@ try {
   if(manifest.name==='ImageCrate') {
     assert.ok(await manager.locator('.card').count()>=5,'DOM, background, shadow and frame collection');
     assert.equal(await manager.locator('.image-select:checked').count(),0,'initial selection is empty');
-    assert.equal(await manager.locator('.thumb img').count(),0,'pregranted Chrome host access does not establish this workspace preview consent');
-    assert.deepEqual(previewRequests,[],'the workspace makes no fixture request before an actual preview consent click');
-    await manager.locator('.card .preview-permission:visible').first().click();
     await manager.waitForFunction(()=>{const image=document.querySelector('.thumb img');return image?.complete&&image.naturalWidth>0&&image.src.startsWith('blob:');});
-    assert.equal(await manager.locator('.thumb img').first().evaluate(image=>image.naturalWidth<=384),true,'the thumbnail is a bounded generated static image');
+    assert.ok(previewRequests.length>0,'existing Chrome host access starts visible previews without an extra permission click');
+    assert.equal(await manager.locator('.thumb img').first().evaluate(image=>image.naturalWidth<=384),true,'the automatic thumbnail is a bounded generated static image');
     await manager.waitForFunction(()=>[...document.querySelectorAll('[data-dimensions]')].some(node=>node.textContent.includes('400 × 300')));
-    assert.equal(await manager.locator('.image-select:checked').count(),0,'preview consent does not select images');
+    assert.equal(await manager.locator('.image-select:checked').count(),0,'automatic previews do not select images');
     await manager.waitForFunction(()=>document.querySelectorAll('.thumb img').length>=2);
     await manager.locator('.thumbnail-image').first().click();
     await manager.waitForFunction(()=>document.querySelector('.image-select').checked);
@@ -181,6 +186,12 @@ try {
         const current=await readImageSession();if(predicate(current))return current;
         await manager.waitForTimeout(25);
       }
+      const diagnostic=await manager.evaluate(async()=>{
+        const key=`workspace:${new URL(location.href).searchParams.get('id')}`,state=(await chrome.storage.session.get(key))[key];
+        const ledger=(await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{};
+        return {batch:state?.batch,jobs:state?.jobs,resources:Object.values(ledger).filter(entry=>entry.owner.startsWith((state?.id||'')+':')),error:document.querySelector('#error')?.textContent,previewErrors:[...document.querySelectorAll('.preview-error')].map(node=>node.textContent)};
+      });
+      console.error('Synthetic batch timeout diagnostic: '+JSON.stringify({...diagnostic,slowRequests}));
       throw new Error('Timed out waiting for the image batch state');
     };
     const openSaveSettings=async()=>{
@@ -334,13 +345,26 @@ try {
     await openSaveSettings();await manager.locator('#folder-name').fill('再読込回復');await closeSaveSettings();
     slowDirectoryWrites=true;await selectRedImage();await manager.locator('#save').click();
     await waitForImageSession(current=>current.batch?.folderName==='再読込回復' && current.jobs[0]?.status==='in_progress' && current.jobs[0]?.bytesReceived>0);
+    assert.ok(slowRequests.some(request=>!request.closed&&!request.finished),'the original save response remains held before reload');
+    // Keep that save body held. Reloaded previews use a separate fixture hold
+    // so Retry must reclaim two occupied fetch leases before saving.
+    slowDirectoryWrites=false;holdPriorityPreviews=true;
     let unloadWarning=false;
     manager.once('dialog',async dialog=>{unloadWarning=dialog.type()==='beforeunload';await dialog.accept();});
     await manager.reload();await manager.waitForFunction(()=>document.querySelector('#message').textContent.includes('前回の取得結果'));
     assert.ok(unloadWarning,'active custom saving warns before reload');
     assert.equal((await readImageSession()).jobs[0].status,'interrupted','reload never reports an unfinished write as complete');
-    slowDirectoryWrites=false;await manager.locator('#retry').click();
+    const previewDeadline=Date.now()+10000;
+    while(priorityPreviewResponses.filter(record=>!record.closed).length<2&&Date.now()<previewDeadline)await manager.waitForTimeout(25);
+    assert.equal(priorityPreviewResponses.filter(record=>!record.closed).length,2,'two real preview responses occupy the workspace fetch budget before Retry');
+    const previewFetches=await manager.evaluate(async()=>{
+      const id=new URL(location.href).searchParams.get('id'),ledger=(await chrome.storage.session.get('imagecrate.imageResources.v1'))['imagecrate.imageResources.v1']||{};
+      return Object.values(ledger).filter(entry=>entry.owner.startsWith(id+':')).reduce((sum,entry)=>sum+(entry.fetches||0),0);
+    });
+    assert.equal(previewFetches,2,'automatic previews have saturated the real workspace fetch leases');
+    holdPriorityPreviews=false;await manager.locator('#retry').click();
     await waitForImageSession(current=>current.jobs[0]?.status==='complete');
+    assert.ok(priorityPreviewResponses.every(record=>record.closed),'managed saving aborts the held preview responses before reusing their fetch budget');
     assert.ok((await readSelectedDirectory('再読込回復')).some(file=>file.size>0 && /<svg\b/.test(file.text)),'reload recovery can finish the saved image');
     // A real OPFS handle normally remains granted. Simulate only the browser's
     // restored-handle prompt/denial decisions; native permission UI stays manual.
@@ -535,4 +559,4 @@ try {
   assert.deepEqual(errors,[],'no uncaught page errors');
   console.log(`${manifest.name} browser smoke PASS (isolated Chrome, local fixture). Native activeTab invocation, tabCapture consent and macOS display/audio remain manual.`);
   if(process.env.QA_KEEP)console.log(`QA files retained locally: ${scratch}`);
-} finally {await context?.close();await new Promise(resolve=>server.close(resolve));if(!process.env.QA_KEEP)await rm(scratch,{recursive:true,force:true});}
+} finally {await context?.close();for(const record of priorityPreviewResponses)record.response.destroy();await new Promise(resolve=>server.close(resolve));if(!process.env.QA_KEEP)await rm(scratch,{recursive:true,force:true});}

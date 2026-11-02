@@ -135,8 +135,6 @@ try {
     manager.__previewRequests=[];manager.on('request',request=>{if(request.url().startsWith(origin))manager.__previewRequests.push(request.url());});
     await manager.waitForLoadState('domcontentloaded');
     await manager.waitForFunction(() => document.querySelector('#message')?.textContent.includes('候補を取得'));
-    assert.equal(await manager.locator('.thumb img').count(),0,'a new workspace starts with placeholders despite the temporary Chrome host grant');
-    assert.deepEqual(manager.__previewRequests,[],'Chrome 116 workspace sends no fixture request before preview consent');
     return manager;
   };
   const source = await context.newPage();
@@ -171,7 +169,12 @@ try {
   await manager.locator('#filters > summary').click(); await manager.locator('#width').fill('1000');
   assert.equal(await manager.locator(`.card[data-url="${origin}/held.svg"]`).count(), 1);
   assert.equal(await manager.locator('#dimension-note').isVisible(), true);
-  await manager.locator(`.card[data-url="${origin}/held.svg"] .preview-permission`).click();
+  // The width filter can remove already-decoded smaller images. Observe the
+  // unknown image's real automatic request before releasing its held body.
+  const heldDeadline=Date.now()+10000;
+  while(!held.size&&Date.now()<heldDeadline)await manager.waitForTimeout(25);
+  assert.ok(held.size>0,'Chrome 116 automatically requests the unknown visible image');
+  assert.ok(manager.__previewRequests.some(url=>url===origin+'/held.svg'),'the held request starts without a preview-permission click');
   releaseHigh = true;
   for (const response of held) response.end(svg(1800, 1200));
   held.clear();

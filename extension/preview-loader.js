@@ -7,6 +7,15 @@ const MIB=1024*1024;
 export const PREVIEW_LIMITS=Object.freeze({maxBytes:8*MIB,maxPixels:24_000_000,maxDimension:8192,timeoutMs:20000,queueEntries:64,cacheEntries:64,encodedCache:16*MIB,displayBytes:32*MIB,totalBytes:256*MIB});
 const abortError=signal=>signal?.reason instanceof Error?signal.reason:new DOMException('プレビューを停止しました。','AbortError');
 const unique=()=>globalThis.crypto?.randomUUID?.()??`${Date.now()}-${Math.random()}`;
+const permissionError=()=>Object.assign(new Error('画像の配信元へのアクセス許可が必要です。'),{code:'PREVIEW_PERMISSION_REQUIRED'});
+const matchesHost=(pattern,host)=>{
+  if(pattern==='<all_urls>')return true;
+  const match=/^(https?|\*):\/\/([^/]+)\/.*$/.exec(pattern);
+  if(!match)return false;
+  const url=new URL(host.key),hostname=match[2];
+  return (match[1]==='*'||`${match[1]}:`===url.protocol)&&(hostname==='*'||hostname===url.hostname
+    ||hostname.startsWith('*.')&&(url.hostname===hostname.slice(2)||url.hostname.endsWith(hostname.slice(1))));
+};
 export function previewHost(value){
   if(typeof value!=='string'||value.length>131072)throw new Error('画像の取得先を確認できません。');
   if(/^data:/i.test(value)){if(!allowedURL(value,'images'))throw new Error('この埋め込み画像のプレビューには対応していません。');return {key:'data:embedded',label:'ページに埋め込まれた画像',pattern:null,isEmbedded:true};}
@@ -46,21 +55,38 @@ export async function acquireMediaFetchLease(operation,ownerId,{coordinator=imag
   }
 }
 export function createPreviewController({ownerId=`preview-${unique()}`,permissions=globalThis.chrome?.permissions,
+  sourceAccess=async()=>false,
   fetchImpl=globalThis.fetch,decodeImpl=decodeStaticImage,inspectImpl=inspectImage,readerImpl=readMediaBlob,
   coordinator=imageResourceCoordinator(),onInvalidate=()=>{},createObjectURL=blob=>URL.createObjectURL(blob),revokeObjectURL=url=>URL.revokeObjectURL(url)
 }={}){
-  let generation=0,disposed=false,active=0,checking=0,totalBytes=0,cacheEncoded=0,cacheDisplay=0;
-  const consent=new Set(),epochs=new Map(),queue=[],running=new Set(),cache=new Map(),failures=new Map(),pending=new Map(),lingeringResources=new Set();
+  let generation=0,permissionRevision=0,disposed=false,active=0,checking=0,totalBytes=0,cacheEncoded=0,cacheDisplay=0;
+  const hosts=new Map(),sourceBlocked=new Set(),unavailable=new Map(),requestingHosts=new Set(),epochs=new Map(),queue=[],running=new Set(),cache=new Map(),failures=new Map(),pending=new Map(),lingeringResources=new Set();
+  const hasUnavailable=host=>[...unavailable.values()].includes(host);
+  const trackHost=host=>{if(!hosts.has(host.key)&&hosts.size>=128)throw new Error('プレビュー配信元の数が上限に達しました。');hosts.set(host.key,host);};
+  const hasAccess=async(url,host)=>{
+    if(host.isEmbedded)return true;
+    let revision=permissionRevision;
+    const contains=()=>permissions?.contains?.({origins:[host.pattern]});
+    if(await contains()||!sourceBlocked.has(host.key)&&await sourceAccess(url))return true;
+    // A grant can arrive while the read-only source check is awaiting the
+    // worker. Do not publish its stale false result after that grant event.
+    while(revision!==permissionRevision){revision=permissionRevision;if(await contains())return true;}
+    return false;
+  };
   const hostEpoch=key=>epochs.get(key)??0;
   const forgetJob=job=>{if(pending.get(job.key)===job)pending.delete(job.key);};
-  const current=job=>!disposed&&job.generation===generation&&job.epoch===hostEpoch(job.host.key)&&consent.has(job.host.key)&&!job.controller.signal.aborted;
+  const current=job=>!disposed&&job.generation===generation&&job.epoch===hostEpoch(job.host.key)&&!job.controller.signal.aborted;
   const notify=host=>{try{onInvalidate(host);}catch{}};
+  const cleanup=promise=>{
+    const pending=Promise.resolve(promise).catch(()=>{});lingeringResources.add(pending);
+    pending.then(()=>lingeringResources.delete(pending));return pending;
+  };
   const dropEntry=entry=>{
     if(entry.dropped)return;entry.dropped=true;cache.delete(entry.key);cacheEncoded-=entry.encodedBytes;cacheDisplay-=entry.displayBytes;
     if(entry.url){revokeObjectURL(entry.url);entry.url='';}entry.source=null;entry.output=null;entry.result=null;entry.metadata=null;
     // Any failure keeps conservative shared accounting; cleanup is retried by
     // dispose.releaseOwner after every active operation has settled.
-    void Promise.allSettled(entry.reservations.map(r=>r.release()));
+    void cleanup(Promise.allSettled(entry.reservations.map(r=>r.release())));
   };
   const trim=(encoded=0,display=0,entries=1)=>{
     for(const entry of cache.values()){
@@ -73,8 +99,8 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
     if(entry.dropped)throw new DOMException('古いプレビューです。','AbortError');if(!entry.url)entry.url=createObjectURL(entry.output);entry.refs++;cache.delete(entry.key);cache.set(entry.key,entry);let released=false;
     return {url:entry.url,width:entry.metadata.width,height:entry.metadata.height,detectedFormat:entry.metadata.format,displayWidth:entry.result.displayWidth,displayHeight:entry.result.displayHeight,release(){if(released)return;released=true;entry.refs=Math.max(0,entry.refs-1);if(!entry.refs&&entry.url){revokeObjectURL(entry.url);entry.url='';}}};
   };
-  const invalidateHost=(key,{clearConsent=true}={})=>{
-    epochs.set(key,hostEpoch(key)+1);if(clearConsent)consent.delete(key);
+  const invalidateHost=(key)=>{
+    epochs.set(key,hostEpoch(key)+1);
     for(const job of [...queue,...running])if(job.host.key===key){
       job.controller.abort(new DOMException('配信元のプレビュー許可が取り消されました。','AbortError'));
       const index=queue.indexOf(job);if(index>=0){queue.splice(index,1);forgetJob(job);job.completed=true;job.reject(abortError(job.controller.signal));}
@@ -86,18 +112,23 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
   const verify=async job=>{
     if(!current(job))throw abortError(job.controller.signal);
     if(job.host.isEmbedded)return;
-    if(!permissions?.contains||!await permissions.contains({origins:[job.host.pattern]})){
-      invalidateHost(job.host.key);throw new Error('画像の配信元へのアクセス許可が必要です。');
+    if(!await hasAccess(job.url,job.host)){
+      invalidateHost(job.host.key);throw permissionError();
     }
     if(!current(job))throw abortError(job.controller.signal);
   };
   async function execute(job){
     const operation=createMediaOperation({signal:job.controller.signal,deadline:job.deadline,timeoutMs:PREVIEW_LIMITS.timeoutMs,idleTimeoutMs:PREVIEW_LIMITS.timeoutMs});
     const reservations=[];let source,result,sourceLease,inspection,inspectionSettled=true,decoding,decodeSettled=true,finished=false,chargedBytes=0;
-    const acquire=amounts=>operation.wait(coordinator.reserve(ownerId,amounts).then(lease=>{
-      if(operation.signal.aborted){void lease.release().catch(()=>{});throw abortError(operation.signal);}
-      reservations.push(lease);return lease;
-    }));
+    const acquire=amounts=>{
+      const acquiring=coordinator.reserve(ownerId,amounts).then(async lease=>{
+        if(operation.signal.aborted){await cleanup(lease.release());throw abortError(operation.signal);}
+        reservations.push(lease);return lease;
+      });
+      // The UI wait can abort before the ledger grant arrives. Keep the
+      // acquisition and its late release in drain's ownership until settled.
+      void cleanup(acquiring);return operation.wait(acquiring);
+    };
     try {
       await operation.wait(verify(job));
       await acquire({fetches:1});
@@ -122,7 +153,7 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
         // deadline check. Late output cannot outlive this job unaccounted.
         result=output;
         try{operation.check();if(finished||!current(job))throw abortError(job.controller.signal);return output;}
-        catch(error){result=null;if(output?.release)void Promise.resolve(output.release()).catch(()=>{});throw error;}
+        catch(error){result=null;if(output?.release)void cleanup(output.release());throw error;}
       });
       decoding.finally(()=>{decodeSettled=true;}).catch(()=>{});
       await operation.wait(decoding);
@@ -140,18 +171,17 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
       if(Number.isSafeInteger(error?.bytesReceived)&&error.bytesReceived>chargedBytes)totalBytes=Math.min(Number.MAX_SAFE_INTEGER,totalBytes+error.bytesReceived-chargedBytes);
       throw error;
     } finally {
-      finished=true;operation.dispose();if(result?.release)void Promise.resolve(result.release()).catch(()=>{});source=null;result=null;
+      finished=true;operation.dispose();if(result?.release)void cleanup(result.release());source=null;result=null;
       const immediate=reservations.filter(reservation=>reservation!==sourceLease);
-      void Promise.allSettled(immediate.map(reservation=>reservation.release()));
+      void cleanup(Promise.allSettled(immediate.map(reservation=>reservation.release())));
       if(sourceLease){
         const tails=[...(inspection&&!inspectionSettled?[inspection]:[]),...(decoding&&!decodeSettled?[decoding]:[])];
         if(tails.length){
           // ArrayBuffer inspection and a codec's ledger acquisition may remain
           // unsettled after UI cancellation. Their actual source ownership is
           // retained until both promises finish, including late output cleanup.
-          const cleanup=Promise.allSettled(tails).then(()=>sourceLease.release()).catch(()=>{});
-          lingeringResources.add(cleanup);cleanup.then(()=>lingeringResources.delete(cleanup));
-        }else void sourceLease.release().catch(()=>{});
+          void cleanup(Promise.allSettled(tails).then(()=>sourceLease.release()));
+        }else void cleanup(sourceLease.release());
       }
     }
   }
@@ -174,38 +204,56 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
     // Stop and clear display/cache synchronously with the removal event. A
     // permission query is asynchronous, so waiting for it would leave old
     // output visible and a queued operation eligible to start. Conservatively
-    // invalidate every consented host, then query each concrete grant. This
-    // also handles broad Chrome patterns without duplicating its matcher.
-    for(const key of [...consent]){
+    // invalidate every tracked host, including automatically loaded previews.
+    // Every new load rechecks Chrome access; no app consent is persisted.
+    for(const key of hosts.keys()){
       if(key==='data:embedded')continue;
-      invalidateHost(key,{clearConsent:false});
-      const epoch=hostEpoch(key),host=previewHost(key);
+      if(removed.origins.some(pattern=>matchesHost(pattern,hosts.get(key))))sourceBlocked.add(key);
+      invalidateHost(key);
+    }
+  };
+  const permissionAdded=added=>{
+    if(!added?.origins?.length)return;
+    permissionRevision++;
+    for(const [key,host]of hosts){
+      if(host.isEmbedded||!hasUnavailable(key)||requestingHosts.has(key))continue;
+      const epoch=hostEpoch(key);
       Promise.resolve().then(()=>permissions.contains({origins:[host.pattern]})).then(allowed=>{
-        if(!allowed&&hostEpoch(key)===epoch){consent.delete(key);notify(key);}
-      },()=>{if(hostEpoch(key)===epoch){consent.delete(key);notify(key);}});
+        if(disposed||!allowed||hostEpoch(key)!==epoch||!hasUnavailable(key))return;
+        sourceBlocked.delete(key);
+        for(const [failureKey,value]of failures)if(value.host===key)failures.delete(failureKey);
+        notify(key);
+      }).catch(()=>{});
     }
   };
   permissions?.onRemoved?.addListener(permissionRemoved);
+  permissions?.onAdded?.addListener(permissionAdded);
   const controller={
-    // Called synchronously from the real user's button click. A saved Chrome
-    // host grant never establishes this separate workspace consent on its own.
+    // Only unavailable hosts need a real click to request Chrome permission.
     grantHost(value){
       if(disposed)return Promise.reject(new DOMException('作業ページを閉じました。','AbortError'));
       let host;try{host=previewHost(value);}catch(error){return Promise.reject(error);}
-      if(host.isEmbedded){consent.add(host.key);for(const [key,error]of failures)if(error.host===host.key)failures.delete(key);return Promise.resolve(true);}
+      try{trackHost(host);}catch(error){return Promise.reject(error);}
+      if(host.isEmbedded){controller.retry(value);return Promise.resolve(true);}
       if(!permissions?.request)return Promise.reject(new Error('Chromeの配信元許可を利用できません。'));
       const epoch=hostEpoch(host.key);let requested;
-      try{requested=permissions.request({origins:[host.pattern]});}catch{return Promise.reject(new Error('配信元へのアクセスを許可できませんでした。'));}
+      requestingHosts.add(host.key);
+      try{requested=permissions.request({origins:[host.pattern]});}catch{requestingHosts.delete(host.key);return Promise.reject(new Error('配信元へのアクセスを許可できませんでした。'));}
       return Promise.resolve(requested).then(allowed=>{
         if(disposed||epoch!==hostEpoch(host.key))return false;
         if(!allowed){invalidateHost(host.key);return false;}
-        if(!consent.has(host.key)&&consent.size>=128)throw new Error('プレビュー配信元の数が上限に達しました。');consent.add(host.key);for(const [key,error]of failures)if(error.host===host.key)failures.delete(key);return true;
-      });
+        sourceBlocked.delete(host.key);controller.retry(value);return true;
+      }).finally(()=>requestingHosts.delete(host.key));
+    },
+    retry(value){
+      const host=previewHost(value);
+      for(const [key,error]of failures)if(error.host===host.key)failures.delete(key);
+      return true;
     },
     load(url,{kind='thumbnail',signal}={}){
       if(disposed)return Promise.reject(new DOMException('作業ページを閉じました。','AbortError'));
       let host;try{host=previewHost(url);}catch(error){return Promise.reject(error);}
-      if(!consent.has(host.key))return Promise.reject(new Error('「プレビューを表示」から許可してください。'));
+      try{trackHost(host);}catch(error){return Promise.reject(error);}
       if(signal?.aborted)return Promise.reject(abortError(signal));
       if(!['thumbnail','viewer'].includes(kind))return Promise.reject(new Error('プレビュー種別が不正です。'));
       const key=`${generation}:${hostEpoch(host.key)}:${kind}:${url}`;
@@ -213,10 +261,13 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
       // Permission is also checked for cache hits, and again before execution.
       if(checking>=PREVIEW_LIMITS.queueEntries)return Promise.reject(new Error('プレビューの待機数が上限に達しました。'));
       checking++;const permissionOperation=createMediaOperation({signal,timeoutMs:PREVIEW_LIMITS.timeoutMs});
-      const permissionCheck=permissionOperation.wait(Promise.resolve().then(()=>host.isEmbedded||permissions?.contains?.({origins:[host.pattern]}))).finally(()=>{checking--;permissionOperation.dispose();});
+      const permissionCheck=permissionOperation.wait(Promise.resolve().then(()=>hasAccess(url,host))).finally(()=>{checking--;permissionOperation.dispose();});
       return permissionCheck.then(allowed=>{
-        if(!allowed){invalidateHost(host.key);throw new Error('画像の配信元へのアクセス許可が必要です。');}
-        if(disposed||!consent.has(host.key)||key!==`${generation}:${hostEpoch(host.key)}:${kind}:${url}`)throw new DOMException('古いプレビューです。','AbortError');
+        // A missing grant is a normal UI state. Invalidating here would notify
+        // the gallery, load again, and repeat forever for an unavailable host.
+        if(!allowed){if(unavailable.size>=1000)unavailable.delete(unavailable.keys().next().value);unavailable.set(url,host.key);throw permissionError();}
+        if(disposed||key!==`${generation}:${hostEpoch(host.key)}:${kind}:${url}`)throw new DOMException('古いプレビューです。','AbortError');
+        unavailable.delete(url);
         if(signal?.aborted)throw abortError(signal);
         const cached=cache.get(key);if(cached)return handle(cached);
         let job=pending.get(key);
@@ -245,11 +296,15 @@ export function createPreviewController({ownerId=`preview-${unique()}`,permissio
       while(queue.length){const job=queue.shift();forgetJob(job);job.completed=true;job.reject(abortError(job.controller.signal));}
       for(const entry of [...cache.values()])dropEntry(entry);failures.clear();
     },
-    async dispose(){
-      if(disposed)return;disposed=true;controller.invalidate();consent.clear();permissions?.onRemoved?.removeListener(permissionRemoved);
-      await Promise.allSettled([...new Set([...pending.values(),...running])].map(job=>job.promise));await Promise.allSettled([...lingeringResources]);await coordinator.releaseOwner(ownerId);
+    async drain(){
+      await Promise.allSettled([...new Set([...pending.values(),...running])].map(job=>job.promise));
+      while(lingeringResources.size)await Promise.allSettled([...lingeringResources]);
     },
-    stats(){return {generation,queued:queue.length,active,cacheEntries:cache.size,encodedBytes:cacheEncoded,displayBytes:cacheDisplay,totalBytes,consentedHosts:consent.size};}
+    async dispose(){
+      if(disposed)return;disposed=true;controller.invalidate();hosts.clear();sourceBlocked.clear();unavailable.clear();requestingHosts.clear();permissions?.onRemoved?.removeListener(permissionRemoved);permissions?.onAdded?.removeListener(permissionAdded);
+      await controller.drain();await coordinator.releaseOwner(ownerId);
+    },
+    stats(){return {generation,queued:queue.length,active,cacheEntries:cache.size,encodedBytes:cacheEncoded,displayBytes:cacheDisplay,totalBytes,trackedHosts:hosts.size};}
   };
   return controller;
 }

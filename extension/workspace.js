@@ -104,7 +104,7 @@ function persistUI(patch) {
   });
   uiWrites=task;return task;
 }
-const previews=createPreviewController({ownerId:previewOwner,onInvalidate:()=>gallery.refreshPreviews()});
+const previews=createPreviewController({ownerId:previewOwner,sourceAccess:url=>send('preview-access',{url}),onInvalidate:()=>gallery.refreshPreviews()});
 const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,previews,
   onSelect:urls=>persistUI({selectedURLs:urls}),onView:patch=>persistUI(patch).catch(error),onError:error,
   onRender:items=>{visible=items;updateSummary();},
@@ -113,9 +113,15 @@ const gallery=new Gallery({getState:()=>state,getSelected:()=>selected,previews,
     send('dimensions',{updates}).then(next=>{applyState(next);}).catch(error);
   },250);},status:url=>jobLabel(jobFor(url))});
 document.addEventListener('visibilitychange',()=>{
-  if(document.hidden)gallery.suspendPreviews();else if(state){gallery.render();if($('image-preview').open&&gallery.viewerURL)gallery.showViewer(gallery.viewerURL);}
+  if(document.hidden)gallery.suspendPreviews();else if(state&&!managedRunning)gallery.resumePreviews();
 });
 window.addEventListener('pagehide',()=>{gallery.suspendPreviews();void previews.dispose().catch(()=>{});});
+// activeTab is temporary and does not emit permissions.onRemoved on source
+// navigation. Discard its old output immediately; each new load checks the live
+// source through the worker before relying on that temporary access again.
+const sourceChanged=tabId=>{if(state?.tabId===tabId){previews.invalidate();gallery.refreshPreviews();}};
+chrome.tabs.onUpdated.addListener((tabId,change)=>{if(change.url||change.status==='loading')sourceChanged(tabId);});
+chrome.tabs.onRemoved.addListener(sourceChanged);
 function updateSummary() {
   if(!state) return;
   const batch=summarizeJobs(state.jobs), busy=isBusy();
@@ -366,6 +372,7 @@ async function managedState(type,extra={},operation) {
 }
 async function runManagedBatch(handle) {
   managedRunning=true;managedController=new AbortController();$('cancel').disabled=false;updateSummary();
+  gallery.suspendPreviews();
   const controller=managedController,batchId=state.batch.id;
   let updates=Promise.resolve(),progressQueued=null,progressTask=null;
   const report=update=> {
@@ -396,6 +403,9 @@ async function runManagedBatch(handle) {
       try {
         // The worker persists a conservative reservation before any fetch.
         operation=createMediaOperation({signal:controller.signal,deadline:Math.min(batch.transferBudget?.deadline??Infinity,Date.now()+120000)});
+        // Auto previews may own both fetch slots. Stop them and wait for their
+        // actual lease cleanup within this save's deadline before reserving.
+        await operation.wait(previews.drain());operation.check();
         await operation.wait(updates);reserved=true;
         await managedState('managed-reserve',{batchId,jobId:job.id},operation);reservationKnown=true;
         const transfer=state.jobs.find(current=>current.id===job.id)?.transfer;
@@ -491,7 +501,7 @@ async function runManagedBatch(handle) {
     await updates;
     if(controller.signal.aborted) await interruptManagedJobs('停止しました。中断分を再試行できます。');
   } catch(e) {const reason=e.name==='NotFoundError'?'保存先フォルダが見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':publicError(e);error(new Error(reason));await interruptManagedJobs(reason).catch(()=>{});}
-  finally {managedRunning=false;managedController=null;$('cancel').disabled=false;updateSummary();}
+  finally {managedRunning=false;managedController=null;$('cancel').disabled=false;updateSummary();if(!document.hidden)gallery.resumePreviews();}
 }
 
 $('destination-change').addEventListener('click',openSettings);

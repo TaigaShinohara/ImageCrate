@@ -1,5 +1,21 @@
 # QA — v0.1
 
+## プレビューの初期ON — 2026-11-02
+
+本人指定により、以下の過去記録にある「作業ページごとの同意」を廃止し、既存Chrome許可・元ページの一時アクセス・data画像で自動表示する。Chromeの追加許可がない別配信元だけ、実clickで要求する。
+
+- `npm test`: **331 PASS / 既存対象外1 SKIP**。元ページの所有者/候補/同origin/移動・閉鎖、未許可の取得・権限要求・通知loopゼロ、取消/再許可、同host別port、確認中の権限追加、遅延予約・decoder出力の実解放を待つdrainを確認。`npm run check` / `git diff --check`: PASS。
+- Chrome156.0.8078.80の `npm run test:browser`: PASS。自動表示、両labelによる選択、元形式・任意フォルダ・実JPEG/PNG/WebP変換・再試行・metadata/データ保持・500候補UIを回帰。保存中reload後に自動プレビューの実HTTP2件とfetch台帳2枠を保持した状態でRetryし、プレビュー中断→元保存batch完成→実SVGを確認。保存優先をテスト待ちの追加だけで隠していない。
+- 同Chromeの `npm run test:ux`: **29項目PASS**。広告候補除外、未確認寸法、別候補/拡大、キーボード、reload、保存設定・handle復元、360/640/1280px、実200%zoom、実alarmと予算付き保存を回帰。自動previewと広告heuristicの元ページ情報検証は、合成responseを保留して区別した。
+- 同Chromeの `npm run test:security`: **15項目PASS、pageerror 0**。既存許可/source fallback/dataの自動表示、未許可と拒否後の取得ゼロ、取消時の同期失効・再取得ゼロ・再許可後の復帰、許可再要求なしの通信失敗retry、CSP・redirect・容量/画素上限・中断と解放を確認。取消/再許可はテスト用必須host grantを外せないため明記したAPI境界fixtureで、実optional権限UIとは区別する。
+- 実Chrome for Testing116.0.5845.96の `npm run test:compat`: **13項目PASS、pageerror 0**。自動プレビュー、収集/継続/復元、拡大、実保存/変換、metadata、EXIF、GIF静止画、codec workerとledger解放を確認。
+- 別の隔離Chrome116・本番と同じmanifest権限で、実ツールバーの拡張メニューからImageCrateを操作した。`permissions.contains(localhost)=false`、永続host追加なしのまま、同一origin合成SVG2件を自動表示、640×480寸法、未選択、`permissions.request`呼出し0、表示操作ボタン0を確認。元ページをabout:blankへ移動すると旧画像が0になることも確認。主担当が自動表示の画面を目視した。個人profileや実サイトを使っていない。
+- 独立設計/コード審査で、同host別portの未許可状態、確認中の権限追加、drain前に未確定だった予約と遅延decoder出力のreleaseを修正し、再現harness・回帰試験・再審査で解消。最終の対象範囲に未解決must-fixなし。
+
+結果: `/private/tmp/imagecrate-auto-ux/`、`/private/tmp/imagecrate-auto-compat/`、`/private/tmp/imagecrate-auto-security-final/`。実toolbar試験: `/var/folders/6s/jk3mxwcn2x98rygsq4qz_mc80000gn/T/imagecrate-auto-native-eNe65e/results/report.json` と同階層の `../automatic-preview.png`。過去の本人回答をこの版の使い心地の確認には流用しない。
+
+未確認: 通常Chromeへ修正版を再読み込みした実サイトでの本人操作感、実optional host許可の取消/再許可UI、スクリーンリーダー。native OS pickerの結果は今回の自動表示変更の確認に含めない。
+
 ## 情報保持・保存先記憶の制御 — 2026-11-01
 
 対象は保存結果のbasename化・旧session移行、閉鎖済みsource情報の削減、次回用保存先のON/OFF、連絡先と保持説明、合成メタデータ検証。実装・自動検証・実UI・本人試用は分けて記録する。

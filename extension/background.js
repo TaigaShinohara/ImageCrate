@@ -135,6 +135,21 @@ async function syncRecoveryAlarm() {
 const active = state => summarizeJobs(state.jobs).active > 0;
 const managed = state => requiresWorkspace(state.batch || {});
 async function liveTab(id) { try { return await chrome.tabs.get(id); } catch { return null; } }
+async function sourcePreviewAccess(state,message) {
+  // activeTab's temporary host access is separate from permissions.contains().
+  // Only the current workspace may use it for an exact collected candidate on
+  // its still-live source page. Chrome remains the final fetch permission gate.
+  if (!message.instance || message.instance !== state.imageInstance) throw new Error('作業ページが更新されました。元ページから拡張を押し直してください。');
+  if (typeof message.url !== 'string' || message.url.length > 131072 || !state.scanned || state.scan?.invalidated
+    || !selectableItems(state).some(item=>item.url === message.url)) return false;
+  let image,source;
+  try { image=new URL(message.url);source=new URL(state.url); } catch { return false; }
+  if (!['http:','https:'].includes(image.protocol) || image.username || image.password
+    || !['http:','https:'].includes(source.protocol) || source.username || source.password
+    || image.origin !== source.origin) return false;
+  const tab=await liveTab(state.tabId);
+  return Boolean(tab && tab.status !== 'loading' && tab.url === state.url);
+}
 async function ownsWorkspaceTab(state, tab) {
   if (!tab) return false;
   const expected=chrome.runtime.getURL(`workspace.html?id=${state.id}`);
@@ -928,6 +943,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
     if (!state || state.closed || sender.tab?.id !== state.workspaceTabId) throw new Error('作業情報が見つかりません。元ページから拡張を押し直してください。');
     switch(message.type) {
       case 'get': return pump(state);
+      case 'preview-access': return sourcePreviewAccess(state,message);
       case 'prune-directories': {
         // Keep the live batch/session set under the same mutation queue as save.
         // A page's startup snapshot may already be stale when another tab saves.
