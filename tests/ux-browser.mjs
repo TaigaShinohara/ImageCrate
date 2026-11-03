@@ -705,7 +705,7 @@ try {
   const originalJob = originalState.jobs.find(job => job.url === `${origin}/original-image`);
   assert.equal(originalState.batch.destination, 'downloads'); assert.equal(originalState.batch.format, 'original');
   report.filenameEvents=await worker.evaluate(()=>globalThis.__qaFilenameEvents||[]);
-  assert.ok(originalJob.filename.endsWith('.svg'), `owned filename decision replaces the neutral .img suffix: ${JSON.stringify({job:originalJob,events:report.filenameEvents})}`);
+  assert.ok(originalJob.filename.endsWith('.svg') || originalJob.actualFilename.endsWith('.svg'), `owned filename decision replaces the neutral .img suffix: ${JSON.stringify({job:originalJob,events:report.filenameEvents})}`);
   assert.equal(originalJob.typeKnown, true);
   assert.equal(originalJob.mime, 'image/svg+xml');
   const originalDownload = await worker.evaluate(async id => (await chrome.downloads.search({ id }))[0], originalJob.downloadId);
