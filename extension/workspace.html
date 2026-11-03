@@ -26,10 +26,11 @@
   <symbol id="icon-height" viewBox="0 0 24 24"><path d="M12 4v16M8 7l4-4 4 4M8 17l4 4 4-4"/></symbol>
   <symbol id="icon-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
   <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2z"/></symbol>
+  <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
 </svg>
 <main class="shell">
   <header class="topbar">
-    <div class="brand"><img class="brand-icon" src="icons/icon-128.png" width="38" height="38" alt=""><h1>ImageCrate</h1></div>
+    <div class="brand"><span class="brand-icon" role="img" aria-label="ImageCrate"></span><h1>ImageCrate</h1></div>
     <details id="help" class="help-disclosure disclosure">
       <summary aria-controls="help-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-help"/></svg><span>使い方</span></summary>
       <div id="help-panel" class="help-panel disclosure-panel">
@@ -59,7 +60,7 @@
 
   <section class="gallery" aria-labelledby="gallery-heading">
     <div class="gallery-heading"><h2 id="gallery-heading" tabindex="-1">画像</h2><span id="count" class="count">表示0 / 全0件</span></div>
-    <nav class="gallery-views" aria-label="表示する画像"><button id="view-all" class="quiet" aria-pressed="true">すべて</button><button id="view-selected" class="quiet" aria-pressed="false">選択済み 0</button><button id="view-added" class="quiet" aria-pressed="false" hidden>今回追加</button></nav>
+    <nav class="gallery-views" aria-label="表示する画像"><button id="view-all" class="quiet" aria-pressed="true">すべて</button><button id="view-selected" class="quiet" aria-pressed="false">選択済み 0</button><button id="view-added" class="quiet" aria-pressed="false" hidden>新しく見つかった画像</button></nav>
     <div id="search-tools" class="search-tools">
       <label class="search-field"><span class="sr-only">画像を検索</span><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><input id="query" type="search" placeholder="画像を検索" autocomplete="off"></label>
       <details id="filters" class="filter-disclosure disclosure">
@@ -142,6 +143,7 @@
     <div class="control-row">
       <p class="scan-status" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="message">ページを確認しています</span></p>
       <div class="selection-tools">
+        <button type="button" id="quick-ad-filter" class="quick-ad-btn" aria-pressed="false" title="広告らしい画像を除外"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><span>広告除外</span></button>
         <button id="reset-filters" class="quiet" hidden>条件をリセット</button>
         <button id="select-visible" class="quiet"><svg class="icon" aria-hidden="true"><use href="#icon-select"/></svg><span>表示中を選択</span></button>
         <button id="clear" class="quiet" disabled><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg><span>すべて解除</span></button>
@@ -149,8 +151,13 @@
     </div>
     <a id="skip-save" class="skip-link" href="#save-heading">保存操作へ移動</a>
     <section id="preview-access" class="preview-access" aria-labelledby="preview-access-heading" hidden>
-      <h3 id="preview-access-heading">プレビューのアクセス許可が必要です</h3>
-      <p class="preview-access-intro">許可すると、この配信元の画像をまとめて表示します。許可しなくても画像の選択と元の形式での保存はできます。</p>
+      <div class="preview-access-head">
+        <svg class="icon preview-access-icon" aria-hidden="true"><use href="#icon-shield"/></svg>
+        <div class="preview-access-titles">
+          <h3 id="preview-access-heading">プレビューのアクセス許可が必要です</h3>
+          <p class="preview-access-intro">安全のため、外部の画像配信元へのアクセス許可が必要です。許可しなくても選択と保存はできます。</p>
+        </div>
+      </div>
       <div id="preview-access-origins" class="preview-access-origins"></div>
     </section>
     <div id="grid" class="grid" aria-label="画像一覧" aria-busy="false"></div>

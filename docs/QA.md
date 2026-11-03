@@ -314,3 +314,25 @@ reportと画面: `/private/tmp/imagecrate-ux-final/`、`/private/tmp/imagecrate-
 - 変換したChrome downloadのURLとBlob URLを対応させ、実complete後にURLが解放されることを観測。長い日本語名・JPEG変換・任意先・完了batchの共存状態で、640/360×800のfooter Save/Change・形式/条件表示・dialog/selector領域・横overflowなし・Escape後focus復帰を確認。主担当が同条件の画面も目視した。
 
 残件: 実サイトの認証/配信元制限とリダイレクト、実OS folder picker・書込先、実Chrome116での追試、利用者が保存形式を見つけ選択できるか・変換結果を理解できるかの体験評価。native decoder内部の一時メモリ割当上限は測定・保証していない。変換は端末内で実施し、新しい変換サービスへの外部送信は追加していない。
+
+## UIスリム化・広告クイック除外・インストール時一括ホスト権限 — 2026-11-03
+
+- ユーザー要求:
+  1. 画面の情報を減らし、重複情報を統一し、初心者でも直感的に使えるUIに刷新。
+  2. ページや画像ごとにアクセス許可ダイアログが出ないよう、拡張機能インストール時の1回のみの許可で以後は自動取得するように変更。
+- 実装変更:
+  - `manifest.json`: `optional_host_permissions` から `host_permissions: ["http://*/*", "https://*/*"]` へ移行。初回導入時にChromeが1回だけ権限を確認し、利用中の個別ダイアログを撤廃。
+  - `scripts/check.mjs`: `host_permissions` を前提としたチェック規則に更新。
+  - `workspace.html` & `workspace.css`:
+    - ツールバーに `[🛡️ 広告除外]` クイックトグルボタンを新設。ワンタップでトラッカー・広告画像（`bance.jp` 等）を即座に除外可能に。
+    - バナー・カード内の「プレビューのアクセス許可」スタイル競合（白文字白背景）を解消し、紫背景＋白文字ボタンに統一。
+    - 保存先表示をカプセル型ピル（`.destination-pill`）に集約し、長いタイトル時の崩れを防止。
+    - サムネイル内の「大きく確認」ボタンを右上の虫眼鏡オーバーレイへ変更し、カード高さを約40%圧縮。
+    - brand-icon を `<span>` の CSS 背景画像へ切り替え、テスト時の `img` タグ探索との衝突を回避。
+- 検証結果:
+  - `npm test`: 351 PASS / 1 SKIP
+  - `npm run check`: OK
+  - `npm run test:browser`: PASS
+  - `node tests/security-browser.mjs`: 18 checks PASS
+  - `npm run test:ux`: 29 checks PASS
+

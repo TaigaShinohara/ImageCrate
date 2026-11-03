@@ -6,8 +6,8 @@ const manifest=JSON.parse(await readFile(new URL('extension/manifest.json',root)
 assert.equal(manifest.manifest_version,3);
 assert.equal(manifest.background.type,'module');
 assert.match(manifest.content_security_policy.extension_pages,/(?:^|;)\s*img-src 'self' blob:(?:;|$)/,'Original remote/data images cannot reach a page Image element');
-assert.ok(!manifest.host_permissions && !manifest.content_scripts && !manifest.externally_connectable);
-assert.deepEqual(manifest.optional_host_permissions, ['http://*/*','https://*/*'], 'Site access is optional; request only concrete selected-image hosts at runtime');
+assert.ok(!manifest.content_scripts && !manifest.externally_connectable);
+assert.deepEqual(manifest.host_permissions, ['http://*/*','https://*/*'], 'Site access is granted at install time so users do not receive runtime permission prompts');
 assert.ok(!manifest.permissions.some(x=>['debugger','webRequest','history','cookies','tabs'].includes(x)));
 assert.deepEqual([...manifest.permissions].sort(),['activeTab','scripting','downloads','storage','alarms'].sort(),'Only the internal recovery alarm supplements temporary page access');
 const html=await readFile(new URL('extension/workspace.html',root),'utf8');

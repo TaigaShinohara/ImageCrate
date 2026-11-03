@@ -213,7 +213,8 @@ export class Gallery {
         const source=node('p','preview-access-source'),scope=node('p','preview-access-scope'),message=node('p','preview-access-message');
         scope.id=`preview-access-scope-${++this.previewSequence}`;message.setAttribute('role','status');
         scope.textContent='この配信元の全パス・全ポートへのアクセスが対象です。サイトのログイン状態を使って画像を取得します。';
-        const button=node('button','secondary preview-access-grant','この配信元の画像を表示');button.type='button';button.dataset.host=key;
+        const button=node('button','secondary preview-access-grant');button.type='button';button.dataset.host=key;
+        button.append(icon('eye'),node('span',null,'この配信元の画像を表示'));
         button.setAttribute('aria-describedby',scope.id);info.append(source,scope,message);element.append(info,button);list.append(element);
         row={element,source,message,button};this.permissionRows.set(key,row);
       }
@@ -379,7 +380,7 @@ export class Gallery {
     $('view-all').setAttribute('aria-pressed',String(this.mode==='all'));
     $('view-selected').setAttribute('aria-pressed',String(this.mode==='selected'));
     $('view-added').setAttribute('aria-pressed',String(this.mode==='added'));
-    $('view-added').hidden=!(state.scan?.addedURLs?.length);
+    $('view-added').hidden=!(state.scan?.addedURLs?.length && state.scan.addedURLs.length < (state.items?.length || 0));
     $('next-page').hidden=!state.scan?.hasMore;
     $('measure-refresh').hidden=true;
     const unknown=candidates.filter(i=>!['decoded','measured'].includes(i.dimensionSource)).length;
@@ -405,7 +406,6 @@ export class Gallery {
       const status=node('span','item-status',this.status(item.url));status.id=`image-status-${index}`;status.dataset.url=item.url;
       status.dataset.state=(state.jobs.find(j=>j.url===item.url)||state.history?.find(j=>j.url===item.url))?.status || '';
       body.append(name,meta,status);
-      if(state.scan?.addedURLs?.includes(item.url))body.append(node('span','new-marker','今回追加'));
       label.append(input,body);
       const jump=node('button','card-save-jump','保存操作へ移動');jump.type='button';jump.onclick=()=>this.focusSave();
       jump.dataset.galleryRole='save';jump.addEventListener('focus',()=>{this.lastURL=item.url;});

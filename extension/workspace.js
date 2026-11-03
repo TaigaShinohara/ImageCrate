@@ -72,6 +72,8 @@ function renderFilterState(filters) {
   if(filters.maxHeight)conditions.push({id:'max-height',label:`高さ ${filters.maxHeight}px以下`});
   if(filters.type)conditions.push({id:'type',label:filters.type.toUpperCase()});
   if(filters.excludeAdLike)conditions.push({id:'exclude-ad-like',label:'広告らしい画像を除外'});
+  const quickAd=$('quick-ad-filter');
+  if(quickAd){quickAd.setAttribute('aria-pressed',String(filters.excludeAdLike===true));quickAd.dataset.active=String(filters.excludeAdLike===true);}
   $('filter-count').textContent=conditions.length;$('filter-count').hidden=!conditions.length;
   $('reset-filters').hidden=!conditions.length && !filters.query;
   $('active-filters').hidden=!conditions.length;
@@ -199,11 +201,15 @@ function renderImages() {
 }
 async function scan(continuation=false) {
   if(isBusy() || recorder?.busy) return;
+  const isInitial = !state.scanned;
   loading=true;clearError();updateSummary();$('message').textContent='画像を探しています…';
   try { await uiWrites.catch(()=>{});applyState(await send('scan',{continuation}));render();const added=state.scan?.addedURLs?.length || 0;
     $('message').textContent=state.scan?.workLimited ? '処理量で区切りました。「続きの候補」で再開できます。選択した画像は保持しています。'
       : state.scan?.scanLimited ? '取得の上限に達しました。取得済みの画像を確認してください。'
-      : continuation?`次の${state.items.length}件の候補を取得`:`${state.items.length}件の候補を取得 · 今回追加${added}件`; }
+      : continuation?`次の${state.items.length}件の候補を取得`
+      : isInitial ? `${state.items.length}件の候補を取得`
+      : added ? `${state.items.length}件の候補を取得 · 今回追加${added}件`
+      : `${state.items.length}件の候補を取得`; }
   catch(e){error(e);$('message').textContent='取得できませんでした。元ページからやり直せます。';}
   finally {loading=false;updateSummary();}
 }
@@ -775,6 +781,10 @@ $('reset-height')?.addEventListener('click', () => {
 });
 
 for(const id of ['query','type','exclude-ad-like'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
+$('quick-ad-filter')?.addEventListener('click',()=>{
+  const el=$('exclude-ad-like');
+  if(el&&state){el.checked=!el.checked;renderImages();persistUI(gallery.viewPatch()).catch(error);}
+});
 $('select-visible').addEventListener('click',()=>{const urls=[...new Set([...selected,...gallery.visible.map(i=>i.url)])];persistUI({selectedURLs:urls}).then(()=>gallery.sync()).catch(error);});
 $('clear').addEventListener('click',()=>persistUI({selectedURLs:[]}).then(()=>renderImages()).catch(error));
 $('recovery-cancel').addEventListener('click',()=>persistUI({saveScope:'selection',failedBatchId:null}).catch(error));

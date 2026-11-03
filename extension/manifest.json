@@ -11,7 +11,10 @@
     "storage",
     "alarms"
   ],
-  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "action": {
     "default_title": "ImageCrateを開く",
     "default_icon": {
