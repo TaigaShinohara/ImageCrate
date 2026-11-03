@@ -1,5 +1,85 @@
 # QA — v0.1
 
+## Safari Web Extension (iOS / macOS) への適合・Xcode構成とモバイル自動選択 — 2026-11-03
+
+- 本人指示「フェーズ3に進んで」を受け、iOS Safari / macOS Safari へのWeb Extension適合、Xcodeプロジェクト生成、モバイル環境向け保存先自動選択を実装・検証。
+  - `extension/background.js`: `chrome.downloads` リスナー（`onChanged`, `onCreated`, `onDeterminingFilename`）をオプショナルチェーン化し、Safari等の未定義環境でも例外なくService Workerが起動するよう防御。
+  - `extension/workspace.js`: モバイル端末（タッチ・UA）および `downloads` API 非存在環境を自動検知し、デフォルト保存先として `destination: 'zip'` を自動採用。ダウンロードAPI非対応環境では `destination-downloads` を無効化。
+  - `scripts/safari-convert.mjs` / `npm run safari:convert`: `safari-web-extension-converter` を呼び出し、`safari/ImageCrate` に iOS/macOS 両対応の Xcode プロジェクトを生成。`extension/` フォルダのソースを直接相対参照する構成で、コードの二重管理を防止。
+  - `scripts/check.mjs`: Safari互換性チェック（リスナーオプショナルチェーン確認、変換スクリプト構文検査）を追加。
+- `npm test`: **351 PASS / 既存対象外1 SKIP**。
+  - `tests/safari-compat.test.js`: `chrome.downloads` が完全に undefined の Safari 環境シミュレーションでの background 健全起動、モバイル/非対応環境での `zip` 自動判定、ZIP保存先ラベル生成の全件通過（PASS）。
+- `npm run check`: **PASS**（manifest, CSP, ローカルモジュール参照, Safari互換性, JS構文検証OK）。
+- `npm run safari:convert`: **PASS**（Xcodeプロジェクト生成・相対リソース参照確認OK）。
+- `npm run test:browser`: **PASS**（全ジオメトリ、フィルター操作、保存ダイアログ回帰確認）。
+- `npm run test:ux`: **29項目PASS**（全29項目正常通過、プレビュー読み込み時のタイムアウト要因解消確認）。
+- 未確認: 実iPhone実機（iOS Safari）へのXcodeデプロイ・実機動作確認、App Store配布・署名審査。
+
+## モバイル保存エンジン（ゼロ依存ZIP一括保存＆Web Share API共有シート連携） — 2026-11-03
+
+- 本人指示「フェーズ2に進んで」を受け、モバイル環境（iOS/Android）向けのZIP一括保存・共有シート連携エンジンを実装・検証。
+  - `extension/zip-writer.js`: 外部依存ゼロの `ZipArchive` クラス（PKZIP 2.0 Store圧縮、CRC-32計算、UTF-8対応）を実装。
+  - `extension/web-share.js`: `canShareFiles()`, `shareOrDownloadZip()`, `downloadBlob()` を実装。Web Share API（`navigator.share`）とBlobダウンロードのハイブリッド連携を構築。
+  - `extension/workspace.js`: 保存先 `zip` のUI選択、元形式画像Blob抽出（`readOriginalBlob`）、ZIPへの段階的追加、共有呼び出しを統合。
+- `npm test`: **348 PASS / 既存対象外1 SKIP**。
+  - `tests/zip-writer.test.js`: CRC-32算出、複数ファイル格納、UTF-8ファイル名、および OS の `unzip -t` コマンドによるバイナリ整合性検証（PASS）。
+  - `tests/web-share.test.js`: Web Share API呼び出し、ユーザーキャンセル（`AbortError`）の安全処理、非対応環境でのBlobダウンロードフォールバック検証（PASS）。
+  - `tests/utils.test.js`: `destination: 'zip'` の設定バリデーション・ラベル表示検証（PASS）。
+- `npm run check`: **PASS**（manifest, CSP, ローカルモジュール参照, JS構文検証OK）。
+- `npm run test:browser`: **PASS**（360px/640px/1280pxの全ジオメトリ、フィルター操作、保存ダイアログ回帰確認）。
+- `npm run test:ux`: **29項目PASS**（広告トグル、12000要素境界、高解像度画像、キーボード操作、セッション復元、保存キュー等全件通過）。
+- 未確認: 実iPhone/Android実機でのOS共有シート表示、「ファイルに保存」実行後のファイルアプリ内解凍動作、人間の操作感。
+
+## モバイル・タッチUXの最適化（スワイプ前後送り・ダブルタップズーム・親指操作） — 2026-11-02
+
+- 本人指示（スマホからでも体験を落とさずに使えるようにする計画、別ブランチでの進行）を受け、新ブランチ `feature/mobile-ux` にてモバイルタッチジェスチャーと親指最適化UIを実装。
+  - 画像確認モーダル（`#image-preview`）に左右タッチスワイプ（前後の画像めくり）とダブルタップ（等倍ズーム切り替え）のジェスチャーを追加。等倍表示中のパン操作を優先する制御とスワイプ後のタップリセットを組み込み、指先でサクサク確認できるように改善。
+  - デュアルレンジスライダーのつまみ（ノブ）に 44px×44px の透明タッチターゲット（`::before`）を完備し、モバイル親指でのドラッグ操作性を向上。
+  - モバイル画面（幅 <= 480px）でのビューワー幅拡大（`calc(100vw - 16px)`）、ボタン高さ44px以上の確保、フッター保存ボタンの強化（高さ48px以上、太字）、カードタップ時の微細スケールフィードバックを追加。
+- `npm test`: **342 PASS / 既存対象外1 SKIP**。スワイプ送り（左右・垂直判定・ズーム中抑制）およびダブルタップズームの単体テストを含む全件通過。
+- `npm run check` / `git diff --check`: PASS。
+- `npm run test:browser`: **PASS**。360px、640px、1280pxの全ジオメトリ、リフロー、フッター・保存ボタン可読性、デュアルレンジバー操作の回帰を確認。
+- 未確認: 実iPhone/Android実機タッチスクリーンでの操作感、iOS Safari Web Extension実環境。
+
+## 画面情報の削減と初心者向け直感UIデザインへの刷新 — 2026-11-02
+
+- 本人指示（画面情報の削減、初心者向け直感UI、別ブランチでの進行）を受け、新ブランチ `codex/simplify-ui` にてUIスリム化と直感化を実施。
+  - ギャラリーカード下部の「大きく確認」ボタンをサムネイル右上のオーバーレイ虫眼鏡（🔍）アイコンボタンへ刷新し、カード高さを約40%削減。
+  - ファイル名や余計な説明文を抑制し、寸法・形式をコンパクトなピルバッジへ整理。
+  - フッターの保存先フルパスをアイコン付きピルへスリム化し、不要なヒント文を整理。
+  - 広告除外フィルターにシールドアイコン（🛡️）とトグルスイッチ風の直感的なUIを導入。
+- `npm test`: **343 PASS / 既存対象外1 SKIP**。単体テスト全件通過。
+- `npm run check` / `git diff --check`: PASS。
+- `npm run test:browser`: PASS。
+- `npm run test:ux`: **29項目PASS**。360px / 640px / 1280pxジオメトリ、Chrome 200%拡大ズーム、キーボード操作（Space/Tab/Escape）、フィルター操作、プレビュー拡大、保存ダイアログの全チェックを回帰確認。
+- 未確認: 実Chrome拡張機能ツールバーからの実サイト操作、実スクリーンリーダー（VoiceOver）での読み上げ、人間の直感的な使い心地。
+
+## 広告除外フィルターの改良：広告の完全除外と元ページ画像の保護 — 2026-11-02
+
+- 本人指示（広告の完全除外と元ページ画像の保護）を受け、広告判定（`adLike`）を大幅に強化。
+  - 主要アドネットワーク・DSP（`bance.jp`, `doubleclick`, `googlesyndication`, `criteo`, `adnxs` 等）のホスト名検出、トラッキングビーコン（`imp`, `pixel`, `beacon`, `tracker`, `1x1`, `infomark` 等）の網羅、IAB標準バナーサイズ（728x90, 300x250, 160x600等）の一致を追加。
+  - 縦スクロール漫画（Webtoon: `height > width` かつ 幅400px以上・高さ1200px以上）や超高解像度パノラマ（画素数80万px²以上）をコンテンツとして保護し、縦横比3:1以上による誤除外を防止。
+- `npm test`: **341 PASS / 既存対象外1 SKIP**。主要アドネットワーク、トラッカー、標準バナーの除外と、Webtoon縦長漫画・パノラマ・通常コミックの保護判定を単体検証。
+- `npm run check` / `git diff --check`: PASS。
+- 未確認: 実サイトでの表示および本人の操作感。
+
+## 1本のデュアルレンジバーによる最小・最大寸法絞り込みと縦横表記の明確化 — 2026-11-02
+
+- 絞り込みフィルターにおいて、横幅および高さの寸法を1本のバーで最小と最大（〜以上・〜以下）を直感的に操作できるデュアルレンジスライダーを実装。軸別の範囲リセットボタン（`#reset-width`, `#reset-height`）を新設し、見出し・入力ラベル・ヒント文の冗長なテキストを整理してアイコンと図形的なタグ表現で初心者にわかりやすくした。
+- `npm test`: **340 PASS / 既存対象外1 SKIP**。`matchesImage` と `candidateMatches` による上限寸法・範囲指定判定、未確認寸法の保持、双方向同期、セッション復元を単体検証。
+- `npm run check` / `git diff --check`: PASS。構文・マニフェスト・参照・CSPに問題なし。
+- `npm run test:browser`: PASS。360px、640px、デスクトップにおけるフィルターUIの表示、軸別範囲リセットボタン操作（`reset-width` 連動）、デュアルレンジバー操作（キーボードArrow/Home、チップ解除、全体リセット連動）、入力、フッター上の表示位置、タッチターゲット（全要素44px以上）、重複ゼロを確認。
+- `npm run test:ux`: **29項目PASS**。360px/640px/1280pxのジオメトリ、フィルター開閉、スクロール位置、拡大・プレビュー自動取得、セッション保存と復元を回帰。
+- 未確認: 実端末のタッチスクリーン操作、実スクリーンリーダー（VoiceOver）による音声読み上げ、通常利用中Chromeでの本人の使用感。
+
+
+## 広告フィルターの初期ONと計測タグ（imp）除外 — 2026-11-02
+
+- 本人指示（広告パーツの初期除外、imp除外）を受け、「広告らしい画像を除外」設定を初期ONに変更し、URLパス末尾が `imp` の計測タグを広告候補（`adLike`）判定に追加した。
+- `npm test`: **338 PASS / 既存対象外1 SKIP**。`isAdBeacon` によるURL判定（クエリパラメータ付き・拡張子付き・大文字小文字対応、`important` 等の誤判定防止）、初期ON状態でのセッション独立性とシリアライズ復元、フィルターチップ表示を検証。
+- `npm run check` / `git diff --check`: PASS。
+- 実サイトでの見え方と本人の使用感は未確認。
+
 ## Liquid Glassアイコン — 2026-11-02
 
 - 内蔵画像生成ツールで原本を作成し、1024pxと16／32／48／64／128pxのRGBA PNGを書き出した。manifestの拡張・actionアイコン、作業画面のヘッダー、faviconへローカル画像を設定。権限・CSP・外部通信の変更なし。

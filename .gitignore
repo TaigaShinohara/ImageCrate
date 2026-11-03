@@ -6,3 +6,9 @@ node_modules/
 playwright-report/
 test-results/
 *.zip
+
+# Xcode
+*.xcuserdata/
+*.xcscmblueprint
+DerivedData/
+build/

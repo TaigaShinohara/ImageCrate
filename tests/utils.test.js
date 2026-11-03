@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {sanitizePart,mediaType,allowedURL,extensionOf,fileLabel,downloadName,matchesImage,mergeItems,summarizeJobs,publicError} from '../extension/utils.js';
+import {sanitizePart,mediaType,allowedURL,extensionOf,fileLabel,downloadName,matchesImage,mergeItems,summarizeJobs,publicError,saveSettings,requiresWorkspace,destinationLabel} from '../extension/utils.js';
 test('filenames stay inside chosen download folder',()=>{
   assert.equal(sanitizePart('../../bad\\name:*'),'_.._bad_name__');
   assert.equal(sanitizePart('..'),'untitled');
@@ -37,6 +37,18 @@ test('unknown dimensions are excluded only when requested',()=>{
   assert.ok(matchesImage({...item,width:300,height:200},{query:'海',width:200,height:100,type:'png'}));
   assert.ok(!matchesImage(item,{query:'mountain'}));
 });
+test('maximum dimensions and range filtering match candidates correctly',()=>{
+  const item={url:'https://a.test/photo.png',alt:'画像',width:500,height:400,dimensionSource:'decoded'};
+  assert.ok(matchesImage(item,{maxWidth:600}));
+  assert.ok(matchesImage(item,{maxWidth:500}));
+  assert.ok(!matchesImage(item,{maxWidth:499}));
+  assert.ok(matchesImage(item,{maxHeight:500}));
+  assert.ok(matchesImage(item,{maxHeight:400}));
+  assert.ok(!matchesImage(item,{maxHeight:399}));
+  assert.ok(matchesImage(item,{width:400,maxWidth:600,height:300,maxHeight:500}));
+  assert.ok(!matchesImage(item,{width:600,maxWidth:800}));
+  assert.ok(!matchesImage(item,{height:500,maxHeight:600}));
+});
 test('rescan merges URLs, retains records, and adds variants',()=>{
   const before=[{url:'https://a.test/i?size=1',width:100,alt:'first'}];
   const merged=mergeItems(before,[{url:'https://a.test/i?size=1',width:200},{url:'https://a.test/i?size=2',width:400}]);
@@ -49,4 +61,17 @@ test('public errors do not reproduce signed media URLs',()=>{
   const s=publicError(new Error('Failed https://example.test/media?secret=token'));
   assert.ok(!s.includes('secret'));assert.ok(s.includes('[URL]'));
   assert.match(publicError({name:'AbortError'}),/キャンセル/);
+});
+test('saveSettings, requiresWorkspace and destinationLabel support zip destination', () => {
+  const settings = saveSettings({ destination: 'zip', folderName: '旅行写真', format: 'webp' });
+  assert.equal(settings.destination, 'zip');
+  assert.equal(settings.folderName, '旅行写真');
+  assert.equal(settings.format, 'webp');
+  assert.equal(requiresWorkspace(settings), true);
+  assert.equal(destinationLabel(settings), 'ZIP保存 / 旅行写真.zip');
+
+  const defaultZip = saveSettings({ destination: 'zip' }, 'デフォルトページ');
+  assert.equal(defaultZip.destination, 'zip');
+  assert.equal(defaultZip.folderName, 'デフォルトページ');
+  assert.equal(destinationLabel(defaultZip), 'ZIP保存 / デフォルトページ.zip');
 });

@@ -601,6 +601,13 @@ async function submitDownload(state,job,url) {
       await pump(current);
     }
   }).catch(()=>{});
+  if (!chrome.downloads?.download) {
+    owned.status = 'failed';
+    owned.error = 'このブラウザ環境ではダウンロードAPIを利用できません。ZIP保存をご利用ください。';
+    settleNativeFailure(current, owned);
+    await pump(current);
+    return;
+  }
   const accepting=Promise.resolve().then(()=>chrome.downloads.download({url,filename:job.filename,conflictAction:'uniquify',saveAs:false}))
     .then(id=>{entry.downloadId=id;entry.apiAcceptedId=id;if(entry.timedOut)void late({id});return id;},error=>{
       if(entry.timedOut)void late({error});throw error;
@@ -677,7 +684,7 @@ function persistNameDecision(match,item,decision) {
     await save(state);
   }).catch(()=>{});
 }
-chrome.downloads.onDeterminingFilename?.addListener((item,suggestCallback)=>{
+chrome.downloads?.onDeterminingFilename?.addListener((item,suggestCallback)=>{
   let finished=false;
   const suggest=value=>{ if (finished) return; finished=true; if (value) suggestCallback(value); else suggestCallback(); };
   if (item.byExtensionId !== chrome.runtime.id || !validDownloadId(item.id)) { suggest(); return false; }
@@ -976,7 +983,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond) => {
         state.batch = {...settings,id:crypto.randomUUID(),owner:message.instance,
           transferBudget:createTransferBudget(),...(sourceBatchId ? {sourceBatchId} : {})};
         state.ui={...state.ui,saveScope:'selection',failedBatchId:null};
-        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),logicalJobId:crypto.randomUUID(),url:item.url,status:'queued',completionApplied:false,filename:settings.destination === 'directory' ? downloadName(item,settings.folderName,i,KIND,settings.format).split('/').pop() : downloadName(item,settings.folderName,i,KIND,settings.format)}));
+        state.jobs = items.map((item,i)=>({id:crypto.randomUUID(),logicalJobId:crypto.randomUUID(),url:item.url,status:'queued',completionApplied:false,filename:['directory','zip'].includes(settings.destination) ? downloadName(item,settings.folderName,i,KIND,settings.format).split('/').pop() : downloadName(item,settings.folderName,i,KIND,settings.format)}));
         if (managed(state)) { await save(state); return state; }
         return pump(state);
       }
@@ -1126,10 +1133,10 @@ async function reconcilePendingStates(downloadId, includeKnown = false) {
   }
   await syncRecoveryAlarm();
 }
-chrome.downloads.onChanged.addListener(delta => {
+chrome.downloads?.onChanged?.addListener(delta => {
   serial(()=>reconcilePendingStates(delta.id,true)).catch(()=>{});
 });
-chrome.downloads.onCreated?.addListener(item=>{
+chrome.downloads?.onCreated?.addListener(item=>{
   if(item.byExtensionId===chrome.runtime.id) {
     // Event evidence is global, not just unique among this worker's runtime
     // entries. A persisted old attempt may own the same URL/path after restart.

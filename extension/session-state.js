@@ -4,7 +4,7 @@ export const CANDIDATE_BYTE_LIMIT = 6 * 1024 * 1024;
 export const SELECTION_LIMIT = 500;
 const encoder = new TextEncoder();
 export const serializedBytes = value => encoder.encode(JSON.stringify(value)).byteLength;
-export const defaultUI = () => ({view:'all',query:'',width:0,height:0,type:'',excludeAdLike:false,onlySelected:false,scrollY:0,focusAnchor:'',saveScope:'selection',failedBatchId:null});
+export const defaultUI = () => ({view:'all',query:'',width:0,maxWidth:0,height:0,maxHeight:0,type:'',excludeAdLike:false,onlySelected:false,scrollY:0,focusAnchor:'',saveScope:'selection',failedBatchId:null});
 // Display metadata is not the requested path or Chrome's ownership evidence.
 // Keep the actual basename/suffix, never the local directory it came from.
 export function actualFilenameBasename(value) {
@@ -67,7 +67,7 @@ export function applyUIPatch(state, patch = {}, baseRevision) {
   if (['all','selected','added'].includes(patch.view)) ui.view = patch.view;
   if (typeof patch.query === 'string') ui.query = patch.query.slice(0,500);
   if (typeof patch.type === 'string') ui.type = patch.type.slice(0,30);
-  for (const key of ['width','height']) if (Number.isFinite(Number(patch[key])) && Object.hasOwn(patch,key)) ui[key] = Math.max(0,Math.min(100000,Math.floor(Number(patch[key]))));
+  for (const key of ['width','height','maxWidth','maxHeight']) if (Number.isFinite(Number(patch[key])) && Object.hasOwn(patch,key)) ui[key] = Math.max(0,Math.min(100000,Math.floor(Number(patch[key]))));
   for (const key of ['onlySelected','filtersOpen','helpOpen','excludeAdLike']) if (typeof patch[key] === 'boolean') ui[key] = patch[key];
   if (Number.isFinite(patch.scrollY)) ui.scrollY = Math.max(0,Math.min(1e9,patch.scrollY));
   if (typeof patch.focusAnchor === 'string') ui.focusAnchor = patch.focusAnchor.slice(0,131072);

@@ -22,4 +22,8 @@ for(const name of await readdir(new URL('extension/',root))) {
   for(const m of source.matchAll(/from\s+['"](\.\/[^'"]+)['"]/g)) await readFile(new URL(m[1],path));
 }
 for(const path of ['workspace.html','workspace.css',manifest.background.service_worker]) await readFile(new URL('extension/'+path,root));
-console.log(`${manifest.name}: manifest, permissions, local module references and JavaScript syntax OK`);
+const bgSource = await readFile(new URL('extension/' + manifest.background.service_worker, root), 'utf8');
+assert.ok(!/chrome\.downloads\.(?:onChanged|onCreated|onDeterminingFilename)\.addListener/.test(bgSource), 'Downloads listeners must be optionally chained for Safari compatibility');
+const safariScriptCheck = spawnSync(process.execPath, ['--check', new URL('scripts/safari-convert.mjs', root).pathname], { encoding: 'utf8' });
+assert.equal(safariScriptCheck.status, 0, safariScriptCheck.stderr);
+console.log(`${manifest.name}: manifest, permissions, local module references, Safari compatibility and JavaScript syntax OK`);

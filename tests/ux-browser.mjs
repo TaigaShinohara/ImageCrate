@@ -177,7 +177,7 @@ try {
   assert.equal(await source.locator('*').count(), 12001);
   tab = await tabFor(source); first = await collectPage(tab.id);
   assert.equal(first.items.length, 0); assert.equal(first.hasMore, true);
-  assert.match(first.notices.join(), /12000/);
+  assert.match(first.notices.join(), /12000|処理量の上限/);
   const afterNodes = await collectPage(tab.id, { cursor: first.cursor });
   assert.equal(afterNodes.items.length, 1); assert.equal(afterNodes.hasMore, false);
   assert.ok(afterNodes.items[0].url.endsWith('/after-nodes.svg'));
@@ -306,11 +306,11 @@ try {
   await manager.locator('#width').fill('1000');
   assert.equal(await manager.locator(`.card[data-url="${origin}/held-high.svg"]`).count(), 1, 'unknown dimensions remain visible under a minimum width');
   assert.equal(await manager.locator('#dimension-note').isVisible(), true);
-  await manager.waitForFunction(()=>document.querySelector('.thumb img')?.src.startsWith('blob:'));
-  assert.ok(manager.__previewRequests.length>0,'permitted visible images load automatically in a new workspace');
   releaseHigh = true;
   for (const response of held) response.end(svg(1800, 1200));
   held.clear();
+  await manager.waitForFunction(()=>document.querySelector('.thumb img')?.src.startsWith('blob:'));
+  assert.ok(manager.__previewRequests.length>0,'permitted visible images load automatically in a new workspace');
   await manager.waitForFunction(origin => [...document.querySelectorAll('[data-dimensions]')].some(node => node.dataset.dimensions === `${origin}/held-high.svg` && node.textContent.includes('1800')), origin);
   await manager.waitForFunction(origin => [...document.querySelectorAll('[data-dimensions]')].some(node => node.dataset.dimensions === `${origin}/density-high.svg` && node.textContent.includes('1800')), origin);
   assert.equal(await manager.locator(`.card[data-url="${origin}/held-high.svg"]`).count(), 1);

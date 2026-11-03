@@ -22,6 +22,10 @@
   <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
   <symbol id="icon-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 4 2c-1 .7-1.5 1-1.5 2M12 17h.01"/></symbol>
   <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+  <symbol id="icon-width" viewBox="0 0 24 24"><path d="M4 12h16M7 8l-4 4 4 4M17 8l4 4-4 4"/></symbol>
+  <symbol id="icon-height" viewBox="0 0 24 24"><path d="M12 4v16M8 7l4-4 4 4M8 17l4 4 4-4"/></symbol>
+  <symbol id="icon-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2z"/></symbol>
 </svg>
 <main class="shell">
   <header class="topbar">
@@ -62,13 +66,74 @@
         <summary aria-controls="filter-panel" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="#icon-filter"/></svg><span>絞り込み</span><span id="filter-count" class="filter-count" hidden></span><span class="chevron" aria-hidden="true"></span></summary>
         <div id="filter-panel" class="filter-panel disclosure-panel">
           <div class="ad-filter">
-            <label class="ad-filter-toggle"><input id="exclude-ad-like" type="checkbox" aria-describedby="ad-filter-help"><span>広告らしい画像を除外</span></label>
-            <p id="ad-filter-help" class="filter-hint">縦横比3:1以上・短辺200px未満・GIFを除外します。元ページの寸法で概算し、プレビュー後は実寸法を使います。不明な候補は残します。広告以外の画像も除外される場合があります。</p>
+            <label class="ad-filter-toggle"><input id="exclude-ad-like" type="checkbox" aria-describedby="ad-filter-help" checked><svg class="icon shield-icon" aria-hidden="true"><use href="#icon-shield"/></svg><span>広告らしい画像を除外</span></label>
+            <p id="ad-filter-help" class="filter-hint">バナー広告やトラッキングタグを除外し、元ページの漫画・コンテンツ画像を残します。</p>
           </div>
-          <label class="field">最小幅 <span>px</span><input id="width" type="number" min="0" value="0" inputmode="numeric"></label>
-          <label class="field">最小高さ <span>px</span><input id="height" type="number" min="0" value="0" inputmode="numeric"></label>
-          <label class="field">形式<select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">形式不明</option></select></label>
-          <p class="filter-hint">寸法未確認の候補も表示します。画像を表示すると寸法を確認できます。</p>
+          <div class="dimension-section" aria-label="寸法で絞り込み">
+            <div class="dimension-axis-group">
+              <div class="dimension-axis-header">
+                <div class="dimension-axis-title-wrap">
+                  <svg class="icon axis-icon" aria-hidden="true"><use href="#icon-width"/></svg>
+                  <span class="dimension-axis-title">横幅</span>
+                </div>
+                <button type="button" class="axis-reset-btn" id="reset-width" aria-label="横幅の範囲をリセット" title="横幅の範囲をリセット">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+                  <span>リセット</span>
+                </button>
+              </div>
+              <div class="dual-range-container">
+                <div class="dual-range-wrapper" id="width-slider-wrap" aria-label="横のサイズ範囲スライダー">
+                  <div class="dual-range-track">
+                    <div class="dual-range-highlight" id="width-highlight"></div>
+                  </div>
+                  <div class="dual-range-thumb thumb-min" id="width-thumb-min" tabindex="0" role="slider" aria-label="横の最小幅（〜以上）" aria-valuemin="0" aria-valuemax="4000" aria-valuenow="0"></div>
+                  <div class="dual-range-thumb thumb-max" id="width-thumb-max" tabindex="0" role="slider" aria-label="横の最大幅（〜以下）" aria-valuemin="0" aria-valuemax="4000" aria-valuenow="4000"></div>
+                </div>
+              </div>
+              <div class="dimension-inputs-row">
+                <span class="dimension-bound-tag" aria-hidden="true">以上</span>
+                <input id="width" class="dimension-number" type="number" min="0" max="100000" value="0" inputmode="numeric" aria-label="横の最小幅（〜以上）">
+                <span class="dimension-unit" aria-hidden="true">px</span>
+                <span class="dimension-sep" aria-hidden="true">〜</span>
+                <span class="dimension-bound-tag" aria-hidden="true">以下</span>
+                <input id="max-width" class="dimension-number" type="number" min="0" max="100000" value="0" placeholder="なし" inputmode="numeric" aria-label="横の最大幅（〜以下）">
+                <span class="dimension-unit" aria-hidden="true">px</span>
+              </div>
+            </div>
+
+            <div class="dimension-axis-group">
+              <div class="dimension-axis-header">
+                <div class="dimension-axis-title-wrap">
+                  <svg class="icon axis-icon" aria-hidden="true"><use href="#icon-height"/></svg>
+                  <span class="dimension-axis-title">高さ</span>
+                </div>
+                <button type="button" class="axis-reset-btn" id="reset-height" aria-label="高さの範囲をリセット" title="高さの範囲をリセット">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+                  <span>リセット</span>
+                </button>
+              </div>
+              <div class="dual-range-container">
+                <div class="dual-range-wrapper" id="height-slider-wrap" aria-label="縦のサイズ範囲スライダー">
+                  <div class="dual-range-track">
+                    <div class="dual-range-highlight" id="height-highlight"></div>
+                  </div>
+                  <div class="dual-range-thumb thumb-min" id="height-thumb-min" tabindex="0" role="slider" aria-label="縦の最小高さ（〜以上）" aria-valuemin="0" aria-valuemax="4000" aria-valuenow="0"></div>
+                  <div class="dual-range-thumb thumb-max" id="height-thumb-max" tabindex="0" role="slider" aria-label="縦の最大高さ（〜以下）" aria-valuemin="0" aria-valuemax="4000" aria-valuenow="4000"></div>
+                </div>
+              </div>
+              <div class="dimension-inputs-row">
+                <span class="dimension-bound-tag" aria-hidden="true">以上</span>
+                <input id="height" class="dimension-number" type="number" min="0" max="100000" value="0" inputmode="numeric" aria-label="縦の最小高さ（〜以上）">
+                <span class="dimension-unit" aria-hidden="true">px</span>
+                <span class="dimension-sep" aria-hidden="true">〜</span>
+                <span class="dimension-bound-tag" aria-hidden="true">以下</span>
+                <input id="max-height" class="dimension-number" type="number" min="0" max="100000" value="0" placeholder="なし" inputmode="numeric" aria-label="縦の最大高さ（〜以下）">
+                <span class="dimension-unit" aria-hidden="true">px</span>
+              </div>
+            </div>
+          </div>
+          <label class="field type-field"><span class="field-label-wrap"><svg class="icon" aria-hidden="true"><use href="#icon-image"/></svg><span>画像形式</span></span><select id="type"><option value="">すべて</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="png">PNG</option><option value="webp">WEBP</option><option value="gif">GIF</option><option value="avif">AVIF</option><option value="svg">SVG</option><option value="bmp">BMP</option><option value="ico">ICO</option><option value="img">形式不明</option></select></label>
+          <p class="filter-hint">※ 寸法が分からない画像も残します。プレビューで実際の大きさを確認できます。</p>
         </div>
       </details>
     </div>
@@ -95,7 +160,7 @@
 </main>
 <footer id="footer" class="footer">
   <div class="footer-inner">
-    <div class="destination-row"><span class="destination-label">保存先</span><p id="destination-summary" class="destination-summary">Chromeのダウンロード先 / ImageCrate / ページ名</p><button id="destination-change" class="quiet" type="button" aria-label="保存設定を変更" aria-haspopup="dialog" aria-controls="save-settings">変更</button><p class="format-summary">保存形式: <strong id="format-summary">元の形式</strong></p></div>
+    <div class="destination-row"><div class="destination-pill"><svg class="icon destination-icon" aria-hidden="true"><use href="#icon-folder"/></svg><span class="destination-label">保存先:</span><p id="destination-summary" class="destination-summary">Chromeのダウンロード先 / ImageCrate / ページ名</p><span class="destination-sep" aria-hidden="true">·</span><p class="format-summary">形式: <strong id="format-summary">元の形式</strong></p><button id="destination-change" class="quiet destination-btn" type="button" aria-label="保存設定を変更" aria-haspopup="dialog" aria-controls="save-settings">変更</button></div></div>
     <p id="directory-warning" class="directory-warning" hidden>選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。</p>
     <h2 id="save-heading" class="sr-only" tabindex="-1">選択した画像の保存</h2>
     <p id="recovery-summary" class="directory-warning" hidden></p><button id="recovery-cancel" class="quiet" hidden>通常の選択に戻る</button>
@@ -118,6 +183,7 @@
       <legend>保存する場所</legend>
       <label class="destination-option"><input id="destination-downloads" type="radio" name="destination" value="downloads" checked><span><strong>Chromeのダウンロード先</strong><span class="option-caption">ImageCrateフォルダの中に保存</span></span></label>
       <label class="destination-option"><input id="destination-directory" type="radio" name="destination" value="directory"><span><strong>選択したフォルダ</strong><span id="chosen-directory" class="option-caption">まだ選択していません</span></span></label>
+      <label class="destination-option"><input id="destination-zip" type="radio" name="destination" value="zip"><span><strong>ZIPファイルにまとめて保存</strong><span class="option-caption">1つのZIPファイルにまとめて保存・共有</span></span></label>
       <div class="directory-actions"><button id="choose-directory" class="secondary" type="button">フォルダを選ぶ</button><button id="directory-reconnect" class="secondary" type="button" hidden>このフォルダへの保存を許可</button></div>
       <p id="directory-status" class="settings-note directory-status" role="status"></p>
       <p id="directory-details" class="settings-note directory-details" hidden>選択したフォルダへ保存するときは、このタブを開いたままにしてください。保存する画像の配信元へのアクセス許可をChromeに求める場合があります。配信元へのアクセス許可は、Chromeの拡張機能設定で取り消せます。</p>

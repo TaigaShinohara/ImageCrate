@@ -15,19 +15,22 @@ export function sanitizePart(value, fallback = 'untitled') {
   return safe;
 }
 export function saveSettings(input = {}, title = 'ページ') {
-  return {destination: input.destination === 'directory' ? 'directory' : 'downloads',
+  return {destination: input.destination === 'directory' ? 'directory' : input.destination === 'zip' ? 'zip' : 'downloads',
     folderName: sanitizePart(String(input.folderName || '').trim() || title, 'ページ'),
     directoryName: String(input.directoryName || '').slice(0, 512),
     format: ['jpg','png','webp'].includes(input.format) ? input.format : 'original'};
 }
 export function requiresWorkspace(settings = {}) {
-  return settings.destination === 'directory' || ['jpg','png','webp'].includes(settings.format);
+  return settings.destination === 'directory' || settings.destination === 'zip' || ['jpg','png','webp'].includes(settings.format);
 }
 export function formatLabel(format) {
   const labels={jpg:'JPEG (.jpg)',png:'PNG (.png)',webp:'WebP (.webp)'};
   return Object.hasOwn(labels,format) ? labels[format] : '元の形式';
 }
 export function destinationLabel(settings) {
+  if (settings.destination === 'zip') {
+    return `ZIP保存 / ${settings.folderName || 'ImageCrate'}.zip`;
+  }
   return settings.destination === 'directory'
     ? `選択した「${settings.directoryName || 'フォルダ'}」 / ${settings.folderName}`
     : `Chromeのダウンロード先 / ImageCrate / ${settings.folderName}`;
@@ -85,7 +88,9 @@ export function matchesImage(item, filters) {
   const q = (filters.query || '').toLocaleLowerCase();
   return (!q || `${fileLabel(item.url)} ${item.alt || ''} ${item.url}`.toLocaleLowerCase().includes(q))
     && (!filters.width || item.width >= filters.width)
+    && (!filters.maxWidth || item.width <= filters.maxWidth)
     && (!filters.height || item.height >= filters.height)
+    && (!filters.maxHeight || item.height <= filters.maxHeight)
     && (!filters.type || extensionOf(item.url, 'images') === filters.type);
 }
 export function mergeItems(previous, incoming) {

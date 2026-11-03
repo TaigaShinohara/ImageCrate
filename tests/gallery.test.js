@@ -25,6 +25,16 @@ test('unmeasured and density-corrected source dimensions remain available under 
   assert.equal(candidateMatches(item('known',{width:40,height:30,dimensionSource:'measured'}),{}),true);
 });
 
+test('maximum dimension filters retain unknown dimensions and exclude oversized candidates', () => {
+  const filters={maxWidth:1000,maxHeight:700};
+  assert.equal(candidateMatches(item('unknown'),filters),true,'unknown dimensions are kept');
+  assert.equal(candidateMatches(item('source',{width:1400,height:900,dimensionSource:'source'}),filters),true,'source estimates are kept');
+  assert.equal(candidateMatches(item('small',{width:400,height:300,dimensionSource:'decoded'}),filters),true);
+  assert.equal(candidateMatches(item('too-wide',{width:1200,height:500,dimensionSource:'decoded'}),filters),false);
+  assert.equal(candidateMatches(item('too-tall',{width:800,height:800,dimensionSource:'measured'}),filters),false);
+  assert.equal(candidateMatches(item('exact',{width:1000,height:700,dimensionSource:'measured'}),filters),true);
+});
+
 test('keeping unknown dimensions does not bypass text or type conditions', () => {
   assert.equal(candidateMatches(item('landscape'),{query:'landscape',type:'png',width:2000}),true);
   assert.equal(candidateMatches(item('landscape'),{query:'portrait',width:2000}),false);
@@ -73,6 +83,59 @@ test('all GIF candidates are excluded from URL or embedded MIME while query text
   for(const url of ['https://images.test/asset?format=gif','https://images.test/photo.png?name=ad.gif','https://images.test/asset']) {
     assert.equal(candidateMatches(item('unknown',{url}),filters),true,url);
   }
+});
+
+test('tracking beacon imp candidates are excluded under excludeAdLike without dimensions', () => {
+  const filters={excludeAdLike:true};
+  for(const url of [
+    'https://js.dsp.bance.jp/imp',
+    'https://js.dsp.bance.jp/imp?bid=123',
+    'https://ad.example.com/ad/imp.png',
+    'https://ad.example.com/imp_123',
+    'https://ad.example.com/imp-pixel',
+    'https://ad.example.com/imp/pixel.gif',
+  ]) {
+    assert.equal(candidateMatches(item('beacon',{url}),filters),false,url);
+    assert.equal(candidateMatches(item('beacon',{url}),{excludeAdLike:false}),true,`${url} (disabled)`);
+  }
+  for(const url of [
+    'https://site.test/simple.jpg',
+    'https://site.test/important.png',
+    'https://site.test/shrimp.webp',
+  ]) {
+    assert.equal(candidateMatches(item('normal',{url}),filters),true,url);
+  }
+});
+
+test('tracking beacon, ad network domains and standard ad banners are excluded while substantial content is preserved', () => {
+  const filters={excludeAdLike:true};
+  // 広告配信ドメイン・ビーコン・バナー名
+  for(const url of [
+    'https://js.dsp.bance.jp/infomark.png',
+    'https://pagead2.googlesyndication.com/pagead/imgad?id=123',
+    'https://securepubads.g.doubleclick.net/gampad/ad.jpg',
+    'https://static.criteo.net/ad.png',
+    'https://site.test/assets/ad-banner-top.jpg',
+    'https://site.test/pixel.gif',
+    'https://site.test/1x1.png',
+  ]) {
+    assert.equal(candidateMatches(item('ad',{url}),filters),false,url);
+  }
+
+  // IAB標準バナーサイズ（728x90, 300x250, 160x600等）
+  for(const [width,height] of [[728,90],[90,728],[300,250],[250,300],[160,600],[600,160],[320,50],[468,60]]) {
+    assert.equal(candidateMatches(item('standard-ad',{width,height,dimensionSource:'decoded'}),filters),false,`${width}x${height}`);
+  }
+
+  // 元ページの縦長コンテンツ（Webtoon漫画）や高解像度コンテンツは保護される
+  const webtoon=item('webtoon',{url:'https://site.test/comic/ch1_p01.jpg',width:800,height:3200,dimensionSource:'decoded',detectedFormat:'jpeg'});
+  assert.equal(candidateMatches(webtoon,filters),true,'vertical Webtoon is protected from 3:1 ratio exclusion');
+
+  const panorama=item('panorama',{url:'https://site.test/gallery/wide.png',width:2400,height:600,dimensionSource:'decoded',detectedFormat:'png'});
+  assert.equal(candidateMatches(panorama,filters),true,'high-res panorama is protected from 3:1 ratio exclusion');
+
+  const regularComic=item('comic',{url:'https://site.test/comic/1.webp',width:1000,height:1414,dimensionSource:'decoded',detectedFormat:'webp'});
+  assert.equal(candidateMatches(regularComic,filters),true,'standard comic page is preserved');
 });
 
 test('inspected formats override URL hints and ad-like exclusions compose with existing conditions', () => {
@@ -232,5 +295,118 @@ test('render publishes the rebuilt selected list after cards and preview control
   } finally {
     if(previousDocument===undefined)delete globalThis.document;else globalThis.document=previousDocument;
     if(previousImage===undefined)delete globalThis.Image;else globalThis.Image=previousImage;
+  }
+});
+
+test('viewer touch gestures support horizontal swiping for next/prev navigation and double tap for zoom', () => {
+  const previousDocument = globalThis.document;
+  const elements = new Map();
+  const listeners = new Map();
+  const makeNode = tag => ({
+    tagName: tag.toUpperCase(),
+    children: [],
+    dataset: {},
+    classList: {
+      tokens: new Set(),
+      contains(cls) { return this.tokens.has(cls); },
+      add(cls) { this.tokens.add(cls); },
+      remove(cls) { this.tokens.delete(cls); },
+      toggle(cls) { if(this.tokens.has(cls)){this.tokens.delete(cls);return false;}else{this.tokens.add(cls);return true;} }
+    },
+    attributes: {},
+    className: '',
+    hidden: false,
+    disabled: false,
+    value: '',
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = [...children]; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    addEventListener(event, fn) {
+      if (!listeners.has(this)) listeners.set(this, new Map());
+      const map = listeners.get(this);
+      if (!map.has(event)) map.set(event, []);
+      map.get(event).push(fn);
+    },
+    dispatchEvent(e) {
+      const fns = listeners.get(this)?.get(e.type) || [];
+      for (const fn of fns) fn(e);
+    },
+    click() {
+      this.dispatchEvent({ type: 'click' });
+    },
+    closest() { return null; },
+    focus() { globalThis.document.activeElement = this; },
+  });
+
+  globalThis.document = {
+    activeElement: null,
+    createElement: makeNode,
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, makeNode(id.includes('preview') || id.includes('view') ? 'button' : 'div'));
+      return elements.get(id);
+    },
+  };
+
+  try {
+    let showViewerCalls = [];
+    let zoomClicks = 0;
+    const stage = document.getElementById('preview-stage');
+    const zoomBtn = document.getElementById('preview-zoom');
+    zoomBtn.addEventListener('click', () => { zoomClicks++; });
+
+    const gallery = Object.assign(Object.create(Gallery.prototype), {
+      viewerURLs: ['https://images.test/1.png', 'https://images.test/2.png', 'https://images.test/3.png'],
+      viewerIndex: 1,
+      showViewer(url) { showViewerCalls.push(url); }
+    });
+
+    gallery.setupViewerGestures();
+
+    const touchstart = (x, y) => {
+      stage.dispatchEvent({
+        type: 'touchstart',
+        touches: [{ clientX: x, clientY: y }]
+      });
+    };
+    const touchend = (x, y) => {
+      stage.dispatchEvent({
+        type: 'touchend',
+        changedTouches: [{ clientX: x, clientY: y }]
+      });
+    };
+
+    // 1. Swipe left (next image)
+    touchstart(200, 100);
+    touchend(100, 105);
+    assert.deepEqual(showViewerCalls, ['https://images.test/3.png'], 'swipe left navigates to next image');
+    showViewerCalls = [];
+
+    // 2. Swipe right (prev image)
+    touchstart(100, 100);
+    touchend(220, 102);
+    assert.deepEqual(showViewerCalls, ['https://images.test/1.png'], 'swipe right navigates to previous image');
+    showViewerCalls = [];
+
+    // 3. Vertical swipe (should not navigate)
+    touchstart(100, 100);
+    touchend(110, 220);
+    assert.deepEqual(showViewerCalls, [], 'vertical swipe does not trigger image navigation');
+
+    // 4. Swipe while actual-size zoom is active (should not navigate)
+    stage.classList.add('actual-size');
+    touchstart(200, 100);
+    touchend(80, 100);
+    assert.deepEqual(showViewerCalls, [], 'swipe does not trigger navigation when zoomed to actual size');
+    stage.classList.remove('actual-size');
+
+    // 5. Double tap triggers zoom toggle
+    touchstart(150, 150);
+    touchend(150, 150);
+    assert.equal(zoomClicks, 0, 'first tap does not trigger zoom');
+    touchstart(152, 151);
+    assert.equal(zoomClicks, 1, 'double tap triggers zoom button click');
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
   }
 });

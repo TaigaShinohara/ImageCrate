@@ -3,8 +3,11 @@ import { getDirectory, putDirectory, deleteDirectory, getLastDestination, putLas
 import { Gallery, candidateCatalog } from './gallery.js';
 import { writeImage, writeBlob } from './directory-writer.js';
 import { convertImage } from './image-converter.js';
-import { createMediaOperation } from './media-reader.js';
+import { createMediaOperation, openMediaReader } from './media-reader.js';
 import { acquireMediaFetchLease, createPreviewController } from './preview-loader.js';
+import { resolveImageFilename } from './image-format.js';
+import { ZipArchive } from './zip-writer.js';
+import { shareOrDownloadZip } from './web-share.js';
 
 const KIND = 'images';
 const $ = id => document.getElementById(id);
@@ -13,6 +16,8 @@ const instance = crypto.randomUUID();
 const resourceOwner=`${sessionId}:${instance}:conversion`;
 const previewOwner=`${sessionId}:${instance}:preview`;
 const hasDownloadId=job=>Number.isSafeInteger(job?.downloadId)&&job.downloadId>=0;
+const isMobileClient = () => (typeof navigator !== 'undefined' && (navigator.maxTouchPoints > 0 || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '')));
+const hasChromeDownloads = () => (typeof chrome !== 'undefined' && Boolean(chrome?.downloads?.download));
 let state, selected = new Set(), visible = [], loading = false, requestPending = false, pollRunning = false;
 let recorder = null;
 let draft=null, draftHandle=null, draftPermission='prompt', settingsGeneration=0;
@@ -43,27 +48,50 @@ function icon(name) {
   svg.classList.add('icon');svg.setAttribute('aria-hidden','true');
   const use=document.createElementNS(svg.namespaceURI,'use');use.setAttribute('href',`#icon-${name}`);svg.append(use);return svg;
 }
+let widthSlider = null, heightSlider = null;
+function updateResetButtons() {
+  const widthActive = (Number($('width')?.value) || 0) > 0 || (Number($('max-width')?.value) || 0) > 0;
+  const heightActive = (Number($('height')?.value) || 0) > 0 || (Number($('max-height')?.value) || 0) > 0;
+  const resetWidth = $('reset-width'), resetHeight = $('reset-height');
+  if (resetWidth) resetWidth.dataset.active = String(widthActive);
+  if (resetHeight) resetHeight.dataset.active = String(heightActive);
+}
 function resetFilters() {
-  $('query').value='';$('width').value=0;$('height').value=0;$('type').value='';
+  $('query').value='';
+  if (widthSlider) widthSlider.reset(); else { $('width').value=0; $('max-width').value=0; }
+  if (heightSlider) heightSlider.reset(); else { $('height').value=0; $('max-height').value=0; }
+  $('type').value='';
   $('exclude-ad-like').checked=false;
   renderImages();
 }
 function renderFilterState(filters) {
   const conditions=[];
   if(filters.width)conditions.push({id:'width',label:`幅 ${filters.width}px以上`});
+  if(filters.maxWidth)conditions.push({id:'max-width',label:`幅 ${filters.maxWidth}px以下`});
   if(filters.height)conditions.push({id:'height',label:`高さ ${filters.height}px以上`});
+  if(filters.maxHeight)conditions.push({id:'max-height',label:`高さ ${filters.maxHeight}px以下`});
   if(filters.type)conditions.push({id:'type',label:filters.type.toUpperCase()});
   if(filters.excludeAdLike)conditions.push({id:'exclude-ad-like',label:'広告らしい画像を除外'});
   $('filter-count').textContent=conditions.length;$('filter-count').hidden=!conditions.length;
   $('reset-filters').hidden=!conditions.length && !filters.query;
   $('active-filters').hidden=!conditions.length;
+  updateResetButtons();
   const previousChip=document.activeElement?.closest('.filter-chip');
   const focusedCondition=previousChip?.dataset.filter;
   $('active-filters').replaceChildren();
   for(const condition of conditions) {
     const chip=element('button','filter-chip');chip.type='button';chip.dataset.filter=condition.id;
     chip.append(element('span','',condition.label),icon('close'));chip.setAttribute('aria-label',`${condition.label}の条件を解除`);
-    chip.addEventListener('click',()=>{if(condition.id==='exclude-ad-like')$(condition.id).checked=false;else $(condition.id).value=condition.id==='type' ? '' : 0;renderImages();persistUI(gallery.viewPatch()).catch(error);});
+    chip.addEventListener('click',()=>{
+      if(condition.id==='exclude-ad-like')$(condition.id).checked=false;
+      else if(condition.id==='type')$(condition.id).value='';
+      else {
+        $(condition.id).value=0;
+        widthSlider?.syncFromInputs();
+        heightSlider?.syncFromInputs();
+      }
+      renderImages();persistUI(gallery.viewPatch()).catch(error);
+    });
     $('active-filters').append(chip);
   }
   if(focusedCondition) {
@@ -160,7 +188,13 @@ function updateSummary() {
 }
 function renderImages() {
   if(!state)return;
-  const filters={query:$('query').value,width:Math.max(0,Number($('width').value)||0),height:Math.max(0,Number($('height').value)||0),type:$('type').value,excludeAdLike:$('exclude-ad-like').checked};
+  const filters={query:$('query').value,
+    width:Math.max(0,Number($('width').value)||0),
+    maxWidth:Math.max(0,Number($('max-width')?.value)||0),
+    height:Math.max(0,Number($('height').value)||0),
+    maxHeight:Math.max(0,Number($('max-height')?.value)||0),
+    type:$('type').value,
+    excludeAdLike:$('exclude-ad-like').checked};
   renderFilterState(filters);gallery.render();visible=gallery.visible;updateSummary();
 }
 async function scan(continuation=false) {
@@ -312,15 +346,15 @@ function renderDestination() {
   const applied=saveSettings(settings,state.title);$('destination-summary').textContent=destinationLabel(applied);$('destination-summary').title=destinationLabel(applied);
   $('format-summary').textContent=formatLabel(applied.format);
   $('directory-warning').hidden=!requiresWorkspace(applied);
-  $('directory-warning').textContent=applied.format!=='original'?'画像を変換して保存します。処理中はこのタブを開いたままにしてください。':'選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。';
+  $('directory-warning').textContent=applied.destination==='zip'?'ZIPファイルを作成して保存します。処理中はこのタブを開いたままにしてください。':applied.format!=='original'?'画像を変換して保存します。処理中はこのタブを開いたままにしてください。':'選択したフォルダへ保存します。保存中はこのタブを開いたままにしてください。';
   $('destination-change').disabled=isBusy();
   $('batch-destination').textContent=state.batch?`今回の保存先: ${destinationLabel(state.batch)}`:'';
   $('batch-destination').title=$('batch-destination').textContent;
   $('batch-format').textContent=state.batch?`今回の形式: ${formatLabel(state.batch.format)}`:'';
   if(!draft)return;
-  const resolved=saveSettings(draft,state.title),custom=draft.destination==='directory',converting=resolved.format!=='original';
+  const resolved=saveSettings(draft,state.title),custom=draft.destination==='directory',zipping=draft.destination==='zip',converting=resolved.format!=='original';
   $('destination-preview').textContent=destinationLabel(resolved);
-  $('destination-downloads').checked=!custom;$('destination-directory').checked=custom;
+  $('destination-downloads').checked=!custom&&!zipping;$('destination-directory').checked=custom;$('destination-zip').checked=zipping;
   $('remember-destination').checked=draftRemember;
   $('remember-destination-help').textContent=rememberLoading?'次回用の保存先設定を読み込んでいます…':!draftRememberPolicy?'次回用の保存先設定を読み込めませんでした。設定を開き直してください。':`現在の次回用設定: ${draftRememberPolicy.remember?'ON':'OFF'}。OFFで次回用の保存先を忘れます。現在の作業の再読み込み・中断分の再開に必要な参照は保持します。`;
   $('remember-destination').setAttribute('aria-busy',String(rememberLoading));
@@ -334,6 +368,8 @@ function renderDestination() {
   const busy=closingSettings || requestPending;
   for(const control of $('save-settings').querySelectorAll('input,select,button'))control.disabled=busy;
   $('destination-directory').disabled=busy || !draftHandle;$('choose-directory').disabled=busy || !window.showDirectoryPicker;
+  $('destination-downloads').disabled=busy || !hasChromeDownloads();
+  $('destination-zip').disabled=busy;
   $('remember-destination').disabled=busy || rememberLoading || !draftRememberPolicy;
   $('settings-done').disabled=busy || rememberLoading || !draftRememberPolicy;
 }
@@ -370,6 +406,25 @@ async function managedState(type,extra={},operation) {
   const pending=send(type,extra).then(next=>{applyState(next);return next;});
   try{return await operation.wait(pending);}finally{if(owned)operation.dispose();}
 }
+async function readOriginalBlob(url, filename, options = {}) {
+  const { operation, onProgress, onBytes, fetchImpl = fetch } = options;
+  operation.check();
+  const source = await openMediaReader(url, { ...options, operation, onProgress, onBytes, fetchImpl });
+  const chunks = [];
+  let chunk;
+  while (!(chunk = await source.read()).done) {
+    chunks.push(chunk.value);
+  }
+  const blob = new Blob(chunks, { type: source.mime || 'application/octet-stream' });
+  const prefix = chunks[0]?.subarray(0, 64) || new Uint8Array(0);
+  const resolved = resolveImageFilename(filename, source.mime, prefix);
+  return {
+    blob,
+    bytesReceived: source.bytesReceived,
+    filename: resolved.filename,
+    formatKnown: resolved.known
+  };
+}
 async function runManagedBatch(handle) {
   managedRunning=true;managedController=new AbortController();$('cancel').disabled=false;updateSummary();
   gallery.suspendPreviews();
@@ -397,6 +452,7 @@ async function runManagedBatch(handle) {
       const preparation=createMediaOperation({signal:controller.signal,deadline:batch.transferBudget?.deadline});
       try{folder=await preparation.wait(handle.getDirectoryHandle(batch.folderName,{create:true}));}finally{preparation.dispose();}
     }
+    const zipArchive = batch.destination === 'zip' ? new ZipArchive() : null;
     for(const job of [...state.jobs].filter(j=>j.status === 'queued')) {
       if(controller.signal.aborted) break;
       let lastProgress=0,sourceBytes=0,operation,blob,reserved=false,reservationKnown=false,fileCommitted=false,resourcesSettled,fetchLease;
@@ -432,7 +488,11 @@ async function runManagedBatch(handle) {
           await operation.wait(completedFetch.release());operation.check();
           sourceBytes=Math.max(sourceBytes,blob.sourceBytes||0);
           if(controller.signal.aborted) throw new DOMException('停止しました。','AbortError');
-          if(folder) {
+          if(zipArchive) {
+            await zipArchive.addFile(job.filename, blob);
+            fileCommitted=true;await settle('complete',blob.size);
+            await report({id:job.id,status:'complete',bytesReceived:sourceBytes,typeKnown:true,actualFilename:job.filename});
+          } else if(folder) {
             // Local output is a separate accounting unit, not a second network
             // transfer of the original source bytes.
             const result=await writeBlob(folder,job.filename,blob,{signal:operation.signal,operation,maxBytes:transfer.maxOutputBytes,onProgress:progressUpdate});
@@ -464,6 +524,12 @@ async function runManagedBatch(handle) {
             if(current?.status==='in_progress'){controller.abort();break;}
             // An accepted Blob remains alive until Chrome's real terminal state.
           }
+        } else if(zipArchive) {
+          const result=await readOriginalBlob(job.url,job.filename,options);
+          sourceBytes=result.bytesReceived;fileCommitted=true;
+          await zipArchive.addFile(result.filename, result.blob);
+          await settle('complete',result.bytesReceived);
+          await report({id:job.id,status:'complete',...result,typeKnown:result.formatKnown,actualFilename:result.filename});
         } else {
           const result=await writeImage(folder,job.filename,job.url,options);
           sourceBytes=result.bytesReceived;fileCommitted=true;await settle('complete',result.bytesReceived);
@@ -499,6 +565,12 @@ async function runManagedBatch(handle) {
       }
     }
     await updates;
+    if(zipArchive && zipArchive.entries.length > 0 && !controller.signal.aborted) {
+      const zipBlob = zipArchive.generate();
+      const zipName = `${batch.folderName || 'ImageCrate'}.zip`;
+      await shareOrDownloadZip(zipBlob, zipName);
+      $('message').textContent = `ZIPファイル（${zipArchive.entries.length}件）を保存しました。`;
+    }
     if(controller.signal.aborted) await interruptManagedJobs('停止しました。中断分を再試行できます。');
   } catch(e) {const reason=e.name==='NotFoundError'?'保存先フォルダが見つかりません。保存先を選び直して、中断分を新しい保存として準備してください。':publicError(e);error(new Error(reason));await interruptManagedJobs(reason).catch(()=>{});}
   finally {managedRunning=false;managedController=null;$('cancel').disabled=false;updateSummary();if(!document.hidden)gallery.resumePreviews();}
@@ -510,7 +582,7 @@ for(const id of ['settings-close','settings-cancel'])$(id).addEventListener('cli
 $('save-settings').addEventListener('cancel',event=>{event.preventDefault();cancelSettings();});
 $('choose-directory').addEventListener('click',()=>chooseDirectory().catch(settingsError));
 $('directory-reconnect').addEventListener('click',reconnectDirectory);
-for(const mode of ['downloads','directory'])$(`destination-${mode}`).addEventListener('change',()=>{if(!draft)return;draft.destination=mode;draft.directoryName=draftHandle?.name || '';renderDestination();});
+for(const mode of ['downloads','directory','zip'])$(`destination-${mode}`).addEventListener('change',()=>{if(!draft)return;draft.destination=mode;draft.directoryName=draftHandle?.name || '';renderDestination();});
 $('folder-name').addEventListener('input',()=>{if(draft){draft.folderName=$('folder-name').value;renderDestination();}});
 $('output-format').addEventListener('change',()=>{if(draft){draft.format=$('output-format').value;renderDestination();}});
 $('remember-destination').addEventListener('change',()=>{if(draft && draftRememberPolicy){draftRemember=$('remember-destination').checked;renderDestination();}});
@@ -536,7 +608,173 @@ for(const id of ['filters','help']) {
   });
   details.addEventListener('keydown',event=>{if(event.key==='Escape'&&details.open){details.open=false;summary.focus();event.preventDefault();}});
 }
-for(const id of ['query','width','height','type','exclude-ad-like'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
+function createDualRangeController({ wrapId, highlightId, minThumbId, maxThumbId, minInputId, maxInputId, maxLimit = 4000 }) {
+  const wrap = $(wrapId), highlight = $(highlightId), minThumb = $(minThumbId), maxThumb = $(maxThumbId);
+  const minInput = $(minInputId), maxInput = $(maxInputId);
+  if (!wrap || !highlight || !minThumb || !maxThumb || !minInput || !maxInput) return null;
+
+  let currentMin = 0, currentMax = maxLimit;
+
+  function updateVisuals() {
+    const minPct = (currentMin / maxLimit) * 100;
+    const maxPct = (currentMax / maxLimit) * 100;
+    minThumb.style.left = `${minPct}%`;
+    maxThumb.style.left = `${maxPct}%`;
+    minThumb.setAttribute('aria-valuenow', String(currentMin));
+    maxThumb.setAttribute('aria-valuenow', String(currentMax));
+    highlight.style.left = `${minPct}%`;
+    highlight.style.right = `${Math.max(0, 100 - maxPct)}%`;
+  }
+
+  function syncToInputs() {
+    minInput.value = currentMin;
+    maxInput.value = currentMax >= maxLimit ? 0 : currentMax;
+    updateVisuals();
+    if (state) {
+      renderImages();
+      persistUI(gallery.viewPatch()).catch(error);
+    }
+  }
+
+  function syncFromInputs() {
+    const minVal = Math.max(0, Number(minInput.value) || 0);
+    const maxVal = Math.max(0, Number(maxInput.value) || 0);
+    currentMin = Math.min(maxLimit, minVal);
+    currentMax = maxVal === 0 ? maxLimit : Math.min(maxLimit, Math.max(currentMin, maxVal));
+    updateVisuals();
+  }
+
+  function posToVal(clientX) {
+    const rect = wrap.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return Math.round((ratio * maxLimit) / 10) * 10;
+  }
+
+  function setupThumb(thumb, isMin) {
+    let pointerId = null;
+    thumb.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      pointerId = e.pointerId;
+      try { thumb.setPointerCapture(pointerId); } catch {}
+    });
+    thumb.addEventListener('pointermove', e => {
+      if (pointerId === null) return;
+      const val = posToVal(e.clientX);
+      if (isMin) {
+        currentMin = Math.min(val, currentMax);
+      } else {
+        currentMax = Math.max(val, currentMin);
+      }
+      syncToInputs();
+    });
+    const release = () => {
+      if (pointerId !== null) {
+        try { thumb.releasePointerCapture(pointerId); } catch {}
+        pointerId = null;
+      }
+    };
+    thumb.addEventListener('pointerup', release);
+    thumb.addEventListener('pointercancel', release);
+
+    thumb.addEventListener('keydown', e => {
+      const step = e.shiftKey ? 100 : 10;
+      let nextVal = isMin ? currentMin : currentMax;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') nextVal -= step;
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') nextVal += step;
+      else if (e.key === 'Home') nextVal = isMin ? 0 : currentMin;
+      else if (e.key === 'End') nextVal = isMin ? currentMax : maxLimit;
+      else return;
+
+      e.preventDefault();
+      nextVal = Math.max(0, Math.min(maxLimit, Math.round(nextVal / 10) * 10));
+      if (isMin) currentMin = Math.min(nextVal, currentMax);
+      else currentMax = Math.max(nextVal, currentMin);
+      syncToInputs();
+    });
+  }
+
+  setupThumb(minThumb, true);
+  setupThumb(maxThumb, false);
+
+  wrap.addEventListener('pointerdown', e => {
+    if (e.target === minThumb || e.target === maxThumb) return;
+    const val = posToVal(e.clientX);
+    const distMin = Math.abs(val - currentMin);
+    const distMax = Math.abs(val - currentMax);
+    if (distMin <= distMax) {
+      currentMin = Math.min(val, currentMax);
+    } else {
+      currentMax = Math.max(val, currentMin);
+    }
+    syncToInputs();
+  });
+
+  minInput.addEventListener('input', () => {
+    const val = Math.max(0, Number(minInput.value) || 0);
+    currentMin = Math.min(maxLimit, val);
+    if (currentMax < currentMin) currentMax = currentMin;
+    updateVisuals();
+    if (state) { renderImages(); persistUI(gallery.viewPatch()).catch(error); }
+  });
+
+  maxInput.addEventListener('input', () => {
+    const val = Math.max(0, Number(maxInput.value) || 0);
+    currentMax = val === 0 ? maxLimit : Math.min(maxLimit, Math.max(currentMin, val));
+    updateVisuals();
+    if (state) { renderImages(); persistUI(gallery.viewPatch()).catch(error); }
+  });
+
+  updateVisuals();
+
+  return {
+    syncFromInputs,
+    reset() {
+      currentMin = 0;
+      currentMax = maxLimit;
+      minInput.value = 0;
+      maxInput.value = 0;
+      updateVisuals();
+    }
+  };
+}
+
+widthSlider = createDualRangeController({
+  wrapId: 'width-slider-wrap',
+  highlightId: 'width-highlight',
+  minThumbId: 'width-thumb-min',
+  maxThumbId: 'width-thumb-max',
+  minInputId: 'width',
+  maxInputId: 'max-width'
+});
+
+heightSlider = createDualRangeController({
+  wrapId: 'height-slider-wrap',
+  highlightId: 'height-highlight',
+  minThumbId: 'height-thumb-min',
+  maxThumbId: 'height-thumb-max',
+  minInputId: 'height',
+  maxInputId: 'max-height'
+});
+
+$('reset-width')?.addEventListener('click', () => {
+  widthSlider?.reset();
+  if (state) {
+    renderImages();
+    persistUI(gallery.viewPatch()).catch(error);
+  }
+});
+
+$('reset-height')?.addEventListener('click', () => {
+  heightSlider?.reset();
+  if (state) {
+    renderImages();
+    persistUI(gallery.viewPatch()).catch(error);
+  }
+});
+
+for(const id of ['query','type','exclude-ad-like'])$(id).addEventListener('input',()=>{if(state){renderImages();persistUI(gallery.viewPatch()).catch(error);}});
 $('select-visible').addEventListener('click',()=>{const urls=[...new Set([...selected,...gallery.visible.map(i=>i.url)])];persistUI({selectedURLs:urls}).then(()=>gallery.sync()).catch(error);});
 $('clear').addEventListener('click',()=>persistUI({selectedURLs:[]}).then(()=>renderImages()).catch(error));
 $('recovery-cancel').addEventListener('click',()=>persistUI({saveScope:'selection',failedBatchId:null}).catch(error));
@@ -558,7 +796,14 @@ try {
   if(!sessionSettings) {
     // Inherit the last location once. Pin its handle and defaults to this
     // session before any interaction; another workspace may change "last".
-    const initial=state.batch?saveSettings(state.batch,state.title):{destination:remembered?.destination==='directory'&&directoryHandle?'directory':'downloads',
+    const defaultDestination = remembered?.destination === 'directory' && directoryHandle
+      ? 'directory'
+      : remembered?.destination === 'zip'
+        ? 'zip'
+        : (isMobileClient() || !hasChromeDownloads())
+          ? 'zip'
+          : 'downloads';
+    const initial=state.batch?saveSettings(state.batch,state.title):{destination:defaultDestination,
       folderName:state.title,directoryName:directoryHandle?.name || '',format:'original'};
     // Older sessions could start a batch before recording settings. Its fixed
     // snapshot is authoritative while active; commit it on a later reload.
@@ -569,7 +814,10 @@ try {
   if(settings.destination==='directory'&&directoryHandle)settings.directoryName=directoryHandle.name;
   $('folder-name').value=settings.folderName;$('output-format').value=settings.format;renderDestination();
   try{$('source-domain').textContent=new URL(state.url).hostname;}catch{}
-  gallery.restore(state.ui);render();
+  gallery.restore(state.ui);
+  widthSlider?.syncFromInputs();
+  heightSlider?.syncFromInputs();
+  render();
   if(!state.scanned)await scan();else{$('message').textContent='前回の取得結果を表示';applyState(await send('get'));}
   requestAnimationFrame(()=>window.scrollTo(0,state.ui?.scrollY || 0));
   setInterval(async()=>{if(pollRunning||loading||requestPending||!state)return;pollRunning=true;try{if(summarizeJobs(state.jobs).active)applyState(await send('get'));}catch(e){error(e);}finally{pollRunning=false;}},1000);

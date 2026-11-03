@@ -3,17 +3,91 @@ import {previewHost} from './preview-loader.js';
 
 const $=id=>document.getElementById(id);
 const node=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;};
+function icon(name) {
+  const svg=typeof document.createElementNS==='function'
+    ? document.createElementNS('http://www.w3.org/2000/svg','svg')
+    : document.createElement('svg');
+  if(svg.classList)svg.classList.add('icon');else svg.className='icon';
+  svg.setAttribute?.('aria-hidden','true');
+  const use=typeof document.createElementNS==='function'
+    ? document.createElementNS('http://www.w3.org/2000/svg','use')
+    : document.createElement('use');
+  use.setAttribute?.('href',`#icon-${name}`);
+  svg.append?.(use);
+  return svg;
+}
+function isAdBeaconOrTracker(url) {
+  if (typeof url !== 'string' || !url) return false;
+  try {
+    const label = fileLabel(url).toLowerCase();
+    const base = label.replace(/\.[a-z0-9]{1,8}$/i, '');
+    if (base === 'imp' || /^imp(\.[a-z0-9]{1,8})?$/i.test(label) || label.startsWith('imp_') || label.startsWith('imp-')
+      || ['pixel', 'beacon', 'tracker', 'track', '1x1', 'blank', 'spacer', 'clear', 'infomark'].includes(base)
+      || label.includes('ad-banner') || label.includes('sp-banner') || label.includes('ad_banner')) return true;
+
+    const u = new URL(url);
+    if (!['http:', 'https:'].includes(u.protocol)) return false;
+
+    const host = u.hostname.toLowerCase();
+    if (/\b(?:dsp|adserver|adsystem|adnxs|doubleclick|googlesyndication|googleads|pagead|criteo|adroll|popads|trafficjunky|exoclick|juicyads|i-mobile|microad|ad-stir|geniee|amoad|nend|bance\.jp)\b/i.test(host)
+      || /^(?:ad|ads|adtech|advert|advertising|beacon|pixel|track|tracker)\./i.test(host)) return true;
+
+    const segments = u.pathname.toLowerCase().split('/').filter(Boolean);
+    if (segments.some(s => ['imp', 'impression', 'pixel', 'beacon', 'track', 'tracker', 'ad-banner', 'sp-banner', 'infomark'].includes(s)
+      || /^imp(\.[a-z0-9]{1,8})?$/i.test(s))) return true;
+
+    if (/[?&](?:ad_id|advertiser_id|banner_id|bid|placement_id|click_id)=/i.test(u.search)) return true;
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function candidateCatalog(state) {
   return [...new Map([...(state.selectedItems || []),...(state.items || [])].map(item=>[item.url,item])).values()];
 }
-export function candidateMatches(item,filters) {
+export function candidateMatches(item,filters,sourceURL='') {
   const known=item.dimensionSource==='decoded' || item.dimensionSource==='measured';
   const format=isDetectedImageFormat(item.detectedFormat)?item.detectedFormat:extensionOf(item.url,'images').toLowerCase();
   const dimensionsValid=Number.isFinite(item.width)&&Number.isFinite(item.height)&&item.width>0&&item.height>0;
   const short=dimensionsValid?Math.min(item.width,item.height):0;
-  const adLike=format==='gif'||dimensionsValid&&(short<200||Math.max(item.width,item.height)/short>=3);
-  return (!filters.excludeAdLike || !adLike) && matchesImage(item,{...filters,width:0,height:0}) && (!known ||
-    ((!filters.width || item.width>=filters.width) && (!filters.height || item.height>=filters.height)));
+  const long=dimensionsValid?Math.max(item.width,item.height):0;
+  const ratio=dimensionsValid?long/short:0;
+
+  let adLike = isAdBeaconOrTracker(item.url);
+  if (!adLike && dimensionsValid) {
+    if (item.width <= 2 && item.height <= 2) adLike = true;
+    else {
+      const isStandardAdSize = (
+        (item.width === 728 && item.height === 90) || (item.width === 90 && item.height === 728) ||
+        (item.width === 468 && item.height === 60) || (item.width === 60 && item.height === 468) ||
+        (item.width === 320 && item.height === 50) || (item.width === 50 && item.height === 320) ||
+        (item.width === 300 && item.height === 250) || (item.width === 250 && item.height === 300) ||
+        (item.width === 160 && item.height === 600) || (item.width === 600 && item.height === 160)
+      );
+      if (isStandardAdSize) adLike = true;
+      else {
+        // コンテンツ画像の保護:
+        // 縦スクロール漫画（Webtoon: 縦長かつ十分な幅・高さ）や超高解像度パノラマはバナーとみなさない
+        const isProtectedContent = (
+          (item.height > item.width && item.width >= 400 && item.height >= 1200) ||
+          (short >= 500 && item.width * item.height >= 800_000)
+        );
+        if (!isProtectedContent) {
+          if (format === 'gif' || short < 200 || ratio >= 3) adLike = true;
+        }
+      }
+    }
+  } else if (!adLike && format === 'gif') {
+    adLike = true;
+  }
+
+  return (!filters.excludeAdLike || !adLike) && matchesImage(item,{...filters,width:0,maxWidth:0,height:0,maxHeight:0}) && (!known ||
+    ((!filters.width || item.width>=filters.width)
+      && (!filters.maxWidth || item.width<=filters.maxWidth)
+      && (!filters.height || item.height>=filters.height)
+      && (!filters.maxHeight || item.height<=filters.maxHeight)));
 }
 export function representativeCandidates(items) {
   const groups=new Map();
@@ -54,18 +128,31 @@ export class Gallery {
       if(event.key==='ArrowLeft' && this.viewerIndex>0){event.preventDefault();this.showViewer(this.viewerURLs[this.viewerIndex-1]);}
       if(event.key==='ArrowRight' && this.viewerIndex<this.viewerURLs.length-1){event.preventDefault();this.showViewer(this.viewerURLs[this.viewerIndex+1]);}
     });
+    this.setupViewerGestures();
     $('return-gallery').addEventListener('click',()=>this.restoreFocus(this.lastURL));
     $('skip-save').addEventListener('click',event=>{event.preventDefault();this.focusSave();});
   }
   restore(ui={}) {
     this.mode=['all','selected','added'].includes(ui.view)?ui.view:ui.onlySelected?'selected':'all';
-    for(const id of ['query','width','height','type'])if(ui[id]!==undefined)$(id).value=ui[id];
+    for(const id of ['query','width','height','maxWidth','maxHeight','type']) {
+      const el=$(id==='maxWidth'?'max-width':id==='maxHeight'?'max-height':id);
+      if(el&&ui[id]!==undefined)el.value=ui[id];
+    }
+    if($('width-range')&&ui.width!==undefined)$('width-range').value=ui.width;
+    if($('max-width-range')&&ui.maxWidth!==undefined)$('max-width-range').value=ui.maxWidth;
+    if($('height-range')&&ui.height!==undefined)$('height-range').value=ui.height;
+    if($('max-height-range')&&ui.maxHeight!==undefined)$('max-height-range').value=ui.maxHeight;
     $('exclude-ad-like').checked=ui.excludeAdLike===true;
     if(ui.filtersOpen)$('filters').open=true;if(ui.helpOpen)$('help').open=true;
     this.lastURL=ui.focusAnchor || '';
   }
   viewPatch() {
-    return {view:this.mode,onlySelected:this.mode==='selected',query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value,
+    return {view:this.mode,onlySelected:this.mode==='selected',query:$('query').value,
+      width:Number($('width').value)||0,
+      maxWidth:Number($('max-width')?.value)||0,
+      height:Number($('height').value)||0,
+      maxHeight:Number($('max-height')?.value)||0,
+      type:$('type').value,
       excludeAdLike:$('exclude-ad-like').checked,
       scrollY:window.scrollY,focusAnchor:this.lastURL,filtersOpen:$('filters').open,helpOpen:$('help').open};
   }
@@ -82,7 +169,7 @@ export class Gallery {
     if(JSON.stringify(this.measured.get(url))===JSON.stringify(value))return;
     this.measured.set(url,value);this.onMeasure({url,...value});
     for(const meta of document.querySelectorAll('[data-dimensions]'))if(meta.dataset.dimensions===url)meta.textContent=`${value.width} × ${value.height}`;
-    if(Number($('width').value)||Number($('height').value)||$('exclude-ad-like').checked)$('measure-refresh').hidden=false;
+    if(Number($('width').value)||Number($('max-width')?.value)||Number($('height').value)||Number($('max-height')?.value)||$('exclude-ad-like').checked)$('measure-refresh').hidden=false;
     const item=this.item(url);
     if(this.viewerURL===url&&item)$('preview-meta').textContent=this.description(this.effective(item));
   }
@@ -279,14 +366,14 @@ export class Gallery {
     const state=this.getState(),selected=this.getSelected(),active=document.activeElement;
     const oldCard=active?.closest('#grid .card'),oldURL=oldCard?.dataset.url,oldRole=active?.dataset.galleryRole;
     const oldIndex=this.visible.findIndex(item=>item.url===oldURL);
-    const filters={query:$('query').value,width:Number($('width').value)||0,height:Number($('height').value)||0,type:$('type').value,excludeAdLike:$('exclude-ad-like').checked};
+    const filters={query:$('query').value,width:Number($('width').value)||0,maxWidth:Number($('max-width')?.value)||0,height:Number($('height').value)||0,maxHeight:Number($('max-height')?.value)||0,type:$('type').value,excludeAdLike:$('exclude-ad-like').checked};
     const all=candidateCatalog(state).map(i=>this.effective(i));
     const retained=new Set(all.map(item=>item.url));
     if(this.viewerURL&&!retained.has(this.viewerURL)){$('image-preview').close();this.clearPreviews('viewer');this.viewerURL=null;}
     for(const url of this.measured.keys())if(!retained.has(url))this.measured.delete(url);
     const page=(state.items || []).map(i=>this.effective(i));
     const candidates=this.mode==='selected'?all.filter(i=>selected.has(i.url)):
-      page.filter(i=>candidateMatches(i,filters) && (this.mode!=='added'||(state.scan?.addedURLs||[]).includes(i.url)));
+      page.filter(i=>candidateMatches(i,filters,state?.url) && (this.mode!=='added'||(state.scan?.addedURLs||[]).includes(i.url)));
     this.visible=this.mode==='selected'?candidates:representativeCandidates(candidates);
     $('count').textContent=`表示${this.visible.length} / ${this.mode==='selected'?'選択':'全'}${this.mode==='selected'?selected.size:page.length}件`;
     $('view-all').setAttribute('aria-pressed',String(this.mode==='all'));
@@ -296,7 +383,7 @@ export class Gallery {
     $('next-page').hidden=!state.scan?.hasMore;
     $('measure-refresh').hidden=true;
     const unknown=candidates.filter(i=>!['decoded','measured'].includes(i.dimensionSource)).length;
-    $('dimension-note').hidden=!(unknown&&(filters.width||filters.height||filters.excludeAdLike));
+    $('dimension-note').hidden=!(unknown&&(filters.width||filters.maxWidth||filters.height||filters.maxHeight||filters.excludeAdLike));
     $('dimension-note').textContent=filters.excludeAdLike?`実寸法未確認${unknown}件を含みます。元ページの寸法で概算し、不明な候補は残します。プレビュー後に確認した情報で条件を更新できます。`:`寸法未確認${unknown}件を含みます。画像を表示すると寸法を確認します。`;
     $('search-tools').hidden=this.mode==='selected';$('active-filters').hidden=this.mode==='selected'||!$('active-filters').children.length;
     $('grid').replaceChildren();
@@ -323,7 +410,9 @@ export class Gallery {
       const jump=node('button','card-save-jump','保存操作へ移動');jump.type='button';jump.onclick=()=>this.focusSave();
       jump.dataset.galleryRole='save';jump.addEventListener('focus',()=>{this.lastURL=item.url;});
       const variants=all.filter(i=>item.groupId && i.groupId===item.groupId);
-      const preview=node('button','preview-open',variants.length>1?`確認・他${variants.length-1}候補`:'大きく確認');preview.type='button';
+      const previewText=variants.length>1?`確認・他${variants.length-1}候補`:'大きく確認';
+      const preview=node('button','preview-open');preview.type='button';
+      preview.append(icon('search'),node('span','preview-open-text',previewText));
       preview.dataset.galleryRole='preview';preview.addEventListener('focus',()=>{this.lastURL=item.url;});
       preview.onclick=()=>this.openViewer(item.url,preview);
       const permission=node('button','secondary preview-permission'),details=node('div','preview-details');permission.type='button';permission.dataset.galleryRole='permission';
@@ -342,6 +431,45 @@ export class Gallery {
     if(oldURL)this.restoreFocus(oldURL,oldRole,oldIndex);
     else if(active===$('measure-refresh')&&active.hidden)$('gallery-heading').focus();
     this.onRender?.(this.visible);
+  }
+  setupViewerGestures() {
+    const stage=$('preview-stage');
+    if(!stage?.addEventListener)return;
+    let startX=0, startY=0, startTime=0, lastTap=0, lastTapX=0, lastTapY=0;
+    stage.addEventListener('touchstart', e => {
+      if(e.touches?.length===1) {
+        startX=e.touches[0].clientX;
+        startY=e.touches[0].clientY;
+        startTime=Date.now();
+        const now=Date.now();
+        if(now-lastTap<350 && Math.hypot(startX-lastTapX, startY-lastTapY)<24) {
+          $('preview-zoom')?.click();
+          lastTap=0;
+          return;
+        }
+        lastTap=now;
+        lastTapX=startX;
+        lastTapY=startY;
+      }
+    }, {passive:true});
+    stage.addEventListener('touchend', e => {
+      if(startTime===0 || !e.changedTouches || e.changedTouches.length===0)return;
+      const endX=e.changedTouches[0].clientX;
+      const endY=e.changedTouches[0].clientY;
+      const dx=endX-startX;
+      const dy=endY-startY;
+      const dt=Date.now()-startTime;
+      startTime=0;
+      if(Math.hypot(dx, dy)>12)lastTap=0;
+      if(stage.classList?.contains('actual-size'))return;
+      if(dt<450 && Math.abs(dx)>40 && Math.abs(dx)>Math.abs(dy)*1.4) {
+        if(dx<0 && this.viewerIndex<this.viewerURLs.length-1) {
+          this.showViewer(this.viewerURLs[this.viewerIndex+1]);
+        } else if(dx>0 && this.viewerIndex>0) {
+          this.showViewer(this.viewerURLs[this.viewerIndex-1]);
+        }
+      }
+    }, {passive:true});
   }
   openViewer(url,origin=document.activeElement) {
     this.returnURL=url;this.viewerURLs=this.visible.map(i=>i.url);
