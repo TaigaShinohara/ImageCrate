@@ -165,6 +165,7 @@ try {
   // Actual DOM/TreeWalker boundaries; no querySelectorAll stand-in for collection.
   const source = await context.newPage();
   await source.goto(`${origin}/candidates`);
+  await source.waitForSelector('img[alt="合成候補500"]');
   let tab = await tabFor(source), first = await collectPage(tab.id);
   assert.equal(first.items.length, 500); assert.equal(first.hasMore, true);
   assert.deepEqual(await collectPage(tab.id, { cursor: first.retryCursor }), first, 'initial page replay is identical');
@@ -184,6 +185,7 @@ try {
   checked('real DOM: 12001 elements continue after the 12000-element boundary');
 
   await source.goto(`${origin}/nested`);
+  await source.waitForSelector('iframe');
   tab = await tabFor(source); first = await collectPage(tab.id);
   const nested = await collectPage(tab.id, { cursor: first.cursor });
   assert.ok(nested.items.some(item => item.url.endsWith('/shadow.svg')));
@@ -191,6 +193,7 @@ try {
   checked('real DOM: shadow root and same-origin frame survive continuation');
 
   await source.goto(`${origin}/mutation`);
+  await source.waitForSelector('img[alt="合成候補500"]');
   const pagedManager = await openWorkspace(source);
   const before = await stateFor(pagedManager);
   assert.equal(before.items.length, 500);

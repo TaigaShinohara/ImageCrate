@@ -2,7 +2,8 @@
 
 ## GitHub オープンソース（OSS）公開準備 — 2026-11-03
 
-- 本人指示「githubでossとして公開したいので準備して」を受け、OSS公開に向けたリポジトリ整備と検証を実施。
+- 本人指示「githubでossとして公開したいので準備して」「あなたがやっといて」を受け、OSS公開に向けたリポジトリ整備・CIパイプラインの安定化と公開作業を実施。
+  - `tests/ux-browser.mjs`: CI（Linux環境）での501件候補スキャン時に、DOM要素パース完了待ち（`waitForSelector`）を追加し、実行環境ごとのタイミング依存を解消。
   - `.github/workflows/ci.yml`: GitHub Actions CIパイプライン（Node 22での単体テスト・静的チェック・ブラウザテスト）を設置。
   - `.github/ISSUE_TEMPLATE/` (`bug_report.yml`, `feature_request.yml`, `config.yml`)、`.github/PULL_REQUEST_TEMPLATE.md`: Issue/PRテンプレートを配置。
   - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 行動規範を設置。
