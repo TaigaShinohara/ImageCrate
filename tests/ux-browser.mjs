@@ -812,7 +812,13 @@ try {
     if(recovered)break;await source.waitForTimeout(50);
   }
   assert.equal(recovered,true,'the real alarm event confirms the owned native download and completes budgeted queued files without a workspace');
-  const recoveredDownloads=await awakened.evaluate(()=>chrome.downloads.search({filenameRegex:'Alarm recovery'}));
+  let recoveredDownloads = [];
+  const downloadDeadline = Date.now() + 10000;
+  while (Date.now() < downloadDeadline) {
+    recoveredDownloads = await awakened.evaluate(() => chrome.downloads.search({ filenameRegex: 'Alarm recovery' }));
+    if (recoveredDownloads.length === 1 && recoveredDownloads[0].state === 'complete') break;
+    await source.waitForTimeout(50);
+  }
   assert.equal(recoveredDownloads.length,1);assert.ok(recoveredDownloads.every(download=>download.state==='complete'));
   const [confirmedSetup]=await awakened.evaluate(id=>chrome.downloads.search({id}),alarmAcceptedId);
   assert.equal(confirmedSetup.state,'complete');assert.match(await readFile(confirmedSetup.filename,'utf8'),/<svg/);
