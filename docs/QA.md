@@ -1,5 +1,21 @@
 # QA — v0.1
 
+## GitHub オープンソース（OSS）公開準備 — 2026-11-03
+
+- 本人指示「githubでossとして公開したいので準備して」を受け、OSS公開に向けたリポジトリ整備と検証を実施。
+  - `.github/workflows/ci.yml`: GitHub Actions CIパイプライン（Node 22での単体テスト・静的チェック・ブラウザテスト）を設置。
+  - `.github/ISSUE_TEMPLATE/` (`bug_report.yml`, `feature_request.yml`, `config.yml`)、`.github/PULL_REQUEST_TEMPLATE.md`: Issue/PRテンプレートを配置。
+  - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 行動規範を設置。
+  - `CONTRIBUTING.md`: 外部依存ゼロ原則、Chrome/Safari両対応、テスト実行要領を明記した公開コントリビューションガイドに刷新。
+  - `package.json`: リポジトリURL、バグ報告URL、ホームページ、キーワード、MITライセンス表記を拡充。
+  - `README.md` & `README_EN.md`: バッジ整備、特徴・インストール・プライバシー案内、日英両言語ドキュメントを配置。
+  - `.gitignore`: macOS/Windows一時ファイル、カバレッジ、IDE、Xcode成果物の包括的除外を設定。
+- `npm test`: **351 PASS / 既存対象外1 SKIP**。
+- `npm run check`: **PASS**（manifest, CSP, ローカルモジュール参照, Safari互換性, JS構文検証OK）。
+- `git diff --check`: エラーなし。
+- 機密情報スキャン: 秘密鍵、個人トークン、個人メール等の不要ファイル混入なし（`SECURITY.md` 記載の意図的なプロジェクト連絡窓口メールのみ）。
+- 未確認: 実際のGitHubリポジトリ設定（SettingsでIssue・Discussionsの有効化、ブランチ保護ルールの設定等）。
+
 ## Safari Web Extension (iOS / macOS) への適合・Xcode構成とモバイル自動選択 — 2026-11-03
 
 - 本人指示「フェーズ3に進んで」を受け、iOS Safari / macOS Safari へのWeb Extension適合、Xcodeプロジェクト生成、モバイル環境向け保存先自動選択を実装・検証。

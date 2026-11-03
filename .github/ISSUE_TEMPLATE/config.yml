@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 セキュリティ・プライバシー脆弱性の報告
+    url: https://github.com/TaigaShinohara/ImageCrate/blob/main/SECURITY.md
+    about: 脆弱性や機密情報に関する報告は公開IssueではなくSECURITY.md記載の窓口へご連絡ください。

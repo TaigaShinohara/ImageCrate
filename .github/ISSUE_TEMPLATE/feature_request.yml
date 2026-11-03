@@ -1,0 +1,31 @@
+name: 💡 機能提案・改善要望 (Feature Request)
+description: ImageCrate への新機能や改善のアイデアを提案する
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ImageCrate をより良くするためのアイデアを歓迎します！
+        提案の前に、既存の Issue や [docs/DESIGN.md](https://github.com/TaigaShinohara/ImageCrate/blob/main/docs/DESIGN.md) に類似の議論がないかご確認ください。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題や背景
+      description: どのような課題や不便さからこの機能が必要だと考えましたか？
+      placeholder: "例: 〇〇のようなWebサイトで大量の画像を保存する際、△△がしづらい。"
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 提案する解決策・新機能
+      description: どのような動作・UIを想定しているか記述してください。
+      placeholder: "例: ギャラリーに〇〇のフィルターを追加し、△△できるようにする。"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+      description: 他に考えた回避策や代替方法があれば記述してください。

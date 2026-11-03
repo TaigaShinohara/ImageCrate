@@ -1,8 +1,28 @@
 # ImageCrate
 
-画像を確認して、必要なものだけ一括保存するChrome拡張。
+<p align="center">
+  <strong>Webページの画像を確認し、必要なものだけを一括保存するブラウザ拡張機能</strong><br>
+  Chrome 116+ & Safari (iOS / macOS) 対応 / 外部依存ゼロ / プライバシー優先
+</p>
 
-仮名・初期版 v0.1.0。将来のOSS公開に向けた開発版です。公開配布・Chrome Web Storeへの申請は今回の作業に含みません。公開用名称の重複や商標は未確認です。
+<p align="center">
+  <a href="https://github.com/TaigaShinohara/ImageCrate/actions/workflows/ci.yml"><img src="https://github.com/TaigaShinohara/ImageCrate/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Chrome-116%2B-brightgreen.svg" alt="Chrome 116+">
+  <img src="https://img.shields.io/badge/Safari-iOS%20%2F%20macOS-blue.svg" alt="Safari iOS/macOS">
+</p>
+
+<p align="center">
+  <a href="README_EN.md">English</a> | <strong>日本語</strong>
+</p>
+
+---
+
+## 概要
+
+**ImageCrate** は、Webページ上に埋め込まれた画像から必要なものだけを快適に選び出し、一括保存するためのブラウザ拡張機能です。
+
+外部のサーバーやサードパーティ依存を一切使わず、ブラウザ標準の Web API と Manifest V3 だけで構築されています。広告フィルター、拡大プレビュー、タッチジェスチャー、端末内フォーマット変換（JPEG / PNG / WebP）、ZIP一括保存、iOSの共有シート連携（AirDrop / ファイル保存）などを備えています。
 
 ## Chromeへ読み込む
 
@@ -120,10 +140,21 @@ CHROME_EXECUTABLE="/path/to/chrome" npm run test:compat
 
 ## 今後の候補
 
-ZIP出力、取得サイズによる絞り込み、追加の保存形式、サイト別の取得補助、英語UI。
+取得サイズによる絞り込み、追加の保存形式、サイト別の取得補助、英語UIなど。
+実サイトで確認した需要とフィードバックに応じて優先順位を決めます。
 
-これらは未実装です。実サイトで確認した需要と制約に応じて優先順位を決めます。
+## コントリビューション
 
-## ライセンスと公開
+バグ報告、機能提案、ドキュメント改善、プルリクエストを歓迎します！
+詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。
+コミュニティに参加する際は [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) を遵守してください。
 
-MITを初期設定として同梱しています。名称、ライセンス、権利表示、プライバシー文書、配布素材を確認してから公開します。公開・ストア申請は今回の作業に含みません。保存できることと再配布できることは別です。自作・許諾済みのメディアなど、保存する権限がある内容で利用してください。
+## ライセンス
+
+本プロジェクトは [MIT License](LICENSE) の下でオープンソースとして公開されています。
+
+```
+Copyright (c) 2026 ImageCrate contributors
+```
+
+※ 保存できることと再配布できることは別です。自作または許諾済みのメディアなど、保存する権限がある内容でご利用ください。

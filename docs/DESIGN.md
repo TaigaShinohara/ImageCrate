@@ -1,5 +1,22 @@
 # ImageCrate / VideoHarbor — initial design v1
 
+## GitHub オープンソース（OSS）公開準備 — 2026-11-03
+
+本人指示「githubでossとして公開したいので準備して」を受け、リポジトリをオープンソースとして健全かつ持続可能に公開・運用するためのガバナンス文書、メタデータ、CIパイプライン、テンプレートを整備。
+
+1. **GitHub ガバナンス・コミュニティ整備**:
+   - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 に準拠した行動規範を設置。
+   - `CONTRIBUTING.md`: 外部依存ゼロ・Manifest V3・プライバシー保護の設計原則、ローカル検証手順（Chrome / Safari）、テスト実行指針を明記したコントリビューションガイドへ刷新。
+   - `SECURITY.md`: 脆弱性報告手順および合成データによる報告方針を維持・確認。
+2. **GitHub Actions CI ＆ テンプレート (`.github/`)**:
+   - `.github/workflows/ci.yml`: GitHub Actions 自動パイプライン（Node 22 による単体テスト `npm test`、静的検査 `npm run check`、およびヘッドレスブラウザテスト `npm run test:browser` / `test:ux`）。
+   - `.github/ISSUE_TEMPLATE/`: 構造化されたバグ報告（`bug_report.yml`）および機能提案（`feature_request.yml`）、セキュリティ報告誘導（`config.yml`）を配置。
+   - `.github/PULL_REQUEST_TEMPLATE.md`: 外部依存ゼロやManifest V3規約、Safari互換性、テスト完了を確認するPRテンプレートを配置。
+3. **リポジトリメタデータ & 国際化**:
+   - `package.json`: `license: MIT`, `repository`, `homepage`, `bugs`, `keywords` などのメタデータを整備。
+   - `README.md` & `README_EN.md`: バッジ（CI, License, Chrome, Safari）、特徴、クイックスタート、プライバシーポリシー、ライセンス案内を整理し、日本語・英語の両言語対応を完備。
+   - `.gitignore`: macOS/Windowsシステムファイル、テストカバレッジ、IDE設定、Xcode一時ファイル等を包括的に除外。
+
 ## Safari Web Extension (iOS / macOS) への適合・Xcode構成とモバイル自動選択 — 2026-11-03
 
 本人指示「フェーズ3に進んで」を受け、iPhone / iPad (iOS Safari) および macOS Safari でImageCrateを動作させるためのWeb Extension適合・Xcodeプロジェクト構成・モバイル環境最適化を実装。

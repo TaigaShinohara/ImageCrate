@@ -1,0 +1,42 @@
+name: 🐛 バグ報告 (Bug Report)
+description: ImageCrate の不具合や予期しない挙動を報告する
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ImageCrate の不具合報告にご協力いただきありがとうございます。
+        **注意**: 報告内容に署名付きURL、アクセストークン、個人情報、私的なメディアを含めないでください。
+  - type: textarea
+    id: description
+    attributes:
+      label: 問題の説明
+      description: どのような問題が発生しているか簡潔に記述してください。
+      placeholder: 何が起きたか、どのような期待される動作と異なっていたかを記載してください。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 再現手順
+      description: 問題を再現する具体的な手順を教えてください。
+      placeholder: |
+        1. 任意のWebページを開く
+        2. ツールバーの ImageCrate アイコンをクリック
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 環境情報
+      description: ご利用のOS、ブラウザ、ImageCrateのバージョン
+      placeholder: "macOS 15.1 / Google Chrome 128 / ImageCrate v0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: エラーログやスクリーンショット
+      description: コンソールエラーや状況がわかるスクリーンショット（機密情報・個人情報をマスクした上で添付）

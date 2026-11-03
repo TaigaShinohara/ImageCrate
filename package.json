@@ -3,7 +3,27 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ImageCrate Chrome extension",
+  "description": "Webページの画像を確認して選んで一括保存するブラウザ拡張機能（Chrome & Safari / iOS）",
+  "author": "ImageCrate contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TaigaShinohara/ImageCrate.git"
+  },
+  "homepage": "https://github.com/TaigaShinohara/ImageCrate#readme",
+  "bugs": {
+    "url": "https://github.com/TaigaShinohara/ImageCrate/issues"
+  },
+  "keywords": [
+    "chrome-extension",
+    "safari-extension",
+    "ios-safari",
+    "image-downloader",
+    "batch-save",
+    "zip",
+    "manifest-v3",
+    "privacy-first"
+  ],
   "scripts": {
     "test": "node --test tests/*.test.js",
     "check": "node scripts/check.mjs",
